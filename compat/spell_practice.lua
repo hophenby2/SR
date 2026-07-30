@@ -24,11 +24,17 @@ local practice_bosses = {
     { "okuu_ex:Lunatic", "Lunatic 5 Extra" },
 }
 
+local practice_catalog = {
+    schema_version = 1,
+    scenarios = {},
+}
+
 for _, practice_boss in ipairs(practice_bosses) do
     local class_name = practice_boss[1]
     local label = practice_boss[2]
     local boss_class = assert(_editor_class[class_name], "missing spell-practice boss class: " .. class_name)
     local attack_number = 0
+    local attacks = {}
 
     for card_index, card in ipairs(boss_class.cards) do
         -- SR's generated one-second combat cards are end markers, not attacks.
@@ -41,6 +47,21 @@ for _, practice_boss in ipairs(practice_bosses) do
                 card_index,
                 false,
             })
+            table.insert(attacks, {
+                attack = attack_number,
+                card_index = card_index,
+                label = string.format("%s #%d", label, attack_number),
+            })
         end
     end
+
+    table.insert(practice_catalog.scenarios, {
+        scenario = class_name,
+        label = label,
+        attack_count = attack_number,
+        attacks = attacks,
+    })
 end
+
+-- The test bridge exposes this scalar-only manifest through its catalog command.
+SR_SPELL_PRACTICE_CATALOG = practice_catalog

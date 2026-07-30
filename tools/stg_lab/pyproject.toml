@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stg-lab"
+version = "0.1.0"
+description = "Deterministic bullet-hell testing, planning, and AI training tools"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "numpy>=2.0,<3",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.5,<3",
+]
+
+[project.scripts]
+stg-lab = "stg_lab.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stg_lab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+]
