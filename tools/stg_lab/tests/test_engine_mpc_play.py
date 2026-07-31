@@ -25,6 +25,7 @@ def observation(
         "episode_frame": frame,
         "terminated": terminated,
         "termination_reason": reason,
+        "performance": {"native_fps": 59.5, "object_count": 320},
         "stage": {"card_index": 4},
         "world": {
             "pl": -192.0,
@@ -118,6 +119,7 @@ def test_controller_observation_delays_hazards_but_not_own_player() -> None:
     assert visible["player"]["x"] == 24.0
     assert visible["own_player_observation_delay"] == 0
     assert visible["own_player_observation_frame"] == 15
+    assert "performance" not in visible
 
 
 def test_attack_complete_is_strict_live_policy_success() -> None:
@@ -141,6 +143,7 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
     assert all(item["control_source"] == "live_mpc" for item in report["decisions"])
     assert all(action.spell is False for action in client.actions)
     assert all(item["predicted_collision"] is False for item in report["decisions"])
+    assert report["render_performance"]["dense_frames"]["median"] == 59.5
 
 
 def test_action_artifact_replay_is_not_part_of_current_mpc_api() -> None:

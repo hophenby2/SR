@@ -112,6 +112,20 @@ local function string_value(value)
     end
 end
 
+local function engine_metric(name)
+    local metric = rawget(_G, name)
+    if type(metric) ~= "function" and type(lstg) == "table" then
+        metric = lstg[name]
+    end
+    if type(metric) ~= "function" then
+        return nil
+    end
+    local ok, value = pcall(metric)
+    if ok then
+        return number_or_nil(value)
+    end
+end
+
 local function truthy(value)
     if type(value) == "boolean" then
         return value
@@ -884,6 +898,10 @@ function Instance:collect_observation()
         indestructibles = indestructibles,
         lasers = lasers,
         resources = {},
+        performance = {
+            native_fps = engine_metric("GetFPS"),
+            object_count = engine_metric("GetnObj"),
+        },
     }
     for _, key in ipairs({ "l", "r", "b", "t", "pl", "pr", "pb", "pt" }) do
         put_number(observation.world, key, world[key])

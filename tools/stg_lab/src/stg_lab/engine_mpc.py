@@ -2179,6 +2179,8 @@ class EngineMPC:
         threats: Sequence[PredictedThreat],
         boss_x: float | None,
         region_anchor: _RegionAnchor | None = None,
+        *,
+        _prefilter_threats: bool = True,
     ) -> tuple[
         tuple[CandidateEvaluation, ...],
         tuple[tuple[Action, ...], ...],
@@ -2216,6 +2218,40 @@ class EngineMPC:
                 [value.source == "indestructibles" for value in threats],
                 dtype=np.bool_,
             )
+
+            # Threat motion is shared by every beam candidate. Precomputing it
+            # once avoids rebuilding these vectors inside all 60 search steps.
+            future_frames = np.arange(
+                1,
+                self.config.horizon_frames + 1,
+                dtype=np.float64,
+            )[:, None]
+            motion_frames = np.minimum(
+                future_frames,
+                threat_motion_horizon[None, :],
+            )
+            future_threat_x = (
+                threat_x[None, :] + threat_vx[None, :] * motion_frames
+            )
+            future_threat_y = (
+                threat_y[None, :] + threat_vy[None, :] * motion_frames
+            )
+            future_radius = np.maximum(
+                0.1,
+                threat_radius[None, :]
+                + threat_radius_rate[None, :]
+                * np.minimum(future_frames, threat_rate_horizon[None, :]),
+            )
+            if np.any(threat_is_region):
+                for frame_index in range(self.config.horizon_frames):
+                    phase_radius = self._region_phase.radius_after(
+                        self.config.observation_delay + frame_index + 1,
+                    )
+                    if phase_radius is not None:
+                        future_radius[frame_index, threat_is_region] = np.maximum(
+                            future_radius[frame_index, threat_is_region],
+                            phase_radius,
+                        )
         else:
             threat_x = threat_y = threat_vx = threat_vy = np.empty(0, dtype=np.float64)
             threat_radius = threat_radius_rate = threat_rate_horizon = np.empty(
@@ -2223,6 +2259,10 @@ class EngineMPC:
             )
             threat_motion_horizon = np.empty(0, dtype=np.float64)
             threat_is_region = np.empty(0, dtype=np.bool_)
+            future_threat_x = future_threat_y = future_radius = np.empty(
+                (self.config.horizon_frames, 0),
+                dtype=np.float64,
+            )
 
         x = np.asarray([px], dtype=np.float64)
         y = np.asarray([py], dtype=np.float64)
@@ -2263,28 +2303,51 @@ class EngineMPC:
                 y = np.clip(raw_y, bottom, top)
                 absolute_frame = segment_start + step
                 if threats:
-                    motion_frame = np.minimum(absolute_frame, threat_motion_horizon)
-                    tx = threat_x + threat_vx * motion_frame
-                    ty = threat_y + threat_vy * motion_frame
-                    radius = np.maximum(
-                        0.1,
-                        threat_radius
-                        + threat_radius_rate
-                        * np.minimum(absolute_frame, threat_rate_horizon),
-                    )
-                    phase_radius = self._region_phase.radius_after(
-                        self.config.observation_delay + absolute_frame,
-                    )
-                    if phase_radius is not None and np.any(threat_is_region):
-                        radius[threat_is_region] = np.maximum(
-                            radius[threat_is_region],
-                            phase_radius,
-                        )
-                    margins = np.hypot(
-                        x[:, None] - tx[None, :],
-                        y[:, None] - ty[None, :],
-                    ) - player_radius - radius[None, :]
-                    frame_margin = margins.min(axis=1)
+                    tx = future_threat_x[absolute_frame - 1]
+                    ty = future_threat_y[absolute_frame - 1]
+                    radius = future_radius[absolute_frame - 1]
+                    active_threats: slice | np.ndarray = slice(None)
+                    if _prefilter_threats:
+                        # Once a candidate has an incumbent minimum margin, a
+                        # threat outside this expanded candidate AABB cannot
+                        # improve that margin or collide this frame. Bounds are
+                        # rounded outward so filtering remains conservative.
+                        threshold = max(0.0, float(np.max(minimum_margin)))
+                        if math.isfinite(threshold):
+                            reach = radius + player_radius + threshold
+                            candidate_left = np.nextafter(
+                                float(np.min(x)) - reach,
+                                -math.inf,
+                            )
+                            candidate_right = np.nextafter(
+                                float(np.max(x)) + reach,
+                                math.inf,
+                            )
+                            candidate_bottom = np.nextafter(
+                                float(np.min(y)) - reach,
+                                -math.inf,
+                            )
+                            candidate_top = np.nextafter(
+                                float(np.max(y)) + reach,
+                                math.inf,
+                            )
+                            active_threats = (
+                                (tx >= candidate_left)
+                                & (tx <= candidate_right)
+                                & (ty >= candidate_bottom)
+                                & (ty <= candidate_top)
+                            )
+                    active_tx = tx[active_threats]
+                    active_ty = ty[active_threats]
+                    active_radius = radius[active_threats]
+                    if not len(active_tx):
+                        frame_margin = np.full(len(x), math.inf, dtype=np.float64)
+                    else:
+                        margins = np.hypot(
+                            x[:, None] - active_tx[None, :],
+                            y[:, None] - active_ty[None, :],
+                        ) - player_radius - active_radius[None, :]
+                        frame_margin = margins.min(axis=1)
                     minimum_margin = np.minimum(minimum_margin, frame_margin)
                     collided_now = frame_margin <= 0.0
                     collision_frames += collided_now.astype(np.int32)

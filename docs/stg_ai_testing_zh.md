@@ -104,11 +104,34 @@ uv run stg-lab train-region-dynamics \
 
 正式 v2 记忆 SHA-256 为 `dcdcddeeed840d733e144477934f217b21f6795ab9a83790d7f3813d273546f7`，训练报告 SHA-256 为 `95f4b3e45952f476f430158416d6f13b7617a4a5d25dbe07e522fc0107ac8e99`。输入 v37 报告 SHA-256 为 `60c1dd6bb0cfdece73d7170b3c968736479470ba87fed6e96fa68e42290134f5`，提供 357 个半径样本和 303 个横向流样本。拟合结果为半径 `7/28`、变化率 `0.7/0.7`、四相 `30/30/30/90`、半径周期 `180` 和横向流周期 `360`；360 帧重复的 201 对样本相关系数为 1、归一化 RMSE 为 0，180 帧反号的 252 对样本同样为 1 和 0。整体平移输入时间轴不会改变 memory 或相对样本统计。
 
+### MPC 预筛选的精确等价与性能
+
+`experiments/benchmark_engine_mpc_beam.py` 在原生报告 `engine-mpc-boss3-heldout-v40-d5-region-dynamics-v2.json`（SHA-256 `e7577aa475ed9a9de6542fedfba8a193dca1b3d8a927e139371e22f41b2d94ef`）的记录观测上，对比保守候选 AABB 威胁预筛选和不筛选参考 beam。已记录的三次运行中位数如下：
+
+| 来源帧 | 模式 | 威胁数 | 不筛选中位耗时 | 预筛选中位耗时 | 加速 | beam 输出 |
+| ---: | --- | ---: | ---: | ---: | ---: | --- |
+| 995 | 局部规划 | 364 | 0.3653 秒 | 0.1292 秒 | 2.83x | 精确相等 |
+| 1292 | 区域规划 | 193 | 0.3809 秒 | 0.1209 秒 | 3.15x | 精确相等 |
+
+这里的等价不是只比较最终动作或终态。所有候选的动作、`collided`、`collision_frames`、`earliest_collision_frame`、精确浮点 `minimum_margin`、边界惩罚、Boss 对齐惩罚，以及完整 20 段动作计划都逐字段相等。来源帧 1292 另以 60 帧预热重放了 21 次有状态决策，优化与参考控制器、提交动作、计划动作和报告碰撞字段全部一致。同机五次重复运行的实测范围约为 2.7x-3.4x，因此这些耗时是会波动的基准样本，不是保证下限。
+
 旧 standalone v2 的 SQLite 单路线/多路线库和对应哈希仍可用于复现历史基准，但它们包含录制路线，不再代表当前 Engine MPC 的策略记忆，也不能证明原生引擎泛化。
 
-## 跨平台高速测试与简化渲染
+## 跨平台完整引擎、高速测试目标与渲染
 
-完整 LuaSTG-Sub 的图形、窗口、音频、输入和外壳构建图都直接依赖 Win32/D3D11/XAudio2，因此只替换 D3D11 为 Vulkan 仍不能得到可运行的 macOS 完整引擎。当前实现是在 `/Users/happyelements/LuaSTG-Sub` 增加隔离的 `LuaSTGPortableTest` CMake target：它复用原引擎 `XCollision` 的圆形/旋转椭圆判定，支持完全不初始化视频设备的不限帧 headless 模式，以及 SDL2 简化碰撞/风险区视图。macOS 加速渲染由 SDL2 的 Metal 后端提供，CI 或无显示环境可用 SDL dummy 软件后端，不要求 Vulkan/MoltenVK；Linux 只需可被 CMake 找到的 SDL2。
+当前 `/Users/happyelements/LuaSTG-Sub` 源码已经不再保留“完整引擎依赖 DirectX”的旧前提。完整可执行文件可在 Windows、macOS 和 Linux 使用 SDL2 窗口/输入/音频与 OpenGL 4.1 GPU 精灵/FBO 渲染器，也可组合 null 图形/窗口/音频执行不限帧 headless 测试；两条路径都运行真实 Lua 脚本、资源系统、碰撞逻辑和测试桥。OpenGL 路径会批量提交旧顶点/索引，在 GPU 缓存源纹理，以 FBO 承载 RenderTarget，并直接显示主目标，不再逐帧上传 CPU 画布；受支持构建均不编译或链接 DirectX。
+
+当前边界也必须保留：任意旧 HLSL 效果尚未翻译为 GLSL，只能退化为可见的 RenderTarget 直通合成；model 绘制和现代 MeshRenderer 尚未完全等价。上文 CrossOver/DXVK 结果验证的是原 Windows 可执行文件，属于独立证据，不是当前跨平台源码的运行依赖。
+
+完整 macOS 引擎的 preset 会依次配置、构建、执行无 DirectX 审计并运行对应测试：
+
+```bash
+cd /Users/happyelements/LuaSTG-Sub
+cmake --workflow --preset macos-headless-release
+cmake --workflow --preset macos-opengl-release
+```
+
+仓库仍保留较小且隔离的 `LuaSTGPortableTest` target。它复用原引擎 `XCollision` 的圆形/旋转椭圆判定，支持完全不初始化视频设备的不限帧 headless 模式，以及 SDL2 软件简化碰撞/风险区视图。这个 target 适合算法测试，但不能当作完整 macOS 游戏运行时。
 
 ```bash
 cd /Users/happyelements/LuaSTG-Sub
@@ -128,9 +151,26 @@ build/portable-native/portable/LuaSTGPortableTest \
   --screenshot build/portable-native/portable/orbit-dummy.bmp
 ```
 
-`pulse` 覆盖安全区扩张、保持、收缩和最小保持，`orbit` 覆盖旋转强制位移体与旋转扇形弹；简化画面绘制与碰撞体一致的椭圆轮廓、自机判定和四级风险栅格。本机 arm64 macOS 已完成全新配置、Release 构建并由 CTest `1/1` 通过。已记录的 10 万帧 pulse 无渲染实测约为 1,511,690 逻辑帧/秒；包含 710,400 个风险采样的 600 帧 orbit 实测约为 496,620 逻辑帧/秒。Metal 截图 `build/portable-native/portable/pulse-macos.bmp` 和 SDL dummy 软件截图 `build/portable-native/portable/orbit-dummy.bmp` 都是非空 `480x560` BMP。该 target 是算法开发/碰撞可视化部分模块，不执行任意 SR Lua，不能替代原版 LuaSTG Sub 的 `attack_complete` 验收。
+`pulse` 覆盖安全区扩张、保持、收缩和最小保持，`orbit` 覆盖旋转强制位移体与旋转扇形弹；简化画面绘制与碰撞体一致的椭圆轮廓、自机判定和四级风险栅格。本机 arm64 macOS 已完成全新配置、Release 构建并由 CTest `1/1` 通过。已记录的 10 万帧 pulse 无渲染实测约为 1,511,690 逻辑帧/秒；包含 710,400 个风险采样的 600 帧 orbit 实测约为 496,620 逻辑帧/秒。macOS SDL2 软件截图 `build/portable-native/portable/pulse-macos.bmp` 和 SDL dummy 软件截图 `build/portable-native/portable/orbit-dummy.bmp` 都是非空 `480x560` BMP。该 target 是算法开发/碰撞可视化部分模块，不执行任意 SR Lua，不能替代完整引擎的 `attack_complete` 验收。
 
-引擎根目录的 `game/plugins/SafetyZoneVisualizer` 提供原生游戏内 F7 分级覆盖层；也可设置 `SR_SAFETY_ZONE_OVERLAY=1` 在首次游戏渲染前开启。它按当前可碰撞对象及未来 `0/6/12` 帧线性投影绘制绿色安全、黄色注意、橙色危险和红色碰撞四级区域，支持圆、旋转椭圆、矩形及直线激光。直线激光不再依赖通用椭圆字段：即使 THlib 对象的 `a=b=0`，插件也会按 `l1/l2/l3/w` 构造两端渐宽/渐窄的多边形并计算距离。插件只读对象几何，不修改输入、RNG、碰撞或 AI 记忆；曲线激光内部仍不由此诊断插件栅格化，实际碰撞以引擎为准。主脚本 SHA-256 为 `3815bbd95a36e4c5cf32c8ebac698cdc9200434145dc15131acde3471075cc3e`。
+引擎根目录的 `game/plugins/SafetyZoneVisualizer` 提供原生游戏内 F7 分级覆盖层；也可设置 `SR_SAFETY_ZONE_OVERLAY=1` 在首次游戏渲染前开启。它按当前可碰撞对象及未来 `0/6/12` 帧线性投影绘制绿色安全、黄色注意、橙色危险和红色碰撞四级区域，支持圆、旋转椭圆、矩形及直线激光。直线激光不再依赖通用椭圆字段：即使 THlib 对象的 `a=b=0`，插件也会按 `l1/l2/l3/w` 构造两端渐宽/渐窄的多边形并计算距离。插件只读对象几何，不修改输入、RNG、碰撞或 AI 记忆；曲线激光内部仍不由此诊断插件栅格化，实际碰撞以引擎为准。
+
+覆盖层的保守空间索引只登记可能影响分级的投影边界内单元。独立测试针对椭圆、旋转矩形、渐宽/渐窄激光、快速投影、边界条件和 350 发弹幕逐格对比原始 full scan，任何风险等级降低都会失败。实跑仅有 `17803/705600` 次查询进入精确净空距离计算，即 2.52%；672 个栅格单元合并为 253 个同级渲染矩形，即 `253/672`（渲染矩形/原单元），同时保持逐格完全等价。主脚本 SHA-256 为 `ce491f13a446c05e301c734d695b82d76336e01fadd189b6823ed2a33f14891c`。
+
+### 原生渲染性能与指标边界
+
+保留的同配置基准使用 LuaSTG Sub v0.21.129、原生 arm64 macOS 15.7.3、Apple M4 Max 40 核 GPU、`640x480` 可见窗口和开启的 VSync。四轮都运行 Stage 5 Boss #3、seed `20260730`，记录 1200 个有效样本、0 个无效样本，逐帧渲染，决策间隔 3、观察延迟 5；密集段定义为 `OBJ >= 300`，每轮都有 273 个密集样本，峰值为 421 OBJ。
+
+| 渲染器 / 覆盖层 | 密集段中位 FPS | P10 FPS | 最低 FPS | 报告 SHA-256 |
+| --- | ---: | ---: | ---: | --- |
+| CPU 软件 / 关闭 | 30.252 | 29.390 | 28.241 | `7cfcd17ca4ac9e86d3815ca9f302a33b4a6bb704f88b78c6e7949db1d1c61a4f` |
+| CPU 软件 / 优化覆盖层 | 29.159 | 28.290 | 25.463 | `b8bf286e2bc68ae6319dee67a7cc80140356b33e24101e844577db16def3d9a0` |
+| OpenGL GPU/FBO / 关闭 | 59.990 | 59.867 | 58.911 | `74482a01232db58d21fa75dc51f7a9e10b8ff2f3844b3484ade9f9bf9747d126` |
+| OpenGL GPU/FBO / 优化覆盖层 | 59.988 | 59.984 | 52.265 | `67f5c5335b317d11584c01e392e91ff1e9b039723498d437a05614fdd43e94b7` |
+
+严格 GPU 加覆盖层击破报告还覆盖 3816 个有效显示样本，峰值 532 OBJ；其中 2844 个密集样本中位为 59.988 FPS、P10 为 59.492 FPS，并且最终达到 `attack_complete`。
+
+`render_performance` 只用于报告和诊断。其来源是 `lstg.GetFPS` 的原生 60 显示帧平均值以及 `lstg.GetnObj`，报告明确写入 `reporting_only_not_controller_input=true`；这些字段不进入 AI 观测、MPC 选择或区域动力学记忆。显示 FPS 表示原生渲染/Present 节奏，会受 VSync 影响；lockstep throughput 则是 Python/桥接控制下每秒推进的逻辑帧数或决策数，必须单独按 wall-clock 统计，不能称作显示 FPS 或 AI 推理帧率。
 
 ### Windows 可见演示与防闪烁
 
@@ -221,7 +261,7 @@ git diff --check
 
 ### 当前原生 Boss #3 严格结果
 
-当前完成的三次验证都使用 CrossOver 26.3 + DXVK 启动新的原生 LuaSTG Sub 进程，从 Spell Practice reset 开始连续 `live_mpc` 闭环。v40/v41 是五帧观察延迟的持出验证，v42 是单列的零延迟回归；三局都使用区域动力学记忆 v2、`authority_state_shield=false` 和 `spell=false`。结果均在第 3816 帧由引擎确认 Boss HP `6000 -> 0`，自机 `death=0`，且 `unsafe_shot_frames=0`：
+保留的三次 CrossOver 验证都使用 CrossOver 26.3 + DXVK 启动新的原生 LuaSTG Sub 进程，从 Spell Practice reset 开始连续 `live_mpc` 闭环。v40/v41 是五帧观察延迟的持出验证，v42 是单列的零延迟回归；三局都使用区域动力学记忆 v2、`authority_state_shield=false` 和 `spell=false`。结果均在第 3816 帧由引擎确认 Boss HP `6000 -> 0`，自机 `death=0`，且 `unsafe_shot_frames=0`：
 
 | 报告 | seed | 观察延迟 | 严格终态 | Boss HP / 自机 | SHA-256 |
 | --- | ---: | ---: | --- | --- | --- |
@@ -230,6 +270,8 @@ git diff --check
 | v42 | 20260732 | 0 | `terminated=true`、`attack_complete`、`passed=true` | `6000 -> 0`、`death=0` | `a45084f331ecd82d0fecff636bf1921c9b547f41f82a1db6846ff76d15d7e37f` |
 
 三份报告绑定同一实现指纹 `5a81172add05549fdf1ea6d65272d26dd08afc3de6c289ab3124e9f7b2e69613` 和同一 v2 记忆 SHA-256 `dcdcddeeed840d733e144477934f217b21f6795ab9a83790d7f3813d273546f7`。五帧延迟持出验证为两个已执行 seed 的 `2/2`，零延迟回归另行通过；这里不外推为尚未执行 seed 的统计成功率。
+
+另有一轮完整引擎的原生 macOS OpenGL 验证在启用优化 F7 覆盖层时满足同一严格成功定义。`engine-mpc-boss3-gpu-overlay-strict-seed20260730.json` 的 SHA-256 为 `ec3f758a8a5135b33e139076bdecdb050bf1117f1e13622679a91c40e8110def`；报告在第 3816 帧写入 `terminated=true`、`termination_reason=attack_complete` 和 `passed=true`，Boss HP `6000 -> 0`、`death=0`、`unsafe_shot_frames=0`，并强制 `spell=false`。该报告的 `acceptance_claim=false`，所以它是单局 live MPC teacher 的严格原生击破证据，不是部署模型验收，也不证明 Boss #4。
 
 桥接器已经由真实引擎启动并监听 `24816` 后，可用下列命令复跑；命令在未达到唯一成功条件时以非零状态退出：
 

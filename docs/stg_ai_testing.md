@@ -276,10 +276,35 @@ normalized RMSE 0; its 180-frame sign inversion has 252 pairs, correlation
 1.0, and normalized RMSE 0. Shifting the entire input timeline does not change
 memory or relative sample statistics.
 
+### Exact MPC prefilter equivalence and performance
+
+`experiments/benchmark_engine_mpc_beam.py` compares the conservative
+candidate-AABB threat prefilter with the unfiltered reference beam on recorded
+observations from
+`engine-mpc-boss3-heldout-v40-d5-region-dynamics-v2.json` (SHA-256
+`e7577aa475ed9a9de6542fedfba8a193dca1b3d8a927e139371e22f41b2d94ef`).
+A recorded three-repeat median run produced:
+
+| Source frame | Mode | Threats | Unfiltered median | Prefiltered median | Speedup | Exact beam output |
+| ---: | --- | ---: | ---: | ---: | ---: | --- |
+| 995 | local beam | 364 | 0.3653 s | 0.1292 s | 2.83x | equal |
+| 1292 | region planning | 193 | 0.3809 s | 0.1209 s | 3.15x | equal |
+
+This is exact field-by-field equality, not only equal selected actions or final
+states. Every candidate's action, `collided`, `collision_frames`,
+`earliest_collision_frame`, floating-point `minimum_margin`, boundary penalty,
+boss-alignment penalty, and complete 20-segment plan are equal. The stateful
+frame-1292 replay also matched the unfiltered controller for 21 decisions after
+a 60-frame warm-up, including the committed action, planned actions, and
+collision fields from the source report. Five-repeat reruns on the same host
+have varied within approximately 2.7x-3.4x, so these timings are benchmark
+samples rather than a guaranteed lower bound.
+
 ### Strict native Boss #3 results
 
-Three fresh original LuaSTG Sub processes under CrossOver 26.3 with DXVK
-passed the sole native success condition. v40 and v41 are five-frame-delay
+The retained CrossOver evidence uses three fresh original LuaSTG Sub processes
+under CrossOver 26.3 with DXVK. All passed the sole native success condition.
+v40 and v41 are five-frame-delay
 held-out runs; v42 is a separate zero-delay regression. All three used
 `authority_state_shield=false`, forced `spell=false`, and the v2 memory above.
 They reduced boss HP from 6000 to 0 without a player death, terminated at
@@ -297,21 +322,54 @@ All three reports bind implementation SHA-256
 The two delay-5 held-out attempts passed, and the zero-delay regression passed;
 this is not a statistical success-rate claim or evidence for Boss #4.
 
+A separate full-engine native macOS OpenGL run kept the optimized F7 overlay
+enabled and met the same strict success definition. Report
+`engine-mpc-boss3-gpu-overlay-strict-seed20260730.json` (SHA-256
+`ec3f758a8a5135b33e139076bdecdb050bf1117f1e13622679a91c40e8110def`)
+has `terminated=true`, `termination_reason=attack_complete`, and `passed=true`
+at episode frame 3816. Boss HP changed from 6000 to 0, player `death=0`,
+`unsafe_shot_frames=0`, and `spell=false` was forced. It is single-run live MPC
+evidence with `acceptance_claim=false`, not a deployable-policy acceptance or a
+Boss #4 result.
+
 The earlier standalone v2 SQLite single-route and route-library artifacts and
 their hashes remain reproducible historical benchmarks. Because they contain
 recorded routes, they do not represent current Engine MPC strategy memory and
 do not establish live-engine generalization.
 
-## 7. Portable High-speed Testing and Simplified Rendering
+## 7. Portable Full Engine, High-speed Test Target, and Rendering
 
-LuaSTG-Sub's graphics, window, audio, input, and shell build graph directly
-depends on Win32, D3D11, and XAudio2, so replacing D3D11 alone cannot produce a
-working macOS engine. The implementation in `/Users/happyelements/LuaSTG-Sub`
-adds an isolated `LuaSTGPortableTest` CMake target. It reuses the engine's
-`XCollision` circle/rotated-ellipse implementation and supports an uncapped
-headless mode that does not initialize video, plus an SDL2 simplified
-collision/risk view. SDL2 uses Metal on macOS when accelerated rendering is
-available; Vulkan and MoltenVK are not required.
+The current `/Users/happyelements/LuaSTG-Sub` source no longer has the old
+complete-engine DirectX dependency. The complete executable supports Windows,
+macOS, and Linux through SDL2 window/input/audio plus an OpenGL 4.1 GPU
+sprite/FBO renderer, or null graphics/window/audio for uncapped headless runs.
+Both paths execute the real Lua scripts, resource system, collision logic, and
+test bridge. The OpenGL path batches legacy vertices and indices, caches source
+textures on the GPU, renders to FBO-backed targets, and presents the main target
+without a per-frame CPU-canvas upload. Supported builds compile and link no
+DirectX code.
+
+The remaining renderer boundaries are explicit: arbitrary legacy HLSL effects
+are not translated to GLSL and currently fall back to visible RenderTarget
+pass-through composition; model drawing and the modern MeshRenderer path are
+not yet feature-equivalent. The CrossOver/DXVK results above concern the
+original Windows executable and remain separate evidence. They are not a
+runtime requirement for the current portable source build.
+
+The full macOS presets configure, build, run the DirectX audit, and execute the
+corresponding tests:
+
+```bash
+cd /Users/happyelements/LuaSTG-Sub
+cmake --workflow --preset macos-headless-release
+cmake --workflow --preset macos-opengl-release
+```
+
+The repository also retains a smaller, isolated `LuaSTGPortableTest` target.
+It reuses the engine's `XCollision` circle/rotated-ellipse implementation and
+supports an uncapped no-video headless mode plus a simplified SDL2 software
+collision/risk view. This target is useful for algorithm tests but is not the
+complete macOS game runtime.
 
 ```bash
 cd /Users/happyelements/LuaSTG-Sub
@@ -334,12 +392,12 @@ build/portable-native/portable/LuaSTGPortableTest \
 The clean arm64 macOS build passed its CTest (`1/1`). The measured 100,000-frame
 headless pulse run reached approximately 1,511,690 logical frames/second, and
 the orbit probe with graded-risk analysis reached approximately 496,620
-frames/second. The Metal-backed macOS capture
+frames/second. The native macOS SDL2 software capture
 `build/portable-native/portable/pulse-macos.bmp` and SDL dummy software capture
 `build/portable-native/portable/orbit-dummy.bmp` are both nonempty `480x560`
 32-bit BMPs. This target is a partial collision and algorithm-development
-module. It does not execute arbitrary SR Lua and cannot replace original
-LuaSTG Sub `attack_complete` acceptance.
+module. It does not execute arbitrary SR Lua and cannot replace full-engine
+`attack_complete` acceptance.
 
 `game/plugins/SafetyZoneVisualizer` adds an in-engine F7 overlay, or it can be
 enabled at launch with `SR_SAFETY_ZONE_OVERLAY=1`. It grades safe, caution,
@@ -348,10 +406,47 @@ projections, supporting circles, rotated ellipses, rectangles, and straight
 lasers. Straight lasers are evaluated as tapered polygons from `l1`, `l2`,
 `l3`, and `w`, including THlib laser objects whose generic ellipse fields
 `a=b=0`; this avoids silently dropping their collision area. Curved-laser
-interiors are not rasterized. The implementation file SHA-256 is
-`3815bbd95a36e4c5cf32c8ebac698cdc9200434145dc15131acde3471075cc3e`.
+interiors are not rasterized. Its conservative spatial index registers only
+cells inside classification-relevant projected bounds. The standalone test
+compares every optimized cell with the original full scan, covering ellipses,
+rotated rectangles, tapered lasers, fast projections, boundary cases, and a
+350-bullet field; any lower risk level fails the test. The benchmark required
+17,803 exact clearance calculations out of the full scan's 705,600 (2.52%) and
+coalesced 672 cells into 253 render rectangles (`253/672`, rectangles/cells),
+while preserving exact per-cell parity. The implementation file SHA-256 is
+`ce491f13a446c05e301c734d695b82d76336e01fadd189b6823ed2a33f14891c`.
 The overlay reads geometry only and does not alter input, RNG, collision, or AI
 memory.
+
+### Native renderer performance and metric boundaries
+
+The retained renderer benchmark uses LuaSTG Sub v0.21.129 on native arm64
+macOS 15.7.3, an Apple M4 Max with a 40-core GPU, a visible `640x480` window,
+and VSync enabled. Every 1200-sample run uses Stage 5 Boss #3, seed `20260730`,
+`render=true`, `render_every=1`, decision interval 3, observation delay 5, and
+the same live MPC configuration. Dense samples are frames with `OBJ >= 300`;
+all four runs have 273 dense samples, zero invalid samples, and peak at 421
+objects.
+
+| Renderer / overlay | Dense median FPS | Dense P10 FPS | Dense minimum FPS | Artifact SHA-256 |
+| --- | ---: | ---: | ---: | --- |
+| CPU software / off | 30.252 | 29.390 | 28.241 | `7cfcd17ca4ac9e86d3815ca9f302a33b4a6bb704f88b78c6e7949db1d1c61a4f` |
+| CPU software / optimized overlay | 29.159 | 28.290 | 25.463 | `b8bf286e2bc68ae6319dee67a7cc80140356b33e24101e844577db16def3d9a0` |
+| OpenGL GPU/FBO / off | 59.990 | 59.867 | 58.911 | `74482a01232db58d21fa75dc51f7a9e10b8ff2f3844b3484ade9f9bf9747d126` |
+| OpenGL GPU/FBO / optimized overlay | 59.988 | 59.984 | 52.265 | `67f5c5335b317d11584c01e392e91ff1e9b039723498d437a05614fdd43e94b7` |
+
+The strict GPU-plus-overlay defeat report above extends this to 3816 valid
+display samples, peak 532 objects, and 2844 dense samples, with dense median
+59.988 FPS and P10 59.492 FPS while still reaching `attack_complete`.
+
+`render_performance` is reporting and diagnosis only. Its source is
+`lstg.GetFPS`, a 60-native-frame display average, plus `lstg.GetnObj`; the
+report explicitly sets `reporting_only_not_controller_input=true`. These fields
+do not enter the AI observation, MPC selection, or region-dynamics memory.
+Display FPS describes the native render/Present cadence and is affected by
+VSync. Lockstep throughput instead means logical frames or decisions advanced
+per wall-clock second under Python/bridge control. It must be reported
+separately and must not be called display FPS or AI inference FPS.
 
 ### Windows visible lockstep and flicker
 

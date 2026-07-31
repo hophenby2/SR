@@ -72,6 +72,8 @@ local function native_get_key(code)
     return code == 99
 end
 GetKeyState = native_get_key
+function GetFPS() return 47.5 end
+function GetnObj() return 123 end
 
 local old_frame_count = 0
 function FrameFunc()
@@ -240,6 +242,10 @@ check(player_object.protect == 500, "player protection override was not applied"
 check(encoded_values[#encoded_values].id == 1 and encoded_values[#encoded_values].ok, "missing reset response")
 check(encoded_values[#encoded_values].observation.counts.enemy_bullets == 1, "visibility filter failed")
 check(encoded_values[#encoded_values].observation.counts.lasers == 1, "laser classification failed")
+check(encoded_values[#encoded_values].observation.performance.native_fps == 47.5,
+    "native FPS telemetry mismatch")
+check(encoded_values[#encoded_values].observation.performance.object_count == 123,
+    "native object-count telemetry mismatch")
 check(getmetatable(encoded_values[#encoded_values].observation.nontjt_enemies) == fake_cjson.array_mt,
     "empty observation arrays must retain JSON array identity")
 

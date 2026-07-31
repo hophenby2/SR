@@ -12,6 +12,7 @@ from .engine_mpc import EngineMPC, MPCDecision
 from .engine_play import _OutcomeTrace, _catalog_entry, _observation
 from .protocol import Action
 from .provenance import source_tree_sha256
+from .render_performance import RenderPerformanceTrace
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +173,7 @@ def _controller_observation(
     """Keep hazards delayed while exposing the player's current visible state."""
 
     result = dict(delayed)
+    result.pop("performance", None)
     player = current.get("player")
     if isinstance(player, Mapping):
         result["player"] = dict(player)
@@ -236,6 +238,8 @@ def run_engine_mpc_play(
 
     trace = _OutcomeTrace()
     trace.push(raw)
+    render_performance = RenderPerformanceTrace()
+    render_performance.push(raw)
     decisions: list[dict[str, Any]] = []
     logical_frames = 0
     shot_frames = 0
@@ -269,6 +273,7 @@ def run_engine_mpc_play(
                 )
             delayed_observations.append(raw)
             trace.push(raw)
+            render_performance.push(raw)
             logical_frames += 1
             advanced += 1
             shot_frames += int(action.shoot)
@@ -375,6 +380,7 @@ def run_engine_mpc_play(
             "catalog_entry": catalog_entry,
         },
         "outcome_evidence": trace.report(raw),
+        "render_performance": render_performance.report(),
         "terminal_transition_evidence": (
             None if terminal_before is None else {
                 "reporting_only_not_controller_input": True,
