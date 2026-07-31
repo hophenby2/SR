@@ -1091,7 +1091,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--render-every",
         type=int,
         default=1,
-        help="present one of every N logical frames when rendering is enabled",
+        help=(
+            "native-engine compatibility hint; visible LuaSTG redraws every "
+            "present to avoid black-buffer flicker"
+        ),
     )
     engine_play_parser.add_argument("--output", type=Path)
     engine_play_parser.set_defaults(handler=_command_engine_play)
@@ -1129,7 +1132,15 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    engine_mpc_parser.add_argument("--render-every", type=int, default=1)
+    engine_mpc_parser.add_argument(
+        "--render-every",
+        type=int,
+        default=1,
+        help=(
+            "native-engine compatibility hint; visible LuaSTG redraws every "
+            "present to avoid black-buffer flicker"
+        ),
+    )
     engine_mpc_parser.add_argument("--output", type=Path)
     engine_mpc_parser.set_defaults(handler=_command_engine_mpc_play)
 

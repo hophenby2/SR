@@ -132,6 +132,32 @@ build/portable-native/portable/LuaSTGPortableTest \
 
 引擎根目录的 `game/plugins/SafetyZoneVisualizer` 提供原生游戏内 F7 分级覆盖层；也可设置 `SR_SAFETY_ZONE_OVERLAY=1` 在首次游戏渲染前开启。它按当前可碰撞对象及未来 `0/6/12` 帧线性投影绘制绿色安全、黄色注意、橙色危险和红色碰撞四级区域，支持圆、旋转椭圆、矩形及直线激光。直线激光不再依赖通用椭圆字段：即使 THlib 对象的 `a=b=0`，插件也会按 `l1/l2/l3/w` 构造两端渐宽/渐窄的多边形并计算距离。插件只读对象几何，不修改输入、RNG、碰撞或 AI 记忆；曲线激光内部仍不由此诊断插件栅格化，实际碰撞以引擎为准。主脚本 SHA-256 为 `3815bbd95a36e4c5cf32c8ebac698cdc9200434145dc15131acde3471075cc3e`。
 
+### Windows 可见演示与防闪烁
+
+原生 LuaSTG 每个显示循环都会先把交换链目标清为黑色，再调用 Lua `RenderFunc`，最后执行 Present。可见 lockstep 等待 Python 时不能通过提前返回来减少重复绘制，否则这些已清空的缓冲仍会提交，形成完整画面与黑帧交替的高频闪烁。桥接器现已在所有可见显示循环重绘当前逻辑状态；`--render-every` 只作为旧协议兼容提示保留，不再在 Lua 层跳过绘制。无渲染模式仍会抑制 Lua 场景绘制。
+
+Windows 必须先关闭正在运行的 LuaSTG，再把修改后的桥接器同步到本地游戏副本；从映射盘运行控制器不影响连接：
+
+```powershell
+$SourceRoot = 'Z:\crack\LuaSTG_aex+v0.8.22-beta.2 (based on LuaSTG_ex+v0.83b)'
+$Mod = 'SR_Subterrain_Reanimation_v100'
+Copy-Item -LiteralPath "$SourceRoot\game\mod\$Mod\compat\testing\bridge.lua" `
+  -Destination "C:\stg-win-demo\mod\$Mod\compat\testing\bridge.lua" -Force
+```
+
+可见演示使用 `SR_TEST_HEADLESS=0`、`SR_TEST_LOCKSTEP=1` 和 `--render --render-every 1`。启动参数应设置 `setting.vsync=true`；这可禁止允许 tearing 的提交，但仅开 vsync 不能修复旧桥接器产生的黑帧。修改 Lua 文件后必须重启引擎，因为文件只在启动时加载。若只有风险色块闪动而游戏底图稳定，可按 F7 关闭覆盖层并单独排查；整屏明暗交替则应先检查本地 `bridge.lua` 是否已经同步。
+
+完成本地游戏复制和 `.venv-win` 安装后，可直接双击 `tools\stg_lab\run-win-boss3.cmd`。它只启动现有文件，不复制、覆盖或安装游戏与 Python 环境。脚本会校验本地桥接器与当前源码一致，设置测试环境变量，以 `setting.vsync=true` 启动 `C:\stg-win-demo\LuaSTGSub.exe`，无连接地等待端口监听，然后运行 Boss #3 可见 MPC 测试。成功仍只接受引擎返回 `attack_complete`。报告写入带时间戳的 `tools\stg_lab\artifacts\engine-mpc-boss3-win-*.json`；默认保留游戏窗口，传入 `-CloseGameWhenDone` 才会在结束后请求关闭。
+
+也可从 PowerShell 覆盖默认参数：
+
+```powershell
+& .\run-win-boss3.ps1 `
+  -LocalGameRoot 'C:\stg-win-demo' `
+  -Seed 20260730 `
+  -Port 24816
+```
+
 从模组根目录运行 Python/Lua 静态检查的命令如下；portable 的构建、CTest、headless 和截图命令见上方代码块：
 
 ```bash

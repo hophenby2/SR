@@ -353,6 +353,21 @@ interiors are not rasterized. The implementation file SHA-256 is
 The overlay reads geometry only and does not alter input, RNG, collision, or AI
 memory.
 
+### Windows visible lockstep and flicker
+
+Native LuaSTG clears its swap-chain target before calling the Lua `RenderFunc`
+and presents it afterward. Returning early from `RenderFunc` does not cancel
+that present, so suppressing duplicate logical frames submits black buffers
+while lockstep waits for Python. The bridge now redraws the current logical
+state on every visible native render pass. `--render-every` remains an accepted
+protocol compatibility hint, but no longer suppresses Lua drawing; headless
+mode still suppresses scene drawing. Visible Windows runs should use
+`setting.vsync=true`, `SR_TEST_HEADLESS=0`, `SR_TEST_LOCKSTEP=1`, and
+`--render --render-every 1`. Vsync reduces tearing but cannot repair the black
+frames produced by an older bridge. A copied Windows game directory must be
+updated with the current `compat/testing/bridge.lua`, and LuaSTG must be
+restarted after the file is replaced.
+
 ## 8. Model and Training
 
 The reference policy uses a dual visual encoder:

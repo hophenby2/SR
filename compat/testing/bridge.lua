@@ -677,7 +677,6 @@ function Instance:_handle_request(request)
             local render_every = integer(request.every, self.config.render_every, 1, 600)
             self.config.headless = not request.render
             self.config.render_every = render_every
-            self.last_rendered_frame = nil
             self:_response(id, true, { render = request.render, every = render_every })
         end
     elseif command == "ping" then
@@ -1006,18 +1005,11 @@ function Instance:_render(...)
     if suppress then
         return
     end
-    -- In visible lockstep the main loop may render the same logical state many
-    -- times while Python prepares the next request. Present it once so network
-    -- and inference latency cannot turn into duplicate GPU presents.
-    if self.client and self.config.lockstep then
-        if self.last_rendered_frame == self.frame then
-            return
-        end
-        self.last_rendered_frame = self.frame
-        if self.frame % self.config.render_every ~= 0 then
-            return
-        end
-    end
+    -- LuaSTG clears and presents the swap-chain buffer even when this callback
+    -- returns without drawing. Visible lockstep must therefore redraw the
+    -- current logical state on every native render pass, including while it is
+    -- waiting for Python. render_every remains accepted for protocol
+    -- compatibility, but it cannot safely suppress drawing at the Lua layer.
     return self.original_render(...)
 end
 

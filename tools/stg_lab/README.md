@@ -253,6 +253,20 @@ The sole success condition is
 the command exits nonzero otherwise. Reaching `max_frames`, surviving longer,
 or partially reducing boss HP is a failure.
 
+For a visible native-engine run, use `--render --render-every 1` and launch
+LuaSTG with `SR_TEST_HEADLESS=0`, lockstep enabled, and `setting.vsync=true`.
+The engine clears its swap-chain target before every Lua `RenderFunc` call, so
+the bridge redraws even when the logical frame is waiting for Python;
+`--render-every` is retained only as a protocol compatibility hint for native
+runs. If the game is copied to a local Windows directory, replace that copy's
+`compat/testing/bridge.lua` and restart LuaSTG before testing this behavior.
+On Windows, double-click `run-win-boss3.cmd` after the local game and
+`.venv-win` already exist. The launcher does not copy or install anything; it
+validates those prerequisites, starts the local engine, waits for the listener
+without consuming the bridge connection, and runs the strict Boss #3 test.
+Use `run-win-boss3.ps1` directly when command-line parameter overrides are
+needed.
+
 The current strict native Boss #3 evidence consists of three fresh original
 LuaSTG Sub processes under CrossOver 26.3 with DXVK. v40 and v41 are
 five-frame-delay held-out runs; v42 is a separate zero-delay regression. All

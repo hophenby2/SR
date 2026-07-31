@@ -124,9 +124,11 @@ not end an episode. A terminated episode rejects further `step` requests until
 
 `observe` returns state without advancing logic. `display` enables or disables
 `RenderFunc` after a headless reset. Its optional `every` value is clamped to
-`[1, 600]` and presents one sampled state per that many logical frames. Visible
-lockstep never presents the same logical state twice while it waits for the
-next client action. `ping` returns protocol and
+`[1, 600]` and remains a protocol compatibility hint. Native LuaSTG clears and
+presents its swap-chain target around every `RenderFunc` call, so visible
+lockstep redraws the current logical state on every native render pass instead
+of submitting black buffers while it waits for the next client action. `ping`
+returns protocol and
 frame metadata, the supported commands/actions, run identities, and an
 operating-system/runtime identity:
 
