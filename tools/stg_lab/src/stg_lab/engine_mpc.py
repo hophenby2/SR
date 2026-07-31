@@ -72,6 +72,8 @@ class RegionDynamicsMemory:
     contracting_frames: float
     minimum_hold_frames: float
     cycle_frames: float
+    lateral_flow_cycle_frames: float | None = None
+    safe_side_rule: str | None = None
 
     def __post_init__(self) -> None:
         values = (
@@ -92,6 +94,21 @@ class RegionDynamicsMemory:
         duration_sum = sum(self.phase_durations.values())
         if not math.isclose(duration_sum, self.cycle_frames, abs_tol=3.0):
             raise ValueError("region dynamics phase durations must sum to the cycle")
+        has_lateral_cycle = self.lateral_flow_cycle_frames is not None
+        has_safe_side_rule = self.safe_side_rule is not None
+        if has_lateral_cycle != has_safe_side_rule:
+            raise ValueError(
+                "region lateral flow cycle and safe-side rule must be paired"
+            )
+        if has_lateral_cycle and (
+            not math.isfinite(self.lateral_flow_cycle_frames)
+            or self.lateral_flow_cycle_frames <= 0.0
+        ):
+            raise ValueError("region lateral flow cycle must be finite and positive")
+        if has_safe_side_rule and self.safe_side_rule != (
+            "opposite_incoming_lateral_flow"
+        ):
+            raise ValueError("unsupported region safe-side rule")
 
     @property
     def phase_durations(self) -> dict[str, float]:
@@ -122,7 +139,11 @@ def load_region_dynamics_memory(
             "region dynamics memory contains unsupported top-level fields: "
             + ", ".join(sorted(str(value) for value in unexpected_top_level))
         )
-    if raw.get("schema_version") != 1 or raw.get("kind") != "region_dynamics_memory":
+    schema_version = raw.get("schema_version")
+    if (
+        schema_version not in {1, 2}
+        or raw.get("kind") != "region_dynamics_memory"
+    ):
         raise ValueError("unsupported region dynamics memory schema")
     if scenario is not None and raw.get("scenario") != scenario:
         raise ValueError("region dynamics memory scenario does not match")
@@ -140,6 +161,8 @@ def load_region_dynamics_memory(
         "phase_durations",
         "cycle_frames",
     }
+    if schema_version == 2:
+        allowed.add("lateral_flow")
     unexpected = set(model) - allowed
     if unexpected:
         raise ValueError(
@@ -159,6 +182,27 @@ def load_region_dynamics_memory(
             raise ValueError(f"region dynamics {label} must be a finite number")
         return result
 
+    lateral_flow_cycle_frames: float | None = None
+    safe_side_rule: str | None = None
+    if schema_version == 2:
+        lateral_flow = model.get("lateral_flow")
+        if not isinstance(lateral_flow, Mapping) or set(lateral_flow) != {
+            "cycle_frames",
+            "safe_side_rule",
+        }:
+            raise ValueError(
+                "region dynamics v2 must define only the lateral flow cycle "
+                "and safe-side rule"
+            )
+        lateral_flow_cycle_frames = finite_number(
+            lateral_flow.get("cycle_frames"),
+            "lateral_flow.cycle_frames",
+        )
+        safe_side_rule_value = lateral_flow.get("safe_side_rule")
+        if safe_side_rule_value != "opposite_incoming_lateral_flow":
+            raise ValueError("unsupported region safe-side rule")
+        safe_side_rule = safe_side_rule_value
+
     return RegionDynamicsMemory(
         minimum_radius=finite_number(model.get("minimum_radius"), "minimum_radius"),
         maximum_radius=finite_number(model.get("maximum_radius"), "maximum_radius"),
@@ -177,6 +221,8 @@ def load_region_dynamics_memory(
             durations.get("minimum_hold"), "minimum_hold",
         ),
         cycle_frames=finite_number(model.get("cycle_frames"), "cycle_frames"),
+        lateral_flow_cycle_frames=lateral_flow_cycle_frames,
+        safe_side_rule=safe_side_rule,
     )
 
 
@@ -193,7 +239,7 @@ class MPCConfig:
     radius_rate_horizon: int = 6
     safe_margin_target: float = 12.0
     nonbullet_motion_horizon: int = 9
-    preferred_y: float = -176.0
+    preferred_y_fraction: float = 2.0 / 25.0
     vertical_anchor_weight: float = 0.25
     beam_cell_size: float = 4.0
     region_anchor_weight: float = 2.0
@@ -205,7 +251,6 @@ class MPCConfig:
     region_learned_max_radius: float = 28.0
     region_radius_step: float = 0.7
     region_dynamics_memory: RegionDynamicsMemory | None = None
-    track_reuse_guard_y: float = 104.0
     track_displacement_tolerance: float = 1.0
 
     def __post_init__(self) -> None:
@@ -227,8 +272,11 @@ class MPCConfig:
             raise ValueError("safe_margin_target must be finite and nonnegative")
         if self.nonbullet_motion_horizon < 0:
             raise ValueError("nonbullet_motion_horizon cannot be negative")
-        if not math.isfinite(self.preferred_y):
-            raise ValueError("preferred_y must be finite")
+        if (
+            not math.isfinite(self.preferred_y_fraction)
+            or not 0.0 <= self.preferred_y_fraction <= 1.0
+        ):
+            raise ValueError("preferred_y_fraction must be in [0, 1]")
         if not math.isfinite(self.vertical_anchor_weight) or self.vertical_anchor_weight < 0.0:
             raise ValueError("vertical_anchor_weight must be finite and nonnegative")
         region_values = (
@@ -248,8 +296,6 @@ class MPCConfig:
             raise ValueError("learned maximum radius must exceed the minimum")
         if not math.isfinite(self.region_path_weight) or self.region_path_weight < 0.0:
             raise ValueError("region_path_weight must be finite and nonnegative")
-        if not math.isfinite(self.track_reuse_guard_y):
-            raise ValueError("track_reuse_guard_y must be finite")
         weights = (self.boundary_weight, self.boss_alignment_weight)
         if not all(math.isfinite(value) and value >= 0.0 for value in weights):
             raise ValueError("MPC weights must be finite and nonnegative")
@@ -374,6 +420,17 @@ class _RegionAnchor:
             self.target_component,
             self.portal,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _RegionSideForecast:
+    """Safe exterior inferred from the next relative expansion window."""
+
+    side: str
+    x: float
+    frames_until_expansion: float
+    open_samples: int
+    total_samples: int
 
 
 @dataclass(slots=True)
@@ -934,14 +991,6 @@ class VisibleTrackEstimator:
         visible: list[PredictedThreat] = []
         seen: set[str] = set()
         delay = self.config.observation_delay
-        player_record = observation.get("player")
-        player_y = (
-            _number(player_record.get("y"))
-            if isinstance(player_record, Mapping) else None
-        )
-        guard_immediate_reuse = (
-            player_y is not None and player_y > self.config.track_reuse_guard_y
-        )
 
         for source in _OBJECT_ARRAYS:
             records = observation.get(source)
@@ -973,9 +1022,7 @@ class VisibleTrackEstimator:
                 visible_vy = dy or 0.0
                 displacement_available = dx is not None and dy is not None
                 if (
-                    source == "enemy_bullets"
-                    and guard_immediate_reuse
-                    and continuous
+                    continuous
                     and elapsed > 0
                     and displacement_available
                     and math.hypot(
@@ -1130,6 +1177,10 @@ class EngineMPC:
             raise ValueError("engine observation has invalid player bounds")
         return adjusted
 
+    def _preferred_y(self, bounds: tuple[float, float, float, float]) -> float:
+        bottom, top = bounds[2], bounds[3]
+        return bottom + (top - bottom) * self.config.preferred_y_fraction
+
     def _update_region_phase(
         self,
         observation: Mapping[str, Any],
@@ -1171,6 +1222,128 @@ class EngineMPC:
         if value is None:
             return None
         return max(0.0, value - self.config.observation_delay)
+
+    def _region_side_forecast(
+        self,
+        rows: Sequence[Sequence[PredictedThreat]],
+        player: tuple[float, float, float, float, float],
+        bounds: tuple[float, float, float, float],
+    ) -> _RegionSideForecast | None:
+        """Infer the safer exterior from flow during the next expansion.
+
+        This is intentionally episode-translation invariant. It projects only
+        currently visible row geometry from the learned relative phase; it does
+        not retain a side sequence, coordinate, action, or episode-frame cue.
+        """
+
+        dynamics_memory = self._region_phase.dynamics_memory
+        if (
+            dynamics_memory is None
+            or dynamics_memory.safe_side_rule
+            != "opposite_incoming_lateral_flow"
+        ):
+            return None
+        if self._region_phase.phase not in {
+            "minimum_hold",
+            "contracting",
+            "expanding",
+        }:
+            return None
+        frames_until_expansion = self._frames_until_region_expansion()
+        expansion_frames = self._region_phase._phase_duration("expanding")
+        if frames_until_expansion is None or expansion_frames is None:
+            return None
+        if not math.isfinite(frames_until_expansion + expansion_frames):
+            return None
+
+        minimum_radius = (
+            self._region_phase.minimum_plateau_radius
+            or self.config.region_learned_min_radius
+        )
+        maximum_radius = (
+            self._region_phase.maximum_plateau_radius
+            or self.config.region_learned_max_radius
+        )
+        growth_rate = (
+            self._region_phase.growth_rate
+            or self.config.region_radius_step
+        )
+        left, right, bottom, top = bounds
+        player_radius = player[2]
+        side_clearance = (
+            player_radius
+            + self.config.portal_clearance
+            + self.config.region_safe_margin_target
+        )
+        # Start, midpoint, and end describe topology over the expansion rather
+        # than at a single trigger instant.
+        phase_offsets = (0.0, 0.5 * expansion_frames, expansion_frames)
+        widths: dict[str, list[float]] = {"left": [], "right": []}
+        targets: dict[str, list[float]] = {"left": [], "right": []}
+        for phase_offset in phase_offsets:
+            future_frame = frames_until_expansion + phase_offset
+            radius = min(
+                maximum_radius,
+                minimum_radius + growth_rate * phase_offset,
+            )
+            for row in rows:
+                center_y = sum(
+                    item.y + item.vy * future_frame for item in row
+                ) / len(row)
+                if (
+                    center_y + radius + player_radius < bottom
+                    or center_y - radius - player_radius > top
+                ):
+                    continue
+                projected_left = min(
+                    item.x + item.vx * future_frame for item in row
+                )
+                projected_right = max(
+                    item.x + item.vx * future_frame for item in row
+                )
+                left_target = projected_left - radius - side_clearance
+                right_target = projected_right + radius + side_clearance
+                widths["left"].append(left_target - left)
+                widths["right"].append(right - right_target)
+                targets["left"].append(left_target)
+                targets["right"].append(right_target)
+
+        if not widths["left"] or len(widths["left"]) != len(widths["right"]):
+            return None
+
+        def side_key(side: str) -> tuple[int, float, float]:
+            values = widths[side]
+            return (
+                sum(value >= 0.0 for value in values),
+                sum(values),
+                min(values),
+            )
+
+        left_key = side_key("left")
+        right_key = side_key("right")
+        if left_key == right_key:
+            return None
+        side = "left" if left_key > right_key else "right"
+        other = "right" if side == "left" else "left"
+        # A one-sample numerical edge is not enough to reverse a persistent
+        # component. Require either more open samples or a full-player-diameter
+        # aggregate clearance advantage.
+        if (
+            side_key(side)[0] == side_key(other)[0]
+            and side_key(side)[1] - side_key(other)[1]
+            < 2.0 * player_radius
+        ):
+            return None
+        target_x = (
+            min(targets[side]) if side == "left" else max(targets[side])
+        )
+        return _RegionSideForecast(
+            side=side,
+            x=min(max(target_x, left), right),
+            frames_until_expansion=frames_until_expansion,
+            open_samples=side_key(side)[0],
+            total_samples=len(widths[side]),
+        )
 
     @staticmethod
     def _boss_x(observation: Mapping[str, Any], delay: int) -> float | None:
@@ -1228,6 +1401,8 @@ class EngineMPC:
         row_y = [sum(item.y for item in row) / len(row) for row in rows]
         px, py, player_radius, speed = player[:4]
         left, right, bottom, top = bounds
+        side_forecast = self._region_side_forecast(rows, player, bounds)
+        preferred_y = self._preferred_y(bounds)
         lower_index = next((
             index
             for index in range(len(rows) - 1)
@@ -1262,7 +1437,7 @@ class EngineMPC:
             lower_radius = 0.0
             lower_edge = bottom
             band_y = min(
-                self.config.preferred_y,
+                preferred_y,
                 upper_edge - self.config.portal_clearance - player_radius,
             )
             mean_vy = 0.0
@@ -1667,6 +1842,45 @@ class EngineMPC:
             add_corridor("left", left_corridor)
             add_corridor("right", right_corridor)
 
+        phase_candidate: dict[str, Any] | None = None
+        if side_forecast is not None:
+            forecast_component = f"exterior:{side_forecast.side}"
+            existing_forecast_route = next((
+                candidate
+                for candidate in portal_candidates
+                if candidate["target_component"] == forecast_component
+                and candidate["path_margin"] >= 0.0
+                and candidate["deadline_slack"] >= 0.0
+            ), None)
+            if existing_forecast_route is not None:
+                phase_candidate = existing_forecast_route
+            else:
+                route = ((side_forecast.x, band_y),)
+                margin, phase_travel = path_margin(route)
+                phase_deadline = (
+                    side_forecast.frames_until_expansion
+                    + 0.5 * expansion_duration
+                )
+                phase_candidate = {
+                    "portal": f"phase-flow:{side_forecast.side}",
+                    "target_component": forecast_component,
+                    "persistent": True,
+                    "corridor": True,
+                    "aligned": (
+                        abs(px - side_forecast.x)
+                        <= speed * self.config.decision_interval
+                    ),
+                    "x": side_forecast.x,
+                    "target_y": band_y,
+                    "approach_y": band_y,
+                    "close_frames": phase_deadline,
+                    "deadline_slack": phase_deadline - phase_travel - guard_frames,
+                    "path_margin": margin,
+                    "travel": float(phase_travel),
+                    "lateral": abs(side_forecast.x - px) / max(0.1, speed),
+                }
+                portal_candidates.append(phase_candidate)
+
         if not portal_candidates:
             navigation_mode = "evacuate" if flow_wait <= 0.0 else "hold"
             self._region_topology.update(
@@ -1724,6 +1938,19 @@ class EngineMPC:
 
         selected = max(portal_candidates, key=candidate_key)
         retained_target = self._region_topology.target_component
+
+        def retains_exterior_intent(candidate: Mapping[str, Any]) -> bool:
+            return (
+                retained_target in {"exterior:left", "exterior:right"}
+                and candidate["target_component"] == retained_target
+                and candidate["persistent"]
+                and candidate["close_frames"] is not None
+                and (
+                    candidate["deadline_slack"] >= 0.0
+                    or math.isinf(candidate["close_frames"])
+                )
+            )
+
         if retained_target is not None:
             retained = next((
                 candidate
@@ -1736,7 +1963,10 @@ class EngineMPC:
                     and candidate["close_frames"] is not None
                     and math.isinf(candidate["close_frames"])
                 )
-                and candidate["path_margin"] >= 0.0
+                and (
+                    candidate["path_margin"] >= 0.0
+                    or retains_exterior_intent(candidate)
+                )
             ), None)
             if retained is not None:
                 selected = retained
@@ -1746,12 +1976,15 @@ class EngineMPC:
             candidate
             for candidate in portal_candidates
             if candidate["target_component"] == remembered_exterior
-            and candidate["path_margin"] >= 0.0
             and (
                 candidate["deadline_slack"] >= 0.0
                 or candidate["persistent"]
                 and candidate["close_frames"] is not None
                 and math.isinf(candidate["close_frames"])
+            )
+            and (
+                candidate["path_margin"] >= 0.0
+                or retains_exterior_intent(candidate)
             )
         ]
         if (
@@ -1769,6 +2002,20 @@ class EngineMPC:
                 ),
             )
 
+        if (
+            phase_candidate is not None
+            and selected["target_component"]
+            != phase_candidate["target_component"]
+            and (
+                phase_candidate["deadline_slack"] >= 0.0
+                or self._region_phase.phase == "expanding"
+            )
+        ):
+            # The phase snapshot describes which exterior remains connected
+            # after the visible rows advect into the next expansion. A locally
+            # blocked straight segment is left to the beam as a short detour.
+            selected = phase_candidate
+
         raw_close_frames = selected["close_frames"]
         close_frames = (
             None if raw_close_frames is None else float(raw_close_frames)
@@ -1777,14 +2024,21 @@ class EngineMPC:
         selected_target_component = str(selected["target_component"])
         if (
             remembered_exterior in {"exterior:left", "exterior:right"}
+            and (
+                side_forecast is None
+                or remembered_exterior == f"exterior:{side_forecast.side}"
+            )
             and any(
                 candidate["target_component"] == remembered_exterior
-                and candidate["path_margin"] >= 0.0
                 and (
                     candidate["deadline_slack"] >= 0.0
                     or candidate["persistent"]
                     and candidate["close_frames"] is not None
                     and math.isinf(candidate["close_frames"])
+                )
+                and (
+                    candidate["path_margin"] >= 0.0
+                    or retains_exterior_intent(candidate)
                 )
                 for candidate in portal_candidates
             )
@@ -1979,6 +2233,7 @@ class EngineMPC:
         boundary_penalty = np.zeros(1, dtype=np.float64)
         plans = np.empty((1, 0), dtype=np.int8)
         left, right, bottom, top = bounds
+        preferred_y = self._preferred_y(bounds)
 
         for segment_start in range(0, self.config.horizon_frames, self.config.decision_interval):
             parents = np.repeat(np.arange(len(x)), action_count)
@@ -2059,7 +2314,7 @@ class EngineMPC:
                     self.config.boss_alignment_weight * np.abs(x - boss_x)
                 )
                 alignment += self.config.vertical_anchor_weight * np.abs(
-                    y - self.config.preferred_y,
+                    y - preferred_y,
                 )
             else:
                 alignment = self.config.region_anchor_weight * (
@@ -2131,7 +2386,7 @@ class EngineMPC:
                     self.config.boss_alignment_weight * np.abs(x[matches] - boss_x)
                 )
                 alignment += self.config.vertical_anchor_weight * np.abs(
-                    y[matches] - self.config.preferred_y,
+                    y[matches] - preferred_y,
                 )
             else:
                 alignment = self.config.region_anchor_weight * (
@@ -2235,6 +2490,7 @@ class EngineMPC:
         earliest_collision = None
         boundary_penalty = 0.0
         left, right, bottom, top = bounds
+        preferred_y = self._preferred_y(bounds)
         for future_frame, (x, y, clamped) in enumerate(path):
             frame_collision = False
             for threat in threats:
@@ -2263,7 +2519,7 @@ class EngineMPC:
                 self.config.boss_alignment_weight * abs(final_x - boss_x)
             )
             alignment += self.config.vertical_anchor_weight * abs(
-                final_y - self.config.preferred_y,
+                final_y - preferred_y,
             )
         else:
             alignment = self.config.region_anchor_weight * (

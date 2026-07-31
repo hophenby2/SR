@@ -145,11 +145,15 @@ def test_nuke_radius_uses_the_learned_maximum_envelope_at_float_oscillation() ->
     estimator = VisibleTrackEstimator(MPCConfig(observation_delay=0))
     estimator.update(observation(
         0,
-        indestructibles=[wall_object(9, 0.0, 0.0, radius=28.0)],
+        indestructibles=[
+            wall_object(9, 0.0, 0.0, radius=28.0, dx=0.0, dy=-3.0),
+        ],
     ))
     dipped = estimator.update(observation(
         3,
-        indestructibles=[wall_object(9, 0.0, -9.0, radius=27.3)],
+        indestructibles=[
+            wall_object(9, 0.0, -9.0, radius=27.3, dx=0.0, dy=-3.0),
+        ],
     ))[0]
 
     assert dipped.radius_rate == 0.0
@@ -159,11 +163,15 @@ def test_nuke_radius_uses_the_learned_maximum_envelope_at_float_oscillation() ->
     rising = VisibleTrackEstimator(MPCConfig(observation_delay=0))
     rising.update(observation(
         0,
-        indestructibles=[wall_object(9, 0.0, 0.0, radius=27.3)],
+        indestructibles=[
+            wall_object(9, 0.0, 0.0, radius=27.3, dx=0.0, dy=-3.0),
+        ],
     ))
     maximum = rising.update(observation(
         3,
-        indestructibles=[wall_object(9, 0.0, -9.0, radius=28.0)],
+        indestructibles=[
+            wall_object(9, 0.0, -9.0, radius=28.0, dx=0.0, dy=-3.0),
+        ],
     ))[0]
     assert maximum.radius_rate == 0.0
     assert maximum.at(60)[2] == 28.0
@@ -173,18 +181,24 @@ def test_nuke_minimum_float_oscillation_does_not_reset_growth_phase() -> None:
     estimator = VisibleTrackEstimator(MPCConfig(observation_delay=0))
     estimator.update(observation(
         0,
-        indestructibles=[wall_object(9, 0.0, 0.0, radius=6.3)],
+        indestructibles=[
+            wall_object(9, 0.0, 0.0, radius=6.3, dx=0.0, dy=-3.0),
+        ],
     ))
     plateau = estimator.update(observation(
         3,
-        indestructibles=[wall_object(9, 0.0, -9.0, radius=7.7)],
+        indestructibles=[
+            wall_object(9, 0.0, -9.0, radius=7.7, dx=0.0, dy=-3.0),
+        ],
     ))[0]
     assert plateau.radius == 7.7
     assert plateau.radius_rate == 0.0
 
     growth = estimator.update(observation(
         6,
-        indestructibles=[wall_object(9, 0.0, -18.0, radius=8.4)],
+        indestructibles=[
+            wall_object(9, 0.0, -18.0, radius=8.4, dx=0.0, dy=-3.0),
+        ],
     ))[0]
     assert growth.radius_rate == 0.7
     assert growth.at(3)[2] == 10.5
@@ -232,10 +246,31 @@ def test_immediately_reused_id_rejects_inconsistent_cross_frame_motion() -> None
     ))
     threat = estimator.update(observation(
         3,
-        player_y=120.0,
+        player_y=-176.0,
         bullets=[bullet(5, 50.0, 0.0, dx=-0.2, dy=-4.0)],
     ))[0]
 
+    assert threat.vx == -0.2
+    assert threat.vy == -4.0
+    assert threat.radius_rate == 0.0
+
+
+def test_immediately_reused_indestructible_id_rejects_inconsistent_motion() -> None:
+    estimator = VisibleTrackEstimator(MPCConfig(observation_delay=0))
+    estimator.update(observation(
+        0,
+        indestructibles=[
+            wall_object(9, -100.0, 0.0, radius=7.0, dx=4.0, dy=0.0),
+        ],
+    ))
+    threat = estimator.update(observation(
+        3,
+        indestructibles=[
+            wall_object(9, 50.0, 0.0, radius=7.0, dx=-0.2, dy=-4.0),
+        ],
+    ))[0]
+
+    assert threat.key == "indestructibles:9"
     assert threat.vx == -0.2
     assert threat.vy == -4.0
     assert threat.radius_rate == 0.0
@@ -353,7 +388,7 @@ def test_48_unit_gap_reaches_its_portal_closure_boundary_at_radius_17_5() -> Non
         teacher = EngineMPC(MPCConfig(
             observation_delay=0,
             horizon_frames=60,
-            preferred_y=-30.0,
+            preferred_y_fraction=74.0 / 192.0,
         ))
         return teacher.select(observation(
             10,
@@ -411,7 +446,7 @@ def test_side_portal_follows_translated_and_rotated_row_endpoints() -> None:
         teacher = EngineMPC(MPCConfig(
             observation_delay=0,
             horizon_frames=60,
-            preferred_y=-55.0,
+            preferred_y_fraction=39.0 / 202.0,
         ))
         decision = teacher.select(observation(
             10,
@@ -489,6 +524,78 @@ def learned_region_dynamics() -> RegionDynamicsMemory:
     )
 
 
+def learned_lateral_region_dynamics() -> RegionDynamicsMemory:
+    return replace(
+        learned_region_dynamics(),
+        lateral_flow_cycle_frames=360.0,
+        safe_side_rule="opposite_incoming_lateral_flow",
+    )
+
+
+def test_phase_flow_forecast_is_relative_and_mirrors_the_observed_flow() -> None:
+    def decide(
+        *,
+        mirror: int,
+        frame: int,
+        dynamics: RegionDynamicsMemory | None = None,
+    ):
+        walls = [
+            wall_object(
+                row * 100 + column,
+                mirror * x,
+                y,
+                radius=7.0,
+                dx=mirror * 1.5,
+                dy=-2.6,
+            )
+            for row, y in enumerate((60.0, 120.0, 180.0, 222.0))
+            for column, x in enumerate(
+                (-192.0, -144.0, -96.0, -48.0, 0.0, 48.0)
+            )
+        ]
+        teacher = EngineMPC(MPCConfig(
+            observation_delay=0,
+            horizon_frames=60,
+            region_dynamics_memory=(
+                learned_lateral_region_dynamics()
+                if dynamics is None else dynamics
+            ),
+        ))
+        return teacher.select(observation(
+            frame,
+            player_x=mirror * 80.0,
+            player_y=-160.0,
+            indestructibles=walls,
+            bounds=(-192.0, 192.0, -224.0, 224.0),
+        ))
+
+    left = decide(mirror=1, frame=10)
+    shifted = decide(mirror=1, frame=441)
+    mirrored = decide(mirror=-1, frame=10)
+    legacy = decide(
+        mirror=1,
+        frame=10,
+        dynamics=learned_region_dynamics(),
+    )
+
+    assert left.region_phase == shifted.region_phase == "minimum_hold"
+    assert left.region_frames_until_expansion == shifted.region_frames_until_expansion
+    assert left.region_target_component == shifted.region_target_component == (
+        "exterior:left"
+    )
+    assert left.region_portal == shifted.region_portal == "phase-flow:left"
+    assert left.region_anchor == shifted.region_anchor
+    assert left.action.move_x == shifted.action.move_x == -1
+
+    assert mirrored.region_target_component == "exterior:right"
+    assert mirrored.region_portal == "phase-flow:right"
+    assert mirrored.region_anchor is not None and left.region_anchor is not None
+    assert mirrored.region_anchor[0] == pytest.approx(-left.region_anchor[0])
+    assert mirrored.action.move_x == 1
+    assert legacy.region_portal is not None
+    assert not legacy.region_portal.startswith("phase-flow:")
+
+
 def test_region_dynamics_prior_makes_first_cycle_portal_deadline_finite() -> None:
     row_x = (-96.0, -48.0, 0.0, 48.0, 96.0)
     walls = [
@@ -555,6 +662,68 @@ def test_target_rows_ahead_comes_from_the_next_stable_band_geometry() -> None:
     )
     assert narrow_then_stable_band.region_target_component == "exterior:left"
     assert narrow_then_stable_band.region_portal == "row:2:side:left"
+
+
+def test_persistent_region_intent_survives_a_blocked_straight_path() -> None:
+    row_x = (-96.0, -48.0, 0.0, 48.0, 96.0)
+    row_y = (-200.0, -120.0, -63.0, 0.0)
+    walls = [
+        wall_object(
+            row * 100 + column,
+            x,
+            y,
+            radius=7.0,
+            dx=0.0,
+            dy=0.0,
+        )
+        for row, y in enumerate(row_y)
+        for column, x in enumerate(row_x)
+    ]
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        horizon_frames=60,
+        region_dynamics_memory=learned_region_dynamics(),
+    ))
+    first_observation = observation(
+        10,
+        player_x=80.0,
+        player_y=-160.0,
+        indestructibles=walls,
+        bounds=(-140.0, 140.0, -240.0, 256.0),
+    )
+    first_threats = teacher.estimator.update(first_observation)
+    teacher._update_region_phase(first_observation, 10)
+    first_player = teacher._player(first_observation, 0)
+    first = teacher._region_anchor(
+        first_player,
+        teacher._bounds(first_observation, first_player[2]),
+        first_threats,
+        10,
+    )
+
+    blocked_observation = observation(
+        13,
+        player_x=80.0,
+        player_y=-160.0,
+        bullets=[bullet(900, 108.0, -160.0, a=18.0, b=18.0)],
+        indestructibles=walls,
+        bounds=(-140.0, 140.0, -240.0, 256.0),
+    )
+    blocked_threats = teacher.estimator.update(blocked_observation)
+    teacher._update_region_phase(blocked_observation, 13)
+    blocked_player = teacher._player(blocked_observation, 0)
+    blocked = teacher._region_anchor(
+        blocked_player,
+        teacher._bounds(blocked_observation, blocked_player[2]),
+        blocked_threats,
+        13,
+    )
+
+    assert first is not None and blocked is not None
+    assert first.target_component == "exterior:right"
+    assert blocked.target_component == first.target_component
+    assert blocked.path_margin < 0.0
+    assert blocked.navigation_mode == "preposition"
 
 
 def test_exterior_side_changes_when_row_motion_will_close_the_near_boundary() -> None:

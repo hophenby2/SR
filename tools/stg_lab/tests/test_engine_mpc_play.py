@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
+import inspect
 from typing import Any
 
 import pytest
@@ -11,7 +10,6 @@ from stg_lab.engine_mpc import EngineMPC, MPCConfig
 from stg_lab.engine_mpc_play import (
     EngineMPCPlayConfig,
     _controller_observation,
-    load_recorded_action_prefix,
     run_engine_mpc_play,
 )
 from stg_lab.protocol import Action
@@ -122,58 +120,10 @@ def test_controller_observation_delays_hazards_but_not_own_player() -> None:
     assert visible["own_player_observation_frame"] == 15
 
 
-def write_prefix(
-    path: Path,
-    *,
-    scenario: str = "okuu:Lunatic",
-    attack: int = 3,
-    seed: int = 42,
-    player: str = "reimu_player",
-    spell: bool = False,
-    start_episode_frame: int = 0,
-    requested_frames: int = 3,
-    advanced_frames: int = 3,
-) -> None:
-    path.write_text(json.dumps({
-        "schema_version": 1,
-        "run_kind": "live_luastg_delayed_visible_mpc_teacher",
-        "scenario": scenario,
-        "attack": attack,
-        "seed": seed,
-        "player": player,
-        "initial_episode_frame": start_episode_frame,
-        "decision_count": 1,
-        "config": {
-            "reset_options": {},
-            "authority_state_shield": False,
-            "spell_forced_off": True,
-        },
-        "decisions": [{
-            "decision": 0,
-            "start_episode_frame": start_episode_frame,
-            "end_episode_frame": start_episode_frame + advanced_frames,
-            "requested_frames": requested_frames,
-            "advanced_frames": advanced_frames,
-            "action": {
-                "move_x": 1,
-                "move_y": 0,
-                "slow": True,
-                "shoot": False,
-                "spell": spell,
-            },
-        }],
-    }), encoding="utf-8")
-
-
-def update_prefix(path: Path, update) -> None:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    update(payload)
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def test_no_prefix_attack_complete_is_policy_validation_eligible() -> None:
+def test_attack_complete_is_strict_live_policy_success() -> None:
+    client = FakeEngineClient()
     report = run_engine_mpc_play(
-        FakeEngineClient(),  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
         scenario="okuu:Lunatic",
         attack=3,
         seed=42,
@@ -186,242 +136,41 @@ def test_no_prefix_attack_complete_is_policy_validation_eligible() -> None:
     assert report["episode_completed"] is True
     assert report["policy_validation_eligible"] is True
     assert report["passed"] is True
-
-
-def test_recorded_prefix_replays_then_switches_to_live_mpc(tmp_path: Path) -> None:
-    artifact = tmp_path / "prefix.json"
-    write_prefix(artifact)
-    client = FakeEngineClient()
-    controller = EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36))
-
-    report = run_engine_mpc_play(
-        client,  # type: ignore[arg-type]
-        scenario="okuu:Lunatic",
-        attack=3,
-        seed=42,
-        player="reimu_player",
-        controller=controller,
-        config=EngineMPCPlayConfig(max_frames=12, observation_delay=0),
-        prefix_artifact=artifact,
-        prefix_until_frame=3,
-    )
-
-    assert report["success"] is True
-    assert report["episode_completed"] is True
-    assert report["policy_validation_eligible"] is False
-    assert report["passed"] is False
-    assert [item["control_source"] for item in report["decisions"]] == [
-        "recorded_prefix",
-        "live_mpc",
-    ]
-    assert all(action.move_x == 1 and not action.shoot for action in client.actions[:3])
+    assert "recorded_prefix" not in report
+    assert report["unsafe_shot_frames_excludes_recorded_actions"] is False
+    assert all(item["control_source"] == "live_mpc" for item in report["decisions"])
     assert all(action.spell is False for action in client.actions)
-    assert report["recorded_prefix"]["used_decisions"] == 1
-    assert report["recorded_prefix"]["used_frames"] == 3
-    assert report["recorded_prefix"]["effective_live_switch_episode_frame"] == 3
-    assert len(report["recorded_prefix"]["artifact_sha256"]) == 64
-    assert report["decisions"][0]["predicted_collision"] is None
-    assert report["decisions"][1]["predicted_collision"] is False
+    assert all(item["predicted_collision"] is False for item in report["decisions"])
 
 
-def test_prefix_cutoff_inside_decision_switches_at_decision_end(tmp_path: Path) -> None:
-    artifact = tmp_path / "prefix-2024.json"
-    write_prefix(artifact, start_episode_frame=2023)
-    client = FakeEngineClient(initial_frame=2023, terminate_at=2029)
-    controller = EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36))
+def test_action_artifact_replay_is_not_part_of_current_mpc_api() -> None:
+    parameters = inspect.signature(run_engine_mpc_play).parameters
+    assert "prefix_artifact" not in parameters
+    assert "prefix_until_frame" not in parameters
 
+    import stg_lab.engine_mpc_play as module
+
+    assert not hasattr(module, "load_recorded_action_prefix")
+
+
+def test_max_frames_is_not_success() -> None:
     report = run_engine_mpc_play(
-        client,  # type: ignore[arg-type]
+        FakeEngineClient(terminate_at=99),  # type: ignore[arg-type]
         scenario="okuu:Lunatic",
         attack=3,
         seed=42,
         player="reimu_player",
-        controller=controller,
+        controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
         config=EngineMPCPlayConfig(max_frames=6, observation_delay=0),
-        prefix_artifact=artifact,
-        prefix_until_frame=2024,
     )
 
-    assert report["success"] is True
-    assert report["policy_validation_eligible"] is False
+    assert report["success"] is False
     assert report["passed"] is False
-    assert [item["start_episode_frame"] for item in report["decisions"]] == [2023, 2026]
-    assert [item["control_source"] for item in report["decisions"]] == [
-        "recorded_prefix",
-        "live_mpc",
-    ]
-    assert report["recorded_prefix"]["until_episode_frame"] == 2024
-    assert report["recorded_prefix"]["selected_decisions"] == 1
-    assert report["recorded_prefix"]["effective_live_switch_episode_frame"] == 2026
+    assert report["terminated"] is False
+    assert report["termination_reason"] == "max_frames"
 
 
-def test_prefix_loader_rejects_identity_mismatch(tmp_path: Path) -> None:
-    artifact = tmp_path / "wrong-seed.json"
-    write_prefix(artifact, seed=41)
-
-    with pytest.raises(ValueError, match="identity does not match"):
-        load_recorded_action_prefix(
-            artifact,
-            scenario="okuu:Lunatic",
-            attack=3,
-            seed=42,
-            player="reimu_player",
-        )
-
-
-def test_prefix_loader_rejects_spell_actions(tmp_path: Path) -> None:
-    artifact = tmp_path / "spell.json"
-    write_prefix(artifact, spell=True)
-
-    with pytest.raises(ValueError, match="uses a spell"):
-        load_recorded_action_prefix(
-            artifact,
-            scenario="okuu:Lunatic",
-            attack=3,
-            seed=42,
-            player="reimu_player",
-        )
-
-
-@pytest.mark.parametrize(
-    ("mutate", "message"),
-    [
-        (lambda value: value.update(schema_version=2), "schema_version must be 1"),
-        (lambda value: value.update(decision_count=2), "decision_count does not match"),
-        (
-            lambda value: value.update(initial_episode_frame=1),
-            "first decision does not start at initial_episode_frame",
-        ),
-    ],
-)
-def test_prefix_loader_rejects_invalid_schema_and_frame_metadata(
-    tmp_path: Path,
-    mutate,
-    message: str,
-) -> None:
-    artifact = tmp_path / "invalid-metadata.json"
-    write_prefix(artifact)
-    update_prefix(artifact, mutate)
-
-    with pytest.raises(ValueError, match=message):
-        load_recorded_action_prefix(
-            artifact,
-            scenario="okuu:Lunatic",
-            attack=3,
-            seed=42,
-            player="reimu_player",
-        )
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("move_x", True),
-        ("move_y", 1.0),
-        ("slow", 1),
-        ("shoot", 0),
-        ("spell", 0),
-    ],
-)
-def test_prefix_loader_rejects_nonexact_action_types(
-    tmp_path: Path,
-    field: str,
-    value: Any,
-) -> None:
-    artifact = tmp_path / f"invalid-{field}.json"
-    write_prefix(artifact)
-    update_prefix(
-        artifact,
-        lambda payload: payload["decisions"][0]["action"].update({field: value}),
-    )
-
-    with pytest.raises(ValueError, match=field):
-        load_recorded_action_prefix(
-            artifact,
-            scenario="okuu:Lunatic",
-            attack=3,
-            seed=42,
-            player="reimu_player",
-        )
-
-
-def test_prefix_loader_rejects_extra_action_fields(tmp_path: Path) -> None:
-    artifact = tmp_path / "extra-action-field.json"
-    write_prefix(artifact)
-    update_prefix(
-        artifact,
-        lambda payload: payload["decisions"][0]["action"].update(extra=False),
-    )
-
-    with pytest.raises(ValueError, match="action fields must be exactly"):
-        load_recorded_action_prefix(
-            artifact,
-            scenario="okuu:Lunatic",
-            attack=3,
-            seed=42,
-            player="reimu_player",
-        )
-
-
-def test_selected_prefix_decisions_must_be_complete_three_frame_holds(
-    tmp_path: Path,
-) -> None:
-    artifact = tmp_path / "short-decision.json"
-    write_prefix(artifact, requested_frames=2, advanced_frames=2)
-
-    with pytest.raises(ValueError, match="exactly three frames"):
-        run_engine_mpc_play(
-            FakeEngineClient(),  # type: ignore[arg-type]
-            scenario="okuu:Lunatic",
-            attack=3,
-            seed=42,
-            player="reimu_player",
-            controller=EngineMPC(MPCConfig(observation_delay=0)),
-            config=EngineMPCPlayConfig(observation_delay=0),
-            prefix_artifact=artifact,
-            prefix_until_frame=2,
-        )
-
-
-def test_prefix_artifact_must_cover_cutoff(tmp_path: Path) -> None:
-    artifact = tmp_path / "short-coverage.json"
-    write_prefix(artifact)
-
-    with pytest.raises(ValueError, match="does not cover"):
-        run_engine_mpc_play(
-            FakeEngineClient(),  # type: ignore[arg-type]
-            scenario="okuu:Lunatic",
-            attack=3,
-            seed=42,
-            player="reimu_player",
-            controller=EngineMPC(MPCConfig(observation_delay=0)),
-            config=EngineMPCPlayConfig(observation_delay=0),
-            prefix_artifact=artifact,
-            prefix_until_frame=4,
-        )
-
-
-def test_engine_reset_frame_must_match_recorded_prefix(tmp_path: Path) -> None:
-    artifact = tmp_path / "reset-frame.json"
-    write_prefix(artifact, start_episode_frame=1)
-
-    with pytest.raises(EngineProtocolError, match="reset initial_episode_frame"):
-        run_engine_mpc_play(
-            FakeEngineClient(initial_frame=0),  # type: ignore[arg-type]
-            scenario="okuu:Lunatic",
-            attack=3,
-            seed=42,
-            player="reimu_player",
-            controller=EngineMPC(MPCConfig(observation_delay=0)),
-            config=EngineMPCPlayConfig(observation_delay=0),
-            prefix_artifact=artifact,
-            prefix_until_frame=2,
-        )
-
-
-def test_engine_episode_frame_must_advance_one_per_step(tmp_path: Path) -> None:
-    artifact = tmp_path / "frame-skip.json"
-    write_prefix(artifact)
+def test_engine_episode_frame_must_advance_one_per_step() -> None:
 
     with pytest.raises(EngineProtocolError, match="advance by exactly one"):
         run_engine_mpc_play(
@@ -432,23 +181,4 @@ def test_engine_episode_frame_must_advance_one_per_step(tmp_path: Path) -> None:
             player="reimu_player",
             controller=EngineMPC(MPCConfig(observation_delay=0)),
             config=EngineMPCPlayConfig(observation_delay=0),
-            prefix_artifact=artifact,
-            prefix_until_frame=3,
-        )
-
-
-def test_prefix_options_must_be_supplied_together(tmp_path: Path) -> None:
-    artifact = tmp_path / "prefix.json"
-    write_prefix(artifact)
-
-    with pytest.raises(ValueError, match="must be provided together"):
-        run_engine_mpc_play(
-            FakeEngineClient(),  # type: ignore[arg-type]
-            scenario="okuu:Lunatic",
-            attack=3,
-            seed=42,
-            player="reimu_player",
-            controller=EngineMPC(MPCConfig(observation_delay=0)),
-            config=EngineMPCPlayConfig(observation_delay=0),
-            prefix_artifact=artifact,
         )

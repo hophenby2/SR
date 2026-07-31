@@ -65,29 +65,89 @@ Python Stage 5 Boss #3 场景只近似原符卡后段的移动、周期扩张危
 
 ## Engine MPC 的相位与拓扑记忆
 
-当前 Engine MPC 的长期状态只描述从在线可见信息学到的弹幕规律和安全区拓扑，不保存一局游戏的走法。Boss #3 使用可见核弹半径的中位数来抵抗对象重排、新生大核弹和平台微小摆动，并按固定顺序识别四相：
+当前 Engine MPC 的跨局策略记忆只描述从在线可见信息学到的安全区动力学，不保存一局游戏的走法。Boss #3 使用可见核弹半径的中位数来抵抗对象重排、新生大核弹和平台微小摆动，并按固定顺序识别四相：
 
 `expanding -> maximum_hold -> contracting -> minimum_hold`
 
-相位记忆只学习和保留周期、各相持续时间，以及扩张/收缩变化率。观测帧索引只允许临时用于计算可见转折之间的时间差；绝对 `episode_frame` 不能成为可复用触发点。预测门何时关闭时，控制器从当前可见相位、已学持续时间和变化率向前推演，不查固定帧表，也不读取 Lua 脚本 timer 或隐藏 phase。
+区域动力学记忆 v2 的可加载内容严格限于场景/攻击身份、半径上下限、扩张/收缩率、四相顺序与相对持续时间、半径周期，以及以下横向流规则：
 
-拓扑记忆跨帧对应当前安全连通域、目标连通域和动态选出的 `portal`。同一外侧连通空间即使跨过不同核弹排也保持同一语义身份；portal 的实际位置每次都由当前可见几何重算。相位、导航模式、当前域、目标域或 portal 改变时，旧的短期动作承诺立即失效。以下内容绝不属于策略记忆：
+```json
+"lateral_flow": {
+  "cycle_frames": 360.0,
+  "safe_side_rule": "opposite_incoming_lateral_flow"
+}
+```
+
+`opposite_incoming_lateral_flow` 表示根据下一次扩张时可见核弹排的来向选择反侧开放区，并不保存“左、右、左、右”之类的侧别序列。半径分支用观测帧号计算可见转折之间的时间差；横向流分支从相邻记录画面中最高的可碰撞核弹排位置差估速，匹配标识只用于相邻画面对应且不会写入记忆。两个分支都不读取原始 `dx/vx`、Lua 类名、脚本 timer、隐藏 phase 或 RNG 状态。
+
+控制器用当前可见相位推算下一次扩张，并把相邻可见画面估计出的核弹排运动投影到扩张开始、中点和结束三个事件切片；它比较左右外侧在三个切片中仍然开放的数量与净空，提前选取扩张后仍连通的一侧。区域目标只表达要到达的安全连通域，局部 beam 搜索可为眼前子弹另走非直线绕行路径，二者不会互相冒充。v1 记忆仍可加载以复现旧实验，但因为没有横向流契约，不启用这项相位拓扑预测。
+
+单局工作状态跨帧对应当前安全连通域、目标连通域和动态选出的 `portal`。同一外侧连通空间即使跨过不同核弹排也保持同一语义身份；portal 的实际位置每次都由当前可见几何重算。component、portal 和短期动作承诺在每次 `reset()` 时全部清空，不写入跨局 artifact。相位、导航模式、当前域、目标域或 portal 改变时，旧的短期动作承诺立即失效。以下内容绝不属于策略记忆：
 
 - 绝对 episode 帧触发点；
 - 固定世界坐标或 waypoint；
+- 预录制侧别序列、固定左右交替规则；
 - 固定动作片段或整局动作序列；
 - 只对某一次录制有效的过关路线。
 
-录制动作前缀只用于严格复现实验和跳过已验证前段以加速后段调试，不是 Engine MPC 的记忆或策略输入。加载器必须校验 `scenario/attack/seed/player` 身份、无 shield、全程 `spell=false`、动作字段和帧跨度，并要求所选决策从 reset 帧开始逐帧连续。使用前缀的结果只能证明切换点之后的闭环行为，不能作为“无前缀泛化”证据；无前缀证据必须从 reset 到结束完全由当前控制器闭环运行。
+当前 `engine-mpc-play` 已删除动作前缀 loader、运行参数和回放分支。原生诊断报告仍保存逐帧动作、位置和绝对帧以便定位故障，但当前代码没有把报告重新解释为策略输入的入口；正式运行只能从 reset 开始由 live MPC 连续闭环控制。
+
+`train-region-dynamics` 从原生报告中读取 `source_frame`、可见区域半径，以及已记录控制器输入中的可碰撞不可摧毁物 `id/x/y`；`id` 只用于相邻画面匹配，产物不保存对象身份。训练器拒绝带录制动作、非 `live_mpc` 决策、authority shield 或未强制 `spell=false` 的来源，并将训练 provenance 与可加载记忆分开保存：
+
+```bash
+cd tools/stg_lab
+uv run stg-lab train-region-dynamics \
+  --input artifacts/engine-mpc-boss3-heldout-v37-d5-memory-no-actions.json \
+  --memory-output artifacts/region-dynamics-boss3-v2.json \
+  --report-output artifacts/region-dynamics-boss3-v2-training.json
+```
+
+正式 v2 记忆 SHA-256 为 `dcdcddeeed840d733e144477934f217b21f6795ab9a83790d7f3813d273546f7`，训练报告 SHA-256 为 `95f4b3e45952f476f430158416d6f13b7617a4a5d25dbe07e522fc0107ac8e99`。输入 v37 报告 SHA-256 为 `60c1dd6bb0cfdece73d7170b3c968736479470ba87fed6e96fa68e42290134f5`，提供 357 个半径样本和 303 个横向流样本。拟合结果为半径 `7/28`、变化率 `0.7/0.7`、四相 `30/30/30/90`、半径周期 `180` 和横向流周期 `360`；360 帧重复的 201 对样本相关系数为 1、归一化 RMSE 为 0，180 帧反号的 252 对样本同样为 1 和 0。整体平移输入时间轴不会改变 memory 或相对样本统计。
 
 旧 standalone v2 的 SQLite 单路线/多路线库和对应哈希仍可用于复现历史基准，但它们包含录制路线，不再代表当前 Engine MPC 的策略记忆，也不能证明原生引擎泛化。
+
+## 跨平台高速测试与简化渲染
+
+完整 LuaSTG-Sub 的图形、窗口、音频、输入和外壳构建图都直接依赖 Win32/D3D11/XAudio2，因此只替换 D3D11 为 Vulkan 仍不能得到可运行的 macOS 完整引擎。当前实现是在 `/Users/happyelements/LuaSTG-Sub` 增加隔离的 `LuaSTGPortableTest` CMake target：它复用原引擎 `XCollision` 的圆形/旋转椭圆判定，支持完全不初始化视频设备的不限帧 headless 模式，以及 SDL2 简化碰撞/风险区视图。macOS 加速渲染由 SDL2 的 Metal 后端提供，CI 或无显示环境可用 SDL dummy 软件后端，不要求 Vulkan/MoltenVK；Linux 只需可被 CMake 找到的 SDL2。
+
+```bash
+cd /Users/happyelements/LuaSTG-Sub
+cmake --preset portable-native
+cmake --build --preset portable-native-release
+ctest --preset portable-native
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario pulse --frames 100000
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario orbit --frames 600 --analyze-risk
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario pulse --frames 180 --render --render-every 6 \
+  --screenshot build/portable-native/portable/pulse-macos.bmp
+SDL_VIDEODRIVER=dummy \
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario orbit --frames 700 --render-every 6 \
+  --screenshot build/portable-native/portable/orbit-dummy.bmp
+```
+
+`pulse` 覆盖安全区扩张、保持、收缩和最小保持，`orbit` 覆盖旋转强制位移体与旋转扇形弹；简化画面绘制与碰撞体一致的椭圆轮廓、自机判定和四级风险栅格。本机 arm64 macOS 已完成全新配置、Release 构建并由 CTest `1/1` 通过。已记录的 10 万帧 pulse 无渲染实测约为 1,511,690 逻辑帧/秒；包含 710,400 个风险采样的 600 帧 orbit 实测约为 496,620 逻辑帧/秒。Metal 截图 `build/portable-native/portable/pulse-macos.bmp` 和 SDL dummy 软件截图 `build/portable-native/portable/orbit-dummy.bmp` 都是非空 `480x560` BMP。该 target 是算法开发/碰撞可视化部分模块，不执行任意 SR Lua，不能替代原版 LuaSTG Sub 的 `attack_complete` 验收。
+
+引擎根目录的 `game/plugins/SafetyZoneVisualizer` 提供原生游戏内 F7 分级覆盖层；也可设置 `SR_SAFETY_ZONE_OVERLAY=1` 在首次游戏渲染前开启。它按当前可碰撞对象及未来 `0/6/12` 帧线性投影绘制绿色安全、黄色注意、橙色危险和红色碰撞四级区域，支持圆、旋转椭圆、矩形及直线激光。直线激光不再依赖通用椭圆字段：即使 THlib 对象的 `a=b=0`，插件也会按 `l1/l2/l3/w` 构造两端渐宽/渐窄的多边形并计算距离。插件只读对象几何，不修改输入、RNG、碰撞或 AI 记忆；曲线激光内部仍不由此诊断插件栅格化，实际碰撞以引擎为准。主脚本 SHA-256 为 `3815bbd95a36e4c5cf32c8ebac698cdc9200434145dc15131acde3471075cc3e`。
+
+从模组根目录运行 Python/Lua 静态检查的命令如下；portable 的构建、CTest、headless 和截图命令见上方代码块：
+
+```bash
+tools/stg_lab/.venv/bin/python -m compileall -q tools/stg_lab/src/stg_lab
+tools/stg_lab/.venv/bin/python -m pytest -q tools/stg_lab/tests
+luac -p ../../plugins/SafetyZoneVisualizer/__init__.lua
+luac -p ../../plugins/SafetyZoneVisualizer/SafetyZoneVisualizer.lua
+git diff --check
+```
 
 ## 实施阶段
 
 1. 建立 JSONL protocol v2、`reset/step/observation` 和确定性状态哈希。
 2. 实现 Stage 5 #3/#4 独立场景、碰撞和预测接口。
 3. 实现时空风险场、连通区域和允许跨越较低危险区的规划器。
-4. 实现由可见半径学习的四相周期、跨帧安全连通域身份和动态 portal 选择；旧 SQLite 路线工具只保留为历史 standalone 回归。
+4. 实现由可见半径与核弹排位移学习的四相/横向流周期、跨帧安全连通域身份和动态 portal 选择；旧 SQLite 路线工具只保留为历史 standalone 回归。
 5. 用 visible-v2 重建全局/局部双视野、空白冷启动、可见位移估速和五帧延迟数据。
 6. 用规划器生成示范并训练 `policy_visible_v2.pt`；shield 只保留为权威状态诊断工具。
 7. 在 Windows LuaSTG 后端运行带 PID、二进制和源码指纹的 53 项双进程确定性回归。
@@ -132,6 +192,48 @@ Python Stage 5 Boss #3 场景只近似原符卡后段的移动、周期扩张危
 这份历史验收只证明文档定义的独立仿真门槛。规划器是精确状态教师；路线评估使用延迟可见 cue 和旧路线库，其动作不是神经 checkpoint 输出，也不是当前 Engine MPC 的记忆方案。Python 场景仍是近似，存活结果不等于原符卡击破，也不等于 AI 已在真实引擎中存活。
 
 原生 Engine MPC 的单局成功标准只有：报告同时满足 `terminated=true` 和 `termination_reason=attack_complete`。由引擎确认 Boss 被击破或符卡完整结束均可；达到 `max_frames`、仅延长存活时间或只削减部分 Boss HP 一律不计成功。所有动作必须保持 `spell=false`；仅当预测安全余量达到射击阈值时才输出 `shoot=true`，危险时停止射击。带动作前缀的运行必须单列为“前缀辅助复现”，不能混入无前缀成功率。
+
+### 当前原生 Boss #3 严格结果
+
+当前完成的三次验证都使用 CrossOver 26.3 + DXVK 启动新的原生 LuaSTG Sub 进程，从 Spell Practice reset 开始连续 `live_mpc` 闭环。v40/v41 是五帧观察延迟的持出验证，v42 是单列的零延迟回归；三局都使用区域动力学记忆 v2、`authority_state_shield=false` 和 `spell=false`。结果均在第 3816 帧由引擎确认 Boss HP `6000 -> 0`，自机 `death=0`，且 `unsafe_shot_frames=0`：
+
+| 报告 | seed | 观察延迟 | 严格终态 | Boss HP / 自机 | SHA-256 |
+| --- | ---: | ---: | --- | --- | --- |
+| v40 | 20260730 | 5 | `terminated=true`、`attack_complete`、`passed=true` | `6000 -> 0`、`death=0` | `e7577aa475ed9a9de6542fedfba8a193dca1b3d8a927e139371e22f41b2d94ef` |
+| v41 | 20260731 | 5 | `terminated=true`、`attack_complete`、`passed=true` | `6000 -> 0`、`death=0` | `5cedf76c0b17028b4239f480dbd146a54cb92ead17dc898f8fc8d6fb52e981fa` |
+| v42 | 20260732 | 0 | `terminated=true`、`attack_complete`、`passed=true` | `6000 -> 0`、`death=0` | `a45084f331ecd82d0fecff636bf1921c9b547f41f82a1db6846ff76d15d7e37f` |
+
+三份报告绑定同一实现指纹 `5a81172add05549fdf1ea6d65272d26dd08afc3de6c289ab3124e9f7b2e69613` 和同一 v2 记忆 SHA-256 `dcdcddeeed840d733e144477934f217b21f6795ab9a83790d7f3813d273546f7`。五帧延迟持出验证为两个已执行 seed 的 `2/2`，零延迟回归另行通过；这里不外推为尚未执行 seed 的统计成功率。
+
+桥接器已经由真实引擎启动并监听 `24816` 后，可用下列命令复跑；命令在未达到唯一成功条件时以非零状态退出：
+
+```bash
+cd tools/stg_lab
+uv run stg-lab engine-mpc-play \
+  --host 127.0.0.1 --port 24816 \
+  --scenario 'okuu:Lunatic' --attack 3 --seed 20260730 \
+  --max-frames 4200 --horizon-frames 60 --observation-delay 5 \
+  --region-dynamics-memory artifacts/region-dynamics-boss3-v2.json \
+  --output artifacts/engine-mpc-boss3-rerun.json
+
+for report in \
+  artifacts/engine-mpc-boss3-heldout-v40-d5-region-dynamics-v2.json \
+  artifacts/engine-mpc-boss3-heldout-v41-seed20260731-d5-region-dynamics-v2.json \
+  artifacts/engine-mpc-boss3-regression-v42-seed20260732-d0-region-dynamics-v2.json
+do
+  jq -e '
+    .passed == true and .terminated == true and
+    .termination_reason == "attack_complete" and
+    .config.authority_state_shield == false and
+    .config.spell_forced_off == true and
+    .outcome_evidence.boss_hp_last_observed == 0 and
+    .outcome_evidence.final_player.death == 0 and
+    .unsafe_shot_frames == 0
+  ' "$report" >/dev/null || exit 1
+done
+```
+
+### 原生内容确定性回归
 
 引擎验证还必须满足：
 

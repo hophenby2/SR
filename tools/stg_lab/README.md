@@ -4,6 +4,13 @@ Standalone deterministic testing, region-risk planning, external episodic memory
 
 The Python simulator is an algorithm-development environment. Final game claims must be verified through `compat/testing/bridge.lua` against the original LuaSTG scripts.
 
+The current native-controller acceptance contract is narrower than the older
+standalone route benchmarks retained below. Cross-episode strategy memory may
+describe only safe-region dynamics; recorded actions, fixed coordinates,
+absolute-frame triggers, waypoints, and full-episode routes are forbidden.
+Native success means that the engine terminates the attack with
+`termination_reason=attack_complete`.
+
 Canonical standalone survival windows are 600 frames for Stage 5 Boss #3 and
 700 frames for #4. They exercise the requested mechanics but do not claim a
 boss defeat; player-shot damage is outside the standalone approximation. The
@@ -222,7 +229,164 @@ bridge protocol and live-engine report schema are v2; the embedded catalog
 schema remains v1. Runtime provenance covers all 18 actually loaded SR Lua
 files. Only the combined report can set `engine_verified: true`.
 
-## Persistent visual cue memory
+## Current native Engine MPC and region-dynamics memory
+
+`engine-mpc-play` starts at the attack reset and remains under continuous live
+MPC control. The command has no recorded-action prefix loader, prefix CLI
+option, or replay branch. Its movement candidates and emitted actions always
+set `spell=false`. Shooting is enabled only when the selected forecast has no
+collision and its minimum margin reaches `--shoot-minimum-margin`; the runner
+therefore stops shooting when its forecast is unsafe.
+
+```bash
+uv run stg-lab engine-mpc-play \
+  --host 127.0.0.1 --port 24816 \
+  --scenario 'okuu:Lunatic' --attack 3 --seed 20260730 \
+  --observation-delay 5 --horizon-frames 60 \
+  --region-dynamics-memory artifacts/region-dynamics-boss3-v2.json \
+  --output artifacts/engine-mpc-boss3.json
+```
+
+The sole success condition is
+`terminated=true && termination_reason=attack_complete`. The report sets
+`success`, `passed`, and `episode_completed` from exactly that expression, and
+the command exits nonzero otherwise. Reaching `max_frames`, surviving longer,
+or partially reducing boss HP is a failure.
+
+The current strict native Boss #3 evidence consists of three fresh original
+LuaSTG Sub processes under CrossOver 26.3 with DXVK. v40 and v41 are
+five-frame-delay held-out runs; v42 is a separate zero-delay regression. All
+three used `authority_state_shield=false`, forced `spell=false`, and
+region-dynamics v2. They reduced boss HP from 6000 to 0 with `death=0`, ended
+at episode frame 3816 with `attack_complete`, and recorded
+`unsafe_shot_frames=0`:
+
+| Run | Seed | Delay | HP | Death | Final frame | Unsafe shots | File SHA-256 |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| `engine-mpc-boss3-heldout-v40-d5-region-dynamics-v2.json` | 20260730 | 5 | `6000 -> 0` | 0 | 3816 | 0 | `e7577aa475ed9a9de6542fedfba8a193dca1b3d8a927e139371e22f41b2d94ef` |
+| `engine-mpc-boss3-heldout-v41-seed20260731-d5-region-dynamics-v2.json` | 20260731 | 5 | `6000 -> 0` | 0 | 3816 | 0 | `5cedf76c0b17028b4239f480dbd146a54cb92ead17dc898f8fc8d6fb52e981fa` |
+| `engine-mpc-boss3-regression-v42-seed20260732-d0-region-dynamics-v2.json` | 20260732 | 0 | `6000 -> 0` | 0 | 3816 | 0 | `a45084f331ecd82d0fecff636bf1921c9b547f41f82a1db6846ff76d15d7e37f` |
+
+All three reports bind implementation SHA-256
+`5a81172add05549fdf1ea6d65272d26dd08afc3de6c289ab3124e9f7b2e69613`.
+The two delay-5 held-out attempts passed, and the zero-delay regression passed;
+this is not a statistical success-rate claim or Boss #4 evidence.
+
+`train-region-dynamics` fits the allowed cross-episode strategy memory from one
+or more native Engine MPC JSON reports:
+
+```bash
+uv run stg-lab train-region-dynamics \
+  --input artifacts/engine-mpc-boss3-heldout-v37-d5-memory-no-actions.json \
+  --memory-output artifacts/region-dynamics-boss3-v2.json \
+  --report-output artifacts/region-dynamics-boss3-v2-training.json
+```
+
+The trainer's observation whitelist is strict. It consumes `source_frame`,
+`region_observed_radius`, and adjacent visible positions from the highest row
+of collidable indestructible hazards. It estimates lateral flow from the
+position displacement of at least three matched visible objects, never from
+object `dx`/`vx`, Lua class, or script-timer fields. Source frames are used
+only for relative intervals and displacement, never as reusable absolute-frame
+triggers. Every input must be a live Engine MPC report for the same scenario
+and attack, have `authority_state_shield=false`, have `spell_forced_off=true`,
+not be marked policy-validation-ineligible, contain only
+`control_source=live_mpc` decisions, and contain no enabled recorded prefix or
+prefix artifact. Inputs without complete radius cycles or a repeated
+lateral-flow cycle with half-cycle sign inversion are rejected.
+
+The loadable memory contains only identity metadata plus this strategy
+whitelist: ordered safe-region phase/change logic, minimum and maximum radius,
+expansion and contraction rates, relative phase durations, radius-cycle
+length, and this lateral-flow contract:
+
+```json
+"lateral_flow": {
+  "cycle_frames": 360.0,
+  "safe_side_rule": "opposite_incoming_lateral_flow"
+}
+```
+
+It does not retain a lateral phase offset or fixed side sequence. Training
+inputs, hashes, sample counts, and fitted-sample statistics are kept in the
+separate provenance report. Neither output may encode absolute episode frames,
+fixed world coordinates or waypoints, recorded actions, action fragments, or a
+route tied to one run.
+
+At runtime v2 projects the current visible hazard rows to the next expansion's
+start, midpoint, and end, then chooses an exterior region expected to remain
+open. That region target is separate from the local beam search around bullets.
+Schema-v1 memory remains loadable for compatibility, but it cannot enable this
+lateral-phase side prediction.
+
+The v2 memory SHA-256 is
+`dcdcddeeed840d733e144477934f217b21f6795ab9a83790d7f3813d273546f7`;
+the training-report SHA-256 is
+`95f4b3e45952f476f430158416d6f13b7617a4a5d25dbe07e522fc0107ac8e99`.
+The report binds source trace SHA-256
+`60c1dd6bb0cfdece73d7170b3c968736479470ba87fed6e96fa68e42290134f5`,
+357 radius samples, and 303 flow samples. It fits radii `7/28`, rates
+`0.7/0.7`, phase durations `30/30/30/90`, and a 180-frame radius cycle. The
+360-frame flow repeat has 201 pairs, correlation 1.0, and normalized RMSE 0;
+the 180-frame sign inversion has 252 pairs, correlation 1.0, and normalized
+RMSE 0.
+
+## Portable development runtime and in-engine risk overlay
+
+`/Users/happyelements/LuaSTG-Sub` provides the isolated
+`LuaSTGPortableTest` target for native macOS/Linux development. It reuses the
+engine's `XCollision` circle/rotated-ellipse checks and offers an uncapped
+headless mode plus an SDL2 simplified collision/risk view. On macOS, SDL2 can
+use Metal for accelerated rendering; this is not a Vulkan replacement for the
+complete Direct3D/Win32 engine.
+
+```bash
+cd /Users/happyelements/LuaSTG-Sub
+cmake --preset portable-native
+cmake --build --preset portable-native-release
+ctest --preset portable-native
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario pulse --frames 100000
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario orbit --frames 600 --analyze-risk
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario pulse --frames 180 --render-every 6 \
+  --screenshot build/portable-native/portable/pulse-macos.bmp
+SDL_VIDEODRIVER=dummy \
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario orbit --frames 700 --render-every 6 \
+  --screenshot build/portable-native/portable/orbit-dummy.bmp
+```
+
+The `pulse` and `orbit` scenarios exercise region phases, forced displacement,
+collision, risk analysis, and simplified rendering. The clean arm64 macOS build
+passed CTest (`1/1`). A measured 100,000-frame headless pulse run reached
+approximately 1,511,690 logical frames/second, while the orbit graded-risk
+probe reached approximately 496,620 frames/second. The Metal-backed
+`build/portable-native/portable/pulse-macos.bmp` and SDL dummy software
+`build/portable-native/portable/orbit-dummy.bmp` captures are nonempty
+`480x560` 32-bit BMPs. This partial runtime does not execute arbitrary SR Lua
+and cannot replace native LuaSTG `attack_complete` training or acceptance.
+
+The engine installation's `game/plugins/SafetyZoneVisualizer` plugin toggles
+with `F7`, or starts enabled with `SR_SAFETY_ZONE_OVERLAY=1`. It grades safe,
+caution, danger, and collision cells from current colliders and linear
+projections at 0, 6, and 12 frames. Circles, rotated ellipses, rectangles, and
+straight lasers are supported. Straight-laser clearance uses the tapered
+polygon defined by `l1`, `l2`, `l3`, and `w`, including THlib laser objects
+whose generic ellipse collider reports `a=b=0`; curved-laser interiors are not
+rasterized. `SafetyZoneVisualizer.lua` SHA-256 is
+`3815bbd95a36e4c5cf32c8ebac698cdc9200434145dc15131acde3471075cc3e`.
+The overlay is diagnostic and read-only: it does not change collision,
+objects, input, RNG, AI actions, or memory.
+
+## Legacy standalone benchmark: persistent visual cues and routes
+
+**Legacy standalone benchmark only.** The commands and artifacts in this
+section retain historical reproducibility, but they store or replay recorded
+routes. They are forbidden as training input, strategy memory, controller
+input, or acceptance evidence for the current native `engine-mpc-play`
+workflow.
 
 `experiments/build_route_memory_v2.py` rebuilds
 `artifacts/episodic_memory_v2.sqlite`, the Boss #3 single-route artifact, and
@@ -244,8 +408,8 @@ route on the controller-local episode timeline. Neither controller reads the
 environment frame, script timer, phase, class name, hidden RNG state, or exact
 teacher risk field.
 
-The final v2 route evaluations must use `--no-shield`. Consequently their
-reports must contain `shield: false`, `authority_state_used: false`, and
+These historical v2 route evaluations must use `--no-shield`. Consequently
+their reports must contain `shield: false`, `authority_state_used: false`, and
 `online_visible_cue: true`. `policy_visible_v2.pt` remains the system checkpoint
 identity for agreement and cross-artifact consistency; route-controller
 actions are not network outputs.
@@ -274,7 +438,11 @@ uv run stg-lab evaluate-route-library \
   --workers 8 --output artifacts/visual_v2_boss4_library.json
 ```
 
-## Strict acceptance
+## Legacy standalone v2 acceptance compiler
+
+This section documents the frozen route-based standalone acceptance compiler.
+It does not accept or validate the current native Engine MPC controller, and a
+passing legacy report does not satisfy the native `attack_complete` criterion.
 
 `accept` ignores input `passed` flags and recomputes thresholds, seed-set
 identity, timing configuration, checkpoint identity/SHA, memory semantics, and
@@ -304,7 +472,7 @@ framebuffer creation with `GL_INVALID_FRAMEBUFFER_OPERATION (0x506)`, while
 DXMT reaches the Lscreen render target and fails `IDXGISurface` acquisition
 with `E_NOINTERFACE`.
 
-The final standalone artifacts are bound to implementation SHA-256
+The frozen legacy standalone artifacts are bound to implementation SHA-256
 `ba7f4d2ee9fe5bf232f264a180a51280657f007629a54fd36c3f4884ca966cb9`
 and use the same 100 distinct seeds, 5001 through 5100, for planner and visual
 evaluation:
@@ -328,10 +496,17 @@ The memory gate passed because the second attempt survived; the report does
 not claim a numeric risk reduction. These are standalone approximation
 results, and route-controller actions are not checkpoint outputs.
 
-The final protocol-v2 DXVK reports use distinct sessions, nonces, and Win32
-PIDs 212/204. Both report executable CRC32 `8844e525`; all 18 runtime Lua CRC32
-values match the local files, and both 18-entry local SHA-256 maps match the
-current tree. Both passed all 53 attacks in 22 scenarios with 301 retained
+### Historical live-engine content-plumbing evidence
+
+The following artifacts verify attack registration, active content, runtime
+identity, and deterministic stepping. They were produced with player
+protection and neutral/no-shoot input, so `53/53` is not an AI survival or
+attack-completion result and is not current native Engine MPC acceptance.
+
+The historical protocol-v2 DXVK reports use distinct sessions, nonces, and
+Win32 PIDs 212/204. Both report executable CRC32 `8844e525`; all 18 runtime Lua
+CRC32 values match the local files, and both 18-entry local SHA-256 maps match
+the current tree. Both passed all 53 attacks in 22 scenarios with 301 retained
 hashes per attack. `engine-acceptance-v2.json` matched all 15,953 hash positions
 and records `passed: true`, `engine_verified: true`:
 

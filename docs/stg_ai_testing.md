@@ -186,49 +186,174 @@ that are born and destroyed between sample endpoints.
 
 ## 6. Engine MPC Phase and Topology Memory
 
-The current Engine MPC keeps only long-lived state that describes a pattern
-learned from online-visible information and the changing topology of safe
-space. For Boss #3 it takes the median visible nuclear-hazard radius, making
+The current Engine MPC keeps only cross-episode strategy memory that describes
+safe-region dynamics learned from online-visible information. For Boss #3 it
+takes the median visible nuclear-hazard radius, making
 the estimate insensitive to object reordering, newly spawned large outliers,
 and small plateau oscillations, and identifies this ordered four-phase cycle:
 
 `expanding -> maximum_hold -> contracting -> minimum_hold`
 
-Phase memory learns and retains only the cycle period, per-phase durations,
-and expansion/contraction rates. Observation frame indices may be used
-transiently to measure time between visible transitions, but an absolute
-`episode_frame` is never a reusable trigger. Future portal closure is forecast
-from the currently visible phase and learned durations/rates, without a fixed
-frame table, Lua script timer, or hidden script phase.
+Region-dynamics memory schema v2 retains the radius cycle period, per-phase
+durations, expansion/contraction rates, and the period of the visible lateral
+flow. Observation frame indices may be used transiently to measure intervals,
+but an absolute `episode_frame` is never a reusable trigger. Future portal
+closure is forecast from the currently visible phase and learned
+durations/rates, without a fixed frame table, Lua script timer, or hidden
+script phase.
 
-Topology memory associates safe connected components across observations and
-tracks the current component, target component, and dynamically selected
-`portal`. The same exterior free space retains one semantic identity across
-different hazard rows, while the portal geometry is recomputed from the
-current visible layout. A change in phase, navigation mode, current component,
-target component, or portal invalidates the old short action commitment. None
-of the following is strategy memory:
+The lateral-flow fit groups the highest visible row of collidable
+indestructible hazards in consecutive recorded controller-input observations.
+It matches at least three visible objects and derives horizontal flow from
+their position displacement; it does not consume object `dx`/`vx`, Lua class,
+or script-timer fields. Schema v2 stores only the fitted flow period and this
+relative rule:
+
+```json
+"lateral_flow": {
+  "cycle_frames": 360.0,
+  "safe_side_rule": "opposite_incoming_lateral_flow"
+}
+```
+
+At runtime the controller combines the current visible flow direction with
+that rule to choose the exterior region that should remain open at the next
+expansion. The memory contains no absolute lateral phase, fixed side sequence,
+or recorded movement path. The controller projects the currently visible
+hazard rows to the start, midpoint, and end of the next expansion event, so it
+can move toward an exterior region before its portal closes. This region goal
+is separate from the local beam search that avoids individual bullets along
+the way; a player-region route is not treated as a projectile trajectory.
+Schema-v1 memory remains readable for compatibility, but without lateral-flow
+data it cannot enable this next-expansion side prediction.
+
+Per-episode working state associates safe connected components across
+observations and tracks the current component, target component, and
+dynamically selected `portal`. The same exterior free space retains one
+semantic identity across different hazard rows, while portal geometry is
+recomputed from the current visible layout. Component, portal, and short action
+state is cleared by every `reset()` and is never written to a cross-episode
+artifact. A change in phase, navigation mode, current component, target
+component, or portal invalidates the old short action commitment. None of the
+following is strategy memory:
 
 - an absolute episode-frame trigger;
 - a fixed world coordinate or waypoint;
 - a fixed action fragment or full-episode action sequence;
 - a route that is specific to one recording.
 
-A recorded action prefix exists only for exact experiment reproduction and for
-skipping an already checked opening while debugging a later segment. It is not
-an Engine MPC memory or policy input. The loader verifies
-`scenario/attack/seed/player` identity, no authority-state shield,
-`spell=false`, action fields and frame spans, and contiguous decisions starting
-at the reset frame. A prefix-assisted result establishes only closed-loop
-behavior after handoff; it cannot be counted as no-prefix generalization. Such
-evidence must run the current controller continuously from reset to completion.
+The current `engine-mpc-play` command has no recorded-action loader, CLI option,
+or replay branch. Diagnostic reports retain per-frame actions, coordinates, and
+absolute frames for failure analysis, but current code cannot reinterpret a
+report as a policy input. Every formal run is controlled continuously by live
+MPC from reset.
+
+`train-region-dynamics` reads source time, visible region radius, and adjacent
+visible indestructible positions from recorded controller-input observations.
+Time is used only for relative intervals and visible displacement. It rejects
+recorded/non-live actions, authority shields, and sources that do not force
+`spell=false`, and writes provenance separately from loadable memory:
+
+```bash
+.venv/bin/stg-lab train-region-dynamics \
+  --input artifacts/engine-mpc-boss3-heldout-v37-d5-memory-no-actions.json \
+  --memory-output artifacts/region-dynamics-boss3-v2.json \
+  --report-output artifacts/region-dynamics-boss3-v2-training.json
+```
+
+The memory SHA-256 is
+`dcdcddeeed840d733e144477934f217b21f6795ab9a83790d7f3813d273546f7`.
+Its loadable model is limited to radius limits, change rates, ordered phase
+durations, radius-cycle length, lateral-flow cycle length, and the relative
+safe-side rule above. The separate training report SHA-256 is
+`95f4b3e45952f476f430158416d6f13b7617a4a5d25dbe07e522fc0107ac8e99`;
+it binds source trace SHA-256
+`60c1dd6bb0cfdece73d7170b3c968736479470ba87fed6e96fa68e42290134f5`,
+357 radius samples, and 303 lateral-flow samples. The radius fit is `7/28`,
+rates are `0.7/0.7`, phase durations are `30/30/30/90`, and the radius cycle is
+180 frames. The 360-frame lateral repeat has 201 pairs, correlation 1.0, and
+normalized RMSE 0; its 180-frame sign inversion has 252 pairs, correlation
+1.0, and normalized RMSE 0. Shifting the entire input timeline does not change
+memory or relative sample statistics.
+
+### Strict native Boss #3 results
+
+Three fresh original LuaSTG Sub processes under CrossOver 26.3 with DXVK
+passed the sole native success condition. v40 and v41 are five-frame-delay
+held-out runs; v42 is a separate zero-delay regression. All three used
+`authority_state_shield=false`, forced `spell=false`, and the v2 memory above.
+They reduced boss HP from 6000 to 0 without a player death, terminated at
+episode frame 3816 with `termination_reason=attack_complete`, and recorded zero
+unsafe-shot frames:
+
+| Run | Seed | Observation delay | HP | Player death | Final frame | Unsafe-shot frames | Artifact SHA-256 |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| `engine-mpc-boss3-heldout-v40-d5-region-dynamics-v2.json` | 20260730 | 5 | `6000 -> 0` | 0 | 3816 | 0 | `e7577aa475ed9a9de6542fedfba8a193dca1b3d8a927e139371e22f41b2d94ef` |
+| `engine-mpc-boss3-heldout-v41-seed20260731-d5-region-dynamics-v2.json` | 20260731 | 5 | `6000 -> 0` | 0 | 3816 | 0 | `5cedf76c0b17028b4239f480dbd146a54cb92ead17dc898f8fc8d6fb52e981fa` |
+| `engine-mpc-boss3-regression-v42-seed20260732-d0-region-dynamics-v2.json` | 20260732 | 0 | `6000 -> 0` | 0 | 3816 | 0 | `a45084f331ecd82d0fecff636bf1921c9b547f41f82a1db6846ff76d15d7e37f` |
+
+All three reports bind implementation SHA-256
+`5a81172add05549fdf1ea6d65272d26dd08afc3de6c289ab3124e9f7b2e69613`.
+The two delay-5 held-out attempts passed, and the zero-delay regression passed;
+this is not a statistical success-rate claim or evidence for Boss #4.
 
 The earlier standalone v2 SQLite single-route and route-library artifacts and
 their hashes remain reproducible historical benchmarks. Because they contain
 recorded routes, they do not represent current Engine MPC strategy memory and
 do not establish live-engine generalization.
 
-## 7. Model and Training
+## 7. Portable High-speed Testing and Simplified Rendering
+
+LuaSTG-Sub's graphics, window, audio, input, and shell build graph directly
+depends on Win32, D3D11, and XAudio2, so replacing D3D11 alone cannot produce a
+working macOS engine. The implementation in `/Users/happyelements/LuaSTG-Sub`
+adds an isolated `LuaSTGPortableTest` CMake target. It reuses the engine's
+`XCollision` circle/rotated-ellipse implementation and supports an uncapped
+headless mode that does not initialize video, plus an SDL2 simplified
+collision/risk view. SDL2 uses Metal on macOS when accelerated rendering is
+available; Vulkan and MoltenVK are not required.
+
+```bash
+cd /Users/happyelements/LuaSTG-Sub
+cmake --preset portable-native
+cmake --build --preset portable-native-release
+ctest --preset portable-native
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario pulse --frames 100000
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario orbit --frames 600 --analyze-risk
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario pulse --frames 180 --render-every 6 \
+  --screenshot build/portable-native/portable/pulse-macos.bmp
+SDL_VIDEODRIVER=dummy \
+build/portable-native/portable/LuaSTGPortableTest \
+  --scenario orbit --frames 700 --render-every 6 \
+  --screenshot build/portable-native/portable/orbit-dummy.bmp
+```
+
+The clean arm64 macOS build passed its CTest (`1/1`). The measured 100,000-frame
+headless pulse run reached approximately 1,511,690 logical frames/second, and
+the orbit probe with graded-risk analysis reached approximately 496,620
+frames/second. The Metal-backed macOS capture
+`build/portable-native/portable/pulse-macos.bmp` and SDL dummy software capture
+`build/portable-native/portable/orbit-dummy.bmp` are both nonempty `480x560`
+32-bit BMPs. This target is a partial collision and algorithm-development
+module. It does not execute arbitrary SR Lua and cannot replace original
+LuaSTG Sub `attack_complete` acceptance.
+
+`game/plugins/SafetyZoneVisualizer` adds an in-engine F7 overlay, or it can be
+enabled at launch with `SR_SAFETY_ZONE_OVERLAY=1`. It grades safe, caution,
+danger, and collision cells from current colliders and 0/6/12-frame linear
+projections, supporting circles, rotated ellipses, rectangles, and straight
+lasers. Straight lasers are evaluated as tapered polygons from `l1`, `l2`,
+`l3`, and `w`, including THlib laser objects whose generic ellipse fields
+`a=b=0`; this avoids silently dropping their collision area. Curved-laser
+interiors are not rasterized. The implementation file SHA-256 is
+`3815bbd95a36e4c5cf32c8ebac698cdc9200434145dc15131acde3471075cc3e`.
+The overlay reads geometry only and does not alter input, RNG, collision, or AI
+memory.
+
+## 8. Model and Training
 
 The reference policy uses a dual visual encoder:
 
@@ -267,7 +392,7 @@ Strict replay obtains 796/868 overall held-out agreement (91.7051%): 369/400
 for #3 (92.25%) and 427/468 for #4 (91.2393%). The agreement report SHA-256 is
 `1208ed6dc57cae5a47a5ba6f8d7bcbbd90cab27af06dd3ffe7dc3cbb1f95abcd`.
 
-## 8. Acceptance Criteria
+## 9. Acceptance Criteria
 
 ### Standalone acceptance
 
@@ -335,8 +460,8 @@ boss defeat or full attack endurance may satisfy that condition. Reaching
 `max_frames`, surviving longer, or reducing boss HP without attack completion
 does not count as success. Every action keeps `spell=false`; shooting is enabled
 only when predicted safety margin meets the configured threshold and is
-disabled during danger. Prefix-assisted reproductions are reported separately
-and never included in a no-prefix success rate.
+disabled during danger. The current command has no recorded-action prefix
+loader; externally prefix-assisted evidence would be ineligible.
 
 ### Engine acceptance
 
@@ -394,7 +519,7 @@ Protocol-v1 reports remain invalid. This live claim is scoped to headless Spell
 Practice content regression; it is not rendered-frame comparison, a full-stage
 clear, or proof of AI survival inside the real engine.
 
-## 9. Tool Layout
+## 10. Tool Layout
 
 ```text
 tools/stg_lab/
@@ -421,6 +546,6 @@ compat/testing/
   PROTOCOL.md         complete wire and environment contract
 ```
 
-## 10. Environment
+## 11. Environment
 
 The base simulator and planner require only Python and NumPy. Neural training uses an isolated Python 3.11 or 3.12 environment with PyTorch. The system Python 3.14 is not used for model training because supported binary wheels are not guaranteed.

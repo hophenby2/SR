@@ -266,6 +266,60 @@ def test_region_memory_loader_accepts_only_dynamics_not_routes(tmp_path: Path) -
         load_region_dynamics_memory(path)
 
 
+def test_region_memory_v2_accepts_only_relative_lateral_flow_rule(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "memory-v2.json"
+    value = memory_artifact()
+    value["schema_version"] = 2
+    model = value["model"]
+    assert isinstance(model, dict)
+    model["lateral_flow"] = {
+        "cycle_frames": 360.0,
+        "safe_side_rule": "opposite_incoming_lateral_flow",
+    }
+    write_memory(path, value)
+
+    loaded = load_region_dynamics_memory(
+        path,
+        scenario="okuu:Lunatic",
+        attack=3,
+    )
+    assert loaded.lateral_flow_cycle_frames == 360.0
+    assert loaded.safe_side_rule == "opposite_incoming_lateral_flow"
+
+    for forbidden_field, forbidden_value in (
+        ("phase_offset", 120),
+        ("side_sequence", ["left", "right"]),
+        ("waypoints", [[-120.0, -40.0]]),
+        ("actions", [1, 2, 3]),
+    ):
+        forbidden = memory_artifact()
+        forbidden["schema_version"] = 2
+        forbidden_model = forbidden["model"]
+        assert isinstance(forbidden_model, dict)
+        forbidden_model["lateral_flow"] = {
+            "cycle_frames": 360.0,
+            "safe_side_rule": "opposite_incoming_lateral_flow",
+            forbidden_field: forbidden_value,
+        }
+        write_memory(path, forbidden)
+        with pytest.raises(ValueError, match="must define only"):
+            load_region_dynamics_memory(path)
+
+    wrong_rule = memory_artifact()
+    wrong_rule["schema_version"] = 2
+    wrong_model = wrong_rule["model"]
+    assert isinstance(wrong_model, dict)
+    wrong_model["lateral_flow"] = {
+        "cycle_frames": 360.0,
+        "safe_side_rule": "alternate_fixed_sides",
+    }
+    write_memory(path, wrong_rule)
+    with pytest.raises(ValueError, match="unsupported region safe-side rule"):
+        load_region_dynamics_memory(path)
+
+
 def test_region_memory_rejects_inconsistent_cycle() -> None:
     with pytest.raises(ValueError, match="durations must sum"):
         RegionDynamicsMemory(

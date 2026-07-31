@@ -528,7 +528,7 @@ def _command_accept(args: argparse.Namespace) -> int:
         determinism_artifact=args.determinism_artifact,
     )
     _emit_json(report, args.output)
-    return 0 if report["success"] else 1
+    return 0 if report["passed"] else 1
 
 
 def _command_engine_test(args: argparse.Namespace) -> int:
@@ -614,7 +614,7 @@ def _command_engine_play(args: argparse.Namespace) -> int:
             config=config,
         )
     _emit_json(report, args.output)
-    return 0 if report["passed"] else 1
+    return 0 if report["success"] else 1
 
 
 def _command_engine_mpc_play(args: argparse.Namespace) -> int:
@@ -672,11 +672,25 @@ def _command_engine_mpc_play(args: argparse.Namespace) -> int:
             player=args.player,
             controller=controller,
             config=config,
-            prefix_artifact=args.prefix_artifact,
-            prefix_until_frame=args.prefix_until_frame,
         )
     _emit_json(report, args.output)
     return 0 if report["passed"] else 1
+
+
+def _command_train_region_dynamics(args: argparse.Namespace) -> int:
+    from .region_dynamics_training import (
+        train_region_dynamics,
+        write_region_dynamics_training,
+    )
+
+    result = train_region_dynamics(args.artifacts)
+    write_region_dynamics_training(
+        result,
+        memory_output=args.memory_output,
+        report_output=args.report_output,
+    )
+    _emit_json(result.report)
+    return 0
 
 
 def _command_engine_train(args: argparse.Namespace) -> int:
@@ -1106,16 +1120,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="load phase durations and safe-region dynamics without route actions",
     )
     engine_mpc_parser.add_argument(
-        "--prefix-artifact",
-        type=Path,
-        help="replay an identity-matched live MPC artifact before switching to MPC",
-    )
-    engine_mpc_parser.add_argument(
-        "--prefix-until-frame",
-        type=int,
-        help="use recorded decisions whose start episode frame is below this value",
-    )
-    engine_mpc_parser.add_argument(
         "--record-observations-from-frame",
         type=int,
         help="embed decision-boundary controller inputs at or after this episode frame",
@@ -1128,6 +1132,23 @@ def build_parser() -> argparse.ArgumentParser:
     engine_mpc_parser.add_argument("--render-every", type=int, default=1)
     engine_mpc_parser.add_argument("--output", type=Path)
     engine_mpc_parser.set_defaults(handler=_command_engine_mpc_play)
+
+    region_training_parser = subparsers.add_parser(
+        "train-region-dynamics",
+        help="fit phase-relative region dynamics from live engine MPC artifacts",
+    )
+    region_training_parser.add_argument(
+        "--input",
+        "--artifact",
+        dest="artifacts",
+        action="append",
+        type=Path,
+        required=True,
+        help="live engine MPC JSON artifact; repeat to aggregate runs",
+    )
+    region_training_parser.add_argument("--memory-output", type=Path, required=True)
+    region_training_parser.add_argument("--report-output", type=Path, required=True)
+    region_training_parser.set_defaults(handler=_command_train_region_dynamics)
 
     engine_train_parser = subparsers.add_parser(
         "engine-train",
