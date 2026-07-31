@@ -237,14 +237,24 @@ class MPCConfig:
     beam_width: int = 128
     region_beam_width: int = 512
     radius_rate_horizon: int = 6
-    safe_margin_target: float = 12.0
+    safe_margin_target: float = 20.0
+    clearance_reward_cap: float = 36.0
+    clearance_reward_weight: float = 0.35
+    minimum_direction_hold_frames: int = 9
+    emergency_collision_frames: int = 12
+    emergency_margin: float = 4.0
+    switch_margin_gain: float = 6.0
+    direction_switch_penalty: float = 3.0
+    direction_reverse_penalty: float = 9.0
+    direction_aba_penalty: float = 6.0
+    speed_switch_penalty: float = 0.75
     nonbullet_motion_horizon: int = 9
     preferred_y_fraction: float = 2.0 / 25.0
     vertical_anchor_weight: float = 0.25
     beam_cell_size: float = 4.0
     region_anchor_weight: float = 2.0
     region_boundary_trigger_margin: float = 72.0
-    region_safe_margin_target: float = 1.0
+    region_safe_margin_target: float = 8.0
     portal_clearance: float = 6.0
     region_path_weight: float = 0.05
     region_learned_min_radius: float = 7.0
@@ -270,6 +280,33 @@ class MPCConfig:
             raise ValueError("radius_rate_horizon cannot be negative")
         if not math.isfinite(self.safe_margin_target) or self.safe_margin_target < 0.0:
             raise ValueError("safe_margin_target must be finite and nonnegative")
+        if self.minimum_direction_hold_frames < 0:
+            raise ValueError("minimum_direction_hold_frames cannot be negative")
+        if self.minimum_direction_hold_frames % self.decision_interval != 0:
+            raise ValueError(
+                "minimum_direction_hold_frames must align to the decision interval"
+            )
+        if not 0 <= self.emergency_collision_frames <= self.horizon_frames:
+            raise ValueError("emergency_collision_frames must be within the horizon")
+        temporal_values = (
+            self.clearance_reward_cap,
+            self.switch_margin_gain,
+        )
+        if not all(math.isfinite(value) and value > 0.0 for value in temporal_values):
+            raise ValueError("clearance and hysteresis thresholds must be finite and positive")
+        nonnegative_temporal_values = (
+            self.clearance_reward_weight,
+            self.emergency_margin,
+            self.direction_switch_penalty,
+            self.direction_reverse_penalty,
+            self.direction_aba_penalty,
+            self.speed_switch_penalty,
+        )
+        if not all(
+            math.isfinite(value) and value >= 0.0
+            for value in nonnegative_temporal_values
+        ):
+            raise ValueError("movement preference values must be finite and nonnegative")
         if self.nonbullet_motion_horizon < 0:
             raise ValueError("nonbullet_motion_horizon cannot be negative")
         if (
@@ -340,6 +377,7 @@ class CandidateEvaluation:
     minimum_margin: float
     boundary_penalty: float
     boss_alignment: float
+    motion_penalty: float = 0.0
 
     @property
     def selection_key(self) -> tuple[float, ...]:
@@ -354,6 +392,7 @@ class CandidateEvaluation:
             -earliest,
             float(self.collision_frames),
             -margin,
+            self.motion_penalty,
             self.boundary_penalty,
             self.boss_alignment,
         )
@@ -1132,6 +1171,9 @@ class EngineMPC:
         self._committed_plan_is_region = False
         self._committed_plan_evacuating = False
         self._committed_plan_key: tuple[Any, ...] | None = None
+        self._last_action: Action | None = None
+        self._previous_action: Action | None = None
+        self._direction_started_frame: int | None = None
 
     @staticmethod
     def _player(observation: Mapping[str, Any], delay: int) -> tuple[float, float, float, float, float]:
@@ -1180,6 +1222,61 @@ class EngineMPC:
     def _preferred_y(self, bounds: tuple[float, float, float, float]) -> float:
         bottom, top = bounds[2], bounds[3]
         return bottom + (top - bottom) * self.config.preferred_y_fraction
+
+    @staticmethod
+    def _direction(action: Action | None) -> tuple[int, int] | None:
+        if action is None:
+            return None
+        return action.move_x, action.move_y
+
+    def _transition_penalty(
+        self,
+        action: Action,
+        previous: Action | None,
+        two_ago: Action | None,
+    ) -> float:
+        if previous is None:
+            return 0.0
+        direction = self._direction(action)
+        previous_direction = self._direction(previous)
+        penalty = 0.0
+        if direction != previous_direction:
+            penalty += self.config.direction_switch_penalty
+            if (
+                direction != (0, 0)
+                and previous_direction != (0, 0)
+                and direction == (-previous.move_x, -previous.move_y)
+            ):
+                penalty += self.config.direction_reverse_penalty
+            if (
+                two_ago is not None
+                and direction == self._direction(two_ago)
+                and direction != previous_direction
+            ):
+                penalty += self.config.direction_aba_penalty
+        elif action.slow != previous.slow:
+            penalty += self.config.speed_switch_penalty
+        return penalty
+
+    def _clearance_reward(self, margin: float, *, region: bool = False) -> float:
+        if math.isnan(margin):
+            return 0.0
+        cap = (
+            max(self.config.region_safe_margin_target, self.config.portal_clearance)
+            if region else
+            self.config.clearance_reward_cap
+        )
+        clearance = min(max(0.0, margin), cap)
+        return self.config.clearance_reward_weight * clearance
+
+    def _remember_action(self, action: Action, source_frame: int) -> None:
+        direction = self._direction(action)
+        if self._last_action is None:
+            self._direction_started_frame = source_frame
+        elif direction != self._direction(self._last_action):
+            self._direction_started_frame = source_frame
+        self._previous_action = self._last_action
+        self._last_action = replace(action, spell=False)
 
     def _update_region_phase(
         self,
@@ -2191,6 +2288,9 @@ class EngineMPC:
         action_count = len(self.actions)
         move_x = np.asarray([action.move_x for action in self.actions], dtype=np.float64)
         move_y = np.asarray([action.move_y for action in self.actions], dtype=np.float64)
+        action_slow = np.asarray(
+            [action.slow for action in self.actions], dtype=np.bool_,
+        )
         action_speed = np.asarray([
             focus_speed if action.slow else speed for action in self.actions
         ], dtype=np.float64)
@@ -2198,6 +2298,32 @@ class EngineMPC:
         action_speed[diagonal] *= _SQRT_HALF
         velocity_x = move_x * action_speed
         velocity_y = move_y * action_speed
+        action_lookup = {
+            (action.move_x, action.move_y, action.slow): index
+            for index, action in enumerate(self.actions)
+        }
+        previous_action_index = (
+            -1
+            if self._last_action is None else
+            action_lookup[
+                (
+                    self._last_action.move_x,
+                    self._last_action.move_y,
+                    self._last_action.slow,
+                )
+            ]
+        )
+        two_ago_action_index = (
+            -1
+            if self._previous_action is None else
+            action_lookup[
+                (
+                    self._previous_action.move_x,
+                    self._previous_action.move_y,
+                    self._previous_action.slow,
+                )
+            ]
+        )
 
         if threats:
             threat_x = np.asarray([value.x for value in threats], dtype=np.float64)
@@ -2271,6 +2397,7 @@ class EngineMPC:
         earliest_collision = np.full(1, self.config.horizon_frames + 1, dtype=np.int32)
         minimum_margin = np.full(1, math.inf, dtype=np.float64)
         boundary_penalty = np.zeros(1, dtype=np.float64)
+        motion_penalty = np.zeros(1, dtype=np.float64)
         plans = np.empty((1, 0), dtype=np.int8)
         left, right, bottom, top = bounds
         preferred_y = self._preferred_y(bounds)
@@ -2286,7 +2413,66 @@ class EngineMPC:
             earliest_collision = earliest_collision[parents]
             minimum_margin = minimum_margin[parents]
             boundary_penalty = boundary_penalty[parents]
+            motion_penalty = motion_penalty[parents]
             plans = plans[parents]
+            if plans.shape[1] >= 1:
+                prior_indices = plans[:, -1].astype(np.int64)
+            else:
+                prior_indices = np.full(
+                    len(action_indices), previous_action_index, dtype=np.int64,
+                )
+            if plans.shape[1] >= 2:
+                two_prior_indices = plans[:, -2].astype(np.int64)
+            elif plans.shape[1] == 1:
+                two_prior_indices = np.full(
+                    len(action_indices), previous_action_index, dtype=np.int64,
+                )
+            else:
+                two_prior_indices = np.full(
+                    len(action_indices), two_ago_action_index, dtype=np.int64,
+                )
+
+            has_prior = prior_indices >= 0
+            safe_prior = np.maximum(prior_indices, 0)
+            changed_direction = has_prior & (
+                (move_x[action_indices] != move_x[safe_prior])
+                | (move_y[action_indices] != move_y[safe_prior])
+            )
+            motion_penalty += (
+                self.config.direction_switch_penalty
+                * changed_direction.astype(np.float64)
+            )
+            reversed_direction = (
+                changed_direction
+                & ((move_x[action_indices] != 0.0) | (move_y[action_indices] != 0.0))
+                & ((move_x[safe_prior] != 0.0) | (move_y[safe_prior] != 0.0))
+                & (move_x[action_indices] == -move_x[safe_prior])
+                & (move_y[action_indices] == -move_y[safe_prior])
+            )
+            motion_penalty += (
+                self.config.direction_reverse_penalty
+                * reversed_direction.astype(np.float64)
+            )
+            has_two_prior = two_prior_indices >= 0
+            safe_two_prior = np.maximum(two_prior_indices, 0)
+            aba = (
+                changed_direction
+                & has_two_prior
+                & (move_x[action_indices] == move_x[safe_two_prior])
+                & (move_y[action_indices] == move_y[safe_two_prior])
+            )
+            motion_penalty += (
+                self.config.direction_aba_penalty * aba.astype(np.float64)
+            )
+            changed_speed = (
+                has_prior
+                & ~changed_direction
+                & (action_slow[action_indices] != action_slow[safe_prior])
+            )
+            motion_penalty += (
+                self.config.speed_switch_penalty
+                * changed_speed.astype(np.float64)
+            )
             plans = np.concatenate(
                 (plans, action_indices[:, None].astype(np.int8)),
                 axis=1,
@@ -2391,27 +2577,31 @@ class EngineMPC:
             margin_shortfall = np.maximum(
                 0.0, margin_target - minimum_margin,
             )
-            preference = boundary_penalty + alignment
-            if region_anchor is None:
-                order = np.lexsort((
-                    first_action,
-                    -minimum_margin,
-                    preference,
-                    margin_shortfall,
-                    collision_frames,
-                    collision_order,
-                    collided.astype(np.int8),
-                ))
-            else:
-                order = np.lexsort((
-                    first_action,
-                    -minimum_margin,
-                    preference,
-                    margin_shortfall,
-                    collision_frames,
-                    collision_order,
-                    collided.astype(np.int8),
-                ))
+            clearance_cap = (
+                self.config.clearance_reward_cap
+                if region_anchor is None else
+                max(
+                    self.config.region_safe_margin_target,
+                    self.config.portal_clearance,
+                )
+            )
+            clearance_reward = self.config.clearance_reward_weight * np.clip(
+                minimum_margin,
+                0.0,
+                clearance_cap,
+            )
+            preference = (
+                boundary_penalty + alignment + motion_penalty - clearance_reward
+            )
+            order = self._beam_candidate_order(
+                collided,
+                earliest_collision,
+                collision_frames,
+                margin_shortfall,
+                preference,
+                minimum_margin,
+                tie_breaker=first_action,
+            )
             keep = self._diverse_keep(
                 order,
                 x,
@@ -2425,6 +2615,7 @@ class EngineMPC:
             earliest_collision = earliest_collision[keep]
             minimum_margin = minimum_margin[keep]
             boundary_penalty = boundary_penalty[keep]
+            motion_penalty = motion_penalty[keep]
             plans = plans[keep]
 
         evaluations: list[CandidateEvaluation] = []
@@ -2465,25 +2656,33 @@ class EngineMPC:
             margin_shortfall = np.maximum(
                 0.0, margin_target - minimum_margin[matches],
             )
-            preference = boundary_penalty[matches] + alignment
-            if region_anchor is None:
-                order = np.lexsort((
-                    -minimum_margin[matches],
-                    preference,
-                    margin_shortfall,
-                    collision_frames[matches],
-                    -earliest_collision[matches],
-                    collided.astype(np.int8),
-                ))
-            else:
-                order = np.lexsort((
-                    -minimum_margin[matches],
-                    margin_shortfall,
-                    preference,
-                    collision_frames[matches],
-                    -earliest_collision[matches],
-                    collided.astype(np.int8),
-                ))
+            clearance_cap = (
+                self.config.clearance_reward_cap
+                if region_anchor is None else
+                max(
+                    self.config.region_safe_margin_target,
+                    self.config.portal_clearance,
+                )
+            )
+            clearance_reward = self.config.clearance_reward_weight * np.clip(
+                minimum_margin[matches],
+                0.0,
+                clearance_cap,
+            )
+            preference = (
+                boundary_penalty[matches]
+                + alignment
+                + motion_penalty[matches]
+                - clearance_reward
+            )
+            order = self._beam_candidate_order(
+                collided,
+                earliest_collision[matches],
+                collision_frames[matches],
+                margin_shortfall,
+                preference,
+                minimum_margin[matches],
+            )
             selected = matches[int(order[0])]
             earliest = int(earliest_collision[selected])
             evaluations.append(CandidateEvaluation(
@@ -2496,11 +2695,37 @@ class EngineMPC:
                 minimum_margin=float(minimum_margin[selected]),
                 boundary_penalty=float(boundary_penalty[selected]),
                 boss_alignment=float(alignment[int(order[0])]),
+                motion_penalty=float(motion_penalty[selected]),
             ))
             action_plans.append(tuple(
                 self.actions[int(value)] for value in plans[selected]
             ))
         return tuple(evaluations), tuple(action_plans)
+
+    @staticmethod
+    def _beam_candidate_order(
+        collided: np.ndarray,
+        earliest_collision: np.ndarray,
+        collision_frames: np.ndarray,
+        margin_shortfall: np.ndarray,
+        preference: np.ndarray,
+        minimum_margin: np.ndarray,
+        *,
+        tie_breaker: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Order beam candidates with safety ahead of motion preferences."""
+
+        keys: tuple[np.ndarray, ...] = (
+            -minimum_margin,
+            preference,
+            margin_shortfall,
+            collision_frames,
+            -earliest_collision,
+            collided.astype(np.int8),
+        )
+        if tie_breaker is not None:
+            keys = (tie_breaker, *keys)
+        return np.lexsort(keys)
 
     @staticmethod
     def _path(
@@ -2596,7 +2821,103 @@ class EngineMPC:
             minimum_margin=minimum_margin,
             boundary_penalty=boundary_penalty,
             boss_alignment=alignment,
+            motion_penalty=self._transition_penalty(
+                action,
+                self._last_action,
+                self._previous_action,
+            ),
         )
+
+    def _apply_direction_hold(
+        self,
+        selected_index: int,
+        evaluations: Sequence[CandidateEvaluation],
+        region_anchor: _RegionAnchor | None,
+        source_frame: int,
+    ) -> int:
+        """Keep a safe direction briefly, while never masking urgent avoidance."""
+
+        if self._last_action is None or self._direction_started_frame is None:
+            return selected_index
+        selected = evaluations[selected_index]
+        if self._direction(selected.action) == self._direction(self._last_action):
+            return selected_index
+        if (
+            region_anchor is not None
+            and region_anchor.navigation_mode == "evacuate"
+        ):
+            return selected_index
+
+        held_frames = max(0, source_frame - self._direction_started_frame)
+        if held_frames >= self.config.minimum_direction_hold_frames:
+            return selected_index
+        incumbent_index = next(
+            (
+                index
+                for index, value in enumerate(evaluations)
+                if value.action.discrete == self._last_action.discrete
+            ),
+            None,
+        )
+        if incumbent_index is None:
+            return selected_index
+        incumbent = evaluations[incumbent_index]
+        imminent_collision = (
+            incumbent.collided
+            and incumbent.earliest_collision_frame is not None
+            and incumbent.earliest_collision_frame
+            <= self.config.emergency_collision_frames
+        )
+        dangerously_close = incumbent.minimum_margin <= self.config.emergency_margin
+        avoids_predicted_collision = incumbent.collided and not selected.collided
+        delays_collision = (
+            incumbent.collided
+            and selected.collided
+            and incumbent.earliest_collision_frame is not None
+            and selected.earliest_collision_frame is not None
+            and selected.earliest_collision_frame
+            >= incumbent.earliest_collision_frame + self.config.decision_interval
+        )
+        margin_gain = selected.minimum_margin - incumbent.minimum_margin
+        margin_target = (
+            self.config.region_safe_margin_target
+            if region_anchor is not None else
+            self.config.safe_margin_target
+        )
+        reaches_safe_reserve = (
+            incumbent.minimum_margin < margin_target <= selected.minimum_margin
+        )
+        material_margin_gain = margin_gain >= self.config.switch_margin_gain
+        if (
+            imminent_collision
+            or dangerously_close
+            or avoids_predicted_collision
+            or delays_collision
+            or reaches_safe_reserve
+            or material_margin_gain
+        ):
+            return selected_index
+        return incumbent_index
+
+    def _committed_action_respects_direction_hold(
+        self,
+        committed_action: Action,
+        proposed_action: Action,
+        source_frame: int,
+    ) -> bool:
+        if self._last_action is None or self._direction_started_frame is None:
+            return True
+        committed_direction = self._direction(committed_action)
+        proposed_direction = self._direction(proposed_action)
+        if committed_direction == proposed_direction:
+            return True
+        held_frames = max(0, source_frame - self._direction_started_frame)
+        if held_frames >= self.config.minimum_direction_hold_frames:
+            return True
+        # _compute already applied the hold. A different proposed direction
+        # inside this window therefore passed an emergency/safety release and
+        # must not be replaced by a stale committed action.
+        return False
 
     def _compute(
         self,
@@ -2622,7 +2943,15 @@ class EngineMPC:
                 if value.earliest_collision_frame is None else
                 float(value.earliest_collision_frame)
             )
-            preference = value.boundary_penalty + value.boss_alignment
+            preference = (
+                value.boundary_penalty
+                + value.boss_alignment
+                + value.motion_penalty
+                - self._clearance_reward(
+                    value.minimum_margin,
+                    region=region_anchor is not None,
+                )
+            )
             if region_anchor is None:
                 return (
                     float(value.collided),
@@ -2648,6 +2977,12 @@ class EngineMPC:
         selected_index = min(
             range(len(evaluations)),
             key=key,
+        )
+        selected_index = self._apply_direction_hold(
+            selected_index,
+            evaluations,
+            region_anchor,
+            source_frame,
         )
         selected_plan = action_plans[selected_index]
         return MPCDecision(
@@ -2787,6 +3122,11 @@ class EngineMPC:
             if (
                 committed_action is not None
                 and self._committed_plan_evacuating == proposed.region_evacuating
+                and self._committed_action_respects_direction_hold(
+                    committed_action,
+                    proposed.action,
+                    source_frame,
+                )
                 and committed_margin is not None
                 and committed_margin >= self.config.region_safe_margin_target
                 and committed_evaluation is not None
@@ -2826,6 +3166,7 @@ class EngineMPC:
                     proposed.planned_actions[1:]
                     if self._committed_plan_is_region else ()
                 )
+            self._remember_action(self._decision.action, source_frame)
             self._last_decision_frame = source_frame
             return self._decision
         assert self._decision is not None

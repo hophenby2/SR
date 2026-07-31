@@ -300,6 +300,62 @@ collision fields from the source report. Five-repeat reruns on the same host
 have varied within approximately 2.7x-3.4x, so these timings are benchmark
 samples rather than a guaranteed lower bound.
 
+### Clearance, direction hysteresis, and grid ablation
+
+Live MPC still replans every three frames. Its ordinary clearance target is now
+20 instead of 12, and the forced-region target is 8 instead of 1. Beam search
+accumulates costs of `3/9/6/0.75` for a direction switch, an additional exact
+180-degree reversal, an `A -> B -> A` oscillation, and a same-direction speed
+mode change. Clearance beyond the target receives a capped reward. A direction
+is normally held for nine frames, but the hold is released for a collision in
+the next 12 frames, incumbent clearance at most 4, a clearance gain of at least
+6, or a true deadline-driven `evacuate`. `preposition` no longer bypasses the
+hold, and a previously committed plan must pass the same gate. Collision state,
+first collision, collision-frame count, and clearance shortfall always outrank
+smoothness. A committed action cannot override a different direction that has
+already passed an emergency or clearance-gain release inside the hold window.
+
+On 32 recorded `hold/preposition/evacuate/settle` samples, region targets
+`4/6/8/12` all produced 15 collision frames and all eight crossing samples
+remained reachable without a collision. Median clearances were approximately
+`4.35/6.33/8.29/12.18`. Target 12 reduced crossing progress and increased final
+anchor L1 error from approximately 0.87 at target 8 to 1.25, so 8 is used for
+narrow forced-region passages.
+
+Two same-seed native closed-loop runs both strictly defeated the attack. From
+the earlier strict run to the final smoothed run, adjacent decision direction
+changes fell `835 -> 487`, exact reversals `65 -> 20`, `A -> B -> A` changes
+`154 -> 20`, and consecutive nonzero displacement angles over 90 degrees
+`236 -> 154`. Median predicted minimum clearance rose `1.43 -> 8.27`, decisions
+at or below clearance 4 fell `815 -> 215`, and predicted collision frames fell
+`2346 -> 1009`. These are 60-frame rolling predictions, not actual hits; both
+runs ended with `death=0`.
+
+`experiments/benchmark_engine_mpc_grid.py` compares 8/12/16-unit time-layered
+grids against continuous beam plans on the same recorded five-frame-delay
+observations at source frames `488/1292/2102/2801/3695`. Every output plan is
+then recomputed with Engine MPC's per-logical-frame continuous circle geometry;
+the grid's own levels are not accepted as proof of safety. The final v46 result
+is:
+
+| Planner | Predicted collision plans | Collision-frame rate | Median minimum clearance | Direction changes per 60 frames | Mean time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Continuous beam 20/8 | 3/5 | 9.09% | -4.87 | 5.66 | 0.103 s |
+| Grid 8, center sample | 3/5 | 11.00% | -8.51 | 7.40 | 0.638 s |
+| Grid 12, center sample | 3/5 | 10.67% | -5.49 | 9.40 | 0.248 s |
+| Grid 16, center sample | 4/5 | 47.67% | -27.67 | 10.80 | 0.085 s |
+
+Whole-cell half-diagonal inflation also did not win: collision-frame rates for
+8/12/16-unit grids were 14.33%/17.33%/52.00%. Of the 33 collision frames in
+the 8-unit center variant, 22 occurred between sampled layers and 11 occurred
+on sampled layers, showing combined temporal, spatial-quantization, and risk
+aggregation failures. Grids remain useful for visualization, connectivity,
+and global-region hints, but they do not replace continuous beam validation.
+The final report SHA-256 is
+`a05c36395bc13c6bc829b5694d1b556bdf9be9fb720d554f0bfaa641bc6c67d9`.
+This is an open-loop plan ablation on fixed observations, not an
+`attack_complete` success rate.
+
 ### Strict native Boss #3 results
 
 The retained CrossOver evidence uses three fresh original LuaSTG Sub processes
@@ -322,6 +378,23 @@ All three reports bind implementation SHA-256
 The two delay-5 held-out attempts passed, and the zero-delay regression passed;
 this is not a statistical success-rate claim or evidence for Boss #4.
 
+The final sorting and committed-action safety fix was then run from Spell
+Practice reset on the native macOS DirectX-free engine for two five-frame-delay
+seeds. Both strictly defeated the attack at frame 3816:
+
+| Run | Seed | Terminal result | HP / death | Changes / reversals / ABA | Median clearance | SHA-256 |
+| --- | ---: | --- | --- | --- | ---: | --- |
+| `engine-mpc-boss3-safety-sort-v46-seed20260730.json` | 20260730 | `attack_complete`, `passed=true` | `6000 -> 0` / 0 | 487 / 20 / 20 | 8.27 | `e1a4df0fd857b3aa7cc52e6bcd6416a856f74228f34e07c26b4a19882cbe6d39` |
+| `engine-mpc-boss3-safety-sort-v47-seed20260731.json` | 20260731 | `attack_complete`, `passed=true` | `6000 -> 0` / 0 | 502 / 10 / 30 | 8.31 | `d69d6b7fa2b88637590f5bbe5f605e1768bd7dccbd47307bdfa25fd651d50faf` |
+
+Both have `unsafe_shot_frames=0`, force `spell=false`, and bind implementation
+SHA-256 `8422915228d7b867ae01ffae0e2d0ae85d7ab8d1aac71e3a383c6b8a6e6d2044`.
+This is 2/2 among executed attempts, not an extrapolation to unexecuted seeds
+or evidence for Boss #4. Their `acceptance_claim=false` correctly scopes them
+as strict live-teacher engine evidence rather than deployable-model acceptance.
+They supersede v44/v45, which predate the final region-sort and committed-action
+safety fixes.
+
 A separate full-engine native macOS OpenGL run kept the optimized F7 overlay
 enabled and met the same strict success definition. Report
 `engine-mpc-boss3-gpu-overlay-strict-seed20260730.json` (SHA-256
@@ -330,7 +403,9 @@ has `terminated=true`, `termination_reason=attack_complete`, and `passed=true`
 at episode frame 3816. Boss HP changed from 6000 to 0, player `death=0`,
 `unsafe_shot_frames=0`, and `spell=false` was forced. It is single-run live MPC
 evidence with `acceptance_claim=false`, not a deployable-policy acceptance or a
-Boss #4 result.
+Boss #4 result. This run predates the current overlay implementation; it is
+historical full-engine integration evidence rather than an execution proof for
+the current overlay SHA-256.
 
 The earlier standalone v2 SQLite single-route and route-library artifacts and
 their hashes remain reproducible historical benchmarks. Because they contain
@@ -401,20 +476,27 @@ module. It does not execute arbitrary SR Lua and cannot replace full-engine
 
 `game/plugins/SafetyZoneVisualizer` adds an in-engine F7 overlay, or it can be
 enabled at launch with `SR_SAFETY_ZONE_OVERLAY=1`. It grades safe, caution,
-danger, and collision cells from current colliders and 0/6/12-frame linear
-projections, supporting circles, rotated ellipses, rectangles, and straight
-lasers. Straight lasers are evaluated as tapered polygons from `l1`, `l2`,
-`l3`, and `w`, including THlib laser objects whose generic ellipse fields
-`a=b=0`; this avoids silently dropping their collision area. Curved-laser
-interiors are not rasterized. Its conservative spatial index registers only
-cells inside classification-relevant projected bounds. The standalone test
-compares every optimized cell with the original full scan, covering ellipses,
-rotated rectangles, tapered lasers, fast projections, boundary cases, and a
-350-bullet field; any lower risk level fails the test. The benchmark required
-17,803 exact clearance calculations out of the full scan's 705,600 (2.52%) and
-coalesced 672 cells into 253 render rectangles (`253/672`, rectangles/cells),
-while preserving exact per-cell parity. The implementation file SHA-256 is
-`ce491f13a446c05e301c734d695b82d76336e01fadd189b6823ed2a33f14891c`.
+danger, and collision cells from current colliders and linear projections every
+three frames from 0 through 24. A 16-unit cell is classified as a whole by
+inflating the player radius by its half diagonal. Red is signed clearance at
+most 0; orange is clearance at most 12 or at least five simultaneous nearby
+threats within 36; yellow is clearance at most 24 or at least three. Clearance
+takes the worst future layer, while density is counted in each layer before
+taking its maximum, so threats arriving at different times are not combined
+into a fictitious crowd. Circles, rotated ellipses, rectangles, and straight
+lasers are supported. Straight lasers are evaluated as tapered polygons from
+`l1`, `l2`, `l3`, and `w`, including THlib laser objects whose generic ellipse
+fields `a=b=0`; curved-laser interiors are not rasterized.
+
+The conservative spatial index registers only cells inside
+classification-relevant projected bounds. The standalone test compares every
+optimized cell with the full scan, covering ellipses, rotated rectangles,
+tapered lasers, fast projections, cell-corner collisions, time-separated
+density, boundary cases, and a 350-bullet field; any lower risk level fails.
+It required 34,548 exact clearance calculations out of 2,116,800 (1.63%) and
+coalesced 672 cells into 45 render rectangles (`45/672`, rectangles/cells)
+while preserving exact per-cell parity. The implementation SHA-256 is
+`a39c7a1ac49e8a6214c1af2f1df6d6ae72ea113ac7bca6bc195c83a7bcf871be`.
 The overlay reads geometry only and does not alter input, RNG, collision, or AI
 memory.
 
@@ -435,9 +517,10 @@ objects.
 | OpenGL GPU/FBO / off | 59.990 | 59.867 | 58.911 | `74482a01232db58d21fa75dc51f7a9e10b8ff2f3844b3484ade9f9bf9747d126` |
 | OpenGL GPU/FBO / optimized overlay | 59.988 | 59.984 | 52.265 | `67f5c5335b317d11584c01e392e91ff1e9b039723498d437a05614fdd43e94b7` |
 
-The strict GPU-plus-overlay defeat report above extends this to 3816 valid
-display samples, peak 532 objects, and 2844 dense samples, with dense median
-59.988 FPS and P10 59.492 FPS while still reaching `attack_complete`.
+The historical strict GPU-plus-overlay defeat report above extends this to
+3816 valid display samples, peak 532 objects, and 2844 dense samples, with
+dense median 59.988 FPS and P10 59.492 FPS while still reaching
+`attack_complete`. It used the earlier overlay revision.
 
 `render_performance` is reporting and diagnosis only. Its source is
 `lstg.GetFPS`, a 60-native-frame display average, plus `lstg.GetnObj`; the

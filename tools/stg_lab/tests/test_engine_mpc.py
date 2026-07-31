@@ -4,13 +4,16 @@ from dataclasses import replace
 import math
 from typing import Any
 
+import numpy as np
 import pytest
 
 from stg_lab.engine_mpc import (
+    CandidateEvaluation,
     EngineMPC,
     MPCConfig,
     RegionDynamicsMemory,
     VisibleTrackEstimator,
+    _RegionAnchor,
     movement_actions,
 )
 
@@ -308,6 +311,363 @@ def test_teacher_holds_action_until_next_three_frame_decision() -> None:
     assert second.action == first.action == third.action
 
 
+def test_safe_direction_hysteresis_rejects_a_three_frame_target_flip() -> None:
+    config = MPCConfig(
+        observation_delay=0,
+        preferred_y_fraction=0.5,
+    )
+
+    def with_boss(frame: int, boss_x: float) -> dict[str, Any]:
+        return observation(
+            frame,
+            enemies=[{
+                "id": 30,
+                "x": boss_x,
+                "y": 40.0,
+                "maxhp": 1000.0,
+                "collidable": False,
+            }],
+        )
+
+    teacher = EngineMPC(config)
+    first = teacher.select(with_boss(0, 80.0))
+    held = teacher.select(with_boss(3, -80.0))
+    no_aba = teacher.select(with_boss(6, 80.0))
+    unconstrained = EngineMPC(config).select(with_boss(3, -80.0))
+
+    assert (first.action.move_x, first.action.move_y) == (
+        held.action.move_x,
+        held.action.move_y,
+    )
+    assert (unconstrained.action.move_x, unconstrained.action.move_y) != (
+        first.action.move_x,
+        first.action.move_y,
+    )
+    assert held.recomputed is True
+    assert (no_aba.action.move_x, no_aba.action.move_y) == (
+        first.action.move_x,
+        first.action.move_y,
+    )
+    assert held.action.spell is False
+
+
+def test_preposition_keeps_hysteresis_but_evacuation_can_break_it() -> None:
+    def anchor(x: float, mode: str) -> _RegionAnchor:
+        return _RegionAnchor(
+            x=x,
+            y=0.0,
+            crossing=mode == "evacuate",
+            path_margin=20.0,
+            evacuating=mode in {"preposition", "evacuate"},
+            target_rows_ahead=1,
+            navigation_mode=mode,
+            current_component="band:0",
+            target_component="exterior:right",
+            portal="test",
+            deadline_slack=30.0,
+        )
+
+    preposition = EngineMPC(MPCConfig(
+        observation_delay=0,
+        preferred_y_fraction=0.5,
+    ))
+    preposition_anchors = iter((
+        anchor(80.0, "preposition"),
+        anchor(-80.0, "preposition"),
+    ))
+    preposition._region_anchor = lambda *_args: next(preposition_anchors)
+    first = preposition.select(observation(0))
+    held = preposition.select(observation(3))
+    assert (held.action.move_x, held.action.move_y) == (
+        first.action.move_x,
+        first.action.move_y,
+    )
+
+    evacuation = EngineMPC(MPCConfig(
+        observation_delay=0,
+        preferred_y_fraction=0.5,
+    ))
+    evacuation_anchors = iter((
+        anchor(80.0, "preposition"),
+        anchor(-80.0, "evacuate"),
+    ))
+    evacuation._region_anchor = lambda *_args: next(evacuation_anchors)
+    before = evacuation.select(observation(0))
+    escaped = evacuation.select(observation(3))
+    assert (escaped.action.move_x, escaped.action.move_y) != (
+        before.action.move_x,
+        before.action.move_y,
+    )
+
+
+def test_committed_plan_cannot_bypass_direction_hold() -> None:
+    teacher = EngineMPC(MPCConfig())
+    right = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (1, 0, True)
+    )
+    left = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (-1, 0, True)
+    )
+    teacher._last_action = right
+    teacher._direction_started_frame = 100
+
+    assert not teacher._committed_action_respects_direction_hold(
+        left,
+        right,
+        103,
+    )
+    assert teacher._committed_action_respects_direction_hold(
+        left,
+        left,
+        103,
+    )
+    assert teacher._committed_action_respects_direction_hold(
+        left,
+        right,
+        109,
+    )
+
+
+def test_committed_old_direction_cannot_override_a_safety_release() -> None:
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        preferred_y_fraction=0.5,
+    ))
+
+    def anchor(*_args: Any) -> _RegionAnchor:
+        return _RegionAnchor(
+            x=80.0,
+            y=0.0,
+            crossing=False,
+            path_margin=20.0,
+            evacuating=True,
+            target_rows_ahead=1,
+            navigation_mode="preposition",
+            current_component="band:0",
+            target_component="exterior:right",
+            portal="test",
+            deadline_slack=30.0,
+        )
+
+    teacher._region_anchor = anchor
+    first = teacher.select(observation(0))
+    committed = first.action
+    replacement = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y) == (
+            -committed.move_x,
+            -committed.move_y,
+        )
+        and action.slow == committed.slow
+    )
+    evaluations = tuple(
+        replace(
+            value,
+            collided=False,
+            collision_frames=0,
+            earliest_collision_frame=None,
+            minimum_margin=(
+                8.0
+                if value.action.discrete == committed.discrete else
+                14.0
+                if value.action.discrete == replacement.discrete else
+                value.minimum_margin
+            ),
+        )
+        for value in first.evaluations
+    )
+    proposed = replace(
+        first,
+        action=replacement,
+        source_frame=3,
+        evaluations=evaluations,
+        planned_actions=(replacement,),
+    )
+    teacher._committed_plan = (committed,)
+    teacher._committed_plan_is_region = True
+    teacher._committed_plan_evacuating = proposed.region_evacuating
+    teacher._committed_plan_key = (
+        proposed.region_phase,
+        proposed.region_phase_started_frame,
+        proposed.region_navigation_mode,
+        proposed.region_current_component,
+        proposed.region_target_component,
+        proposed.region_portal,
+    )
+    teacher._compute = lambda *_args: proposed
+
+    selected = teacher.select(observation(3))
+
+    assert selected.action.discrete == replacement.discrete
+    assert selected.using_committed_plan is False
+
+
+def test_beam_candidate_order_keeps_clearance_shortfall_ahead_of_smoothing() -> None:
+    order = EngineMPC._beam_candidate_order(
+        collided=np.asarray([False, False]),
+        earliest_collision=np.asarray([61, 61]),
+        collision_frames=np.asarray([0, 0]),
+        margin_shortfall=np.asarray([8.0, 0.0]),
+        preference=np.asarray([0.0, 100.0]),
+        minimum_margin=np.asarray([0.0, 8.0]),
+    )
+
+    assert order.tolist() == [1, 0]
+
+
+def test_imminent_collision_interrupts_direction_hold_immediately() -> None:
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        preferred_y_fraction=0.5,
+    ))
+    boss = {
+        "id": 30,
+        "x": 80.0,
+        "y": 40.0,
+        "maxhp": 1000.0,
+        "collidable": False,
+    }
+    first = teacher.select(observation(0, enemies=[boss]))
+    assert (first.action.move_x, first.action.move_y) == (1, -1)
+
+    path_coordinate = 3.0 * math.sqrt(2.0)
+    danger = bullet(
+        31,
+        path_coordinate,
+        -path_coordinate,
+        dx=0.0,
+        dy=0.0,
+    )
+    boss["x"] = -80.0
+    escaped = teacher.select(observation(3, enemies=[boss], bullets=[danger]))
+    incumbent = next(
+        item for item in escaped.evaluations
+        if item.action.discrete == first.action.discrete
+    )
+    selected = next(
+        item for item in escaped.evaluations
+        if item.action.discrete == escaped.action.discrete
+    )
+
+    assert incumbent.collided is True
+    assert incumbent.earliest_collision_frame == 2
+    assert selected.collided is False
+    assert escaped.action.discrete != first.action.discrete
+    assert escaped.action.spell is False
+
+
+def test_material_clearance_gain_can_interrupt_direction_hold() -> None:
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        preferred_y_fraction=0.5,
+    ))
+    boss = {
+        "id": 30,
+        "x": 80.0,
+        "y": 40.0,
+        "maxhp": 1000.0,
+        "collidable": False,
+    }
+    first = teacher.select(observation(0, enemies=[boss]))
+    boss["x"] = -80.0
+    escaped = teacher.select(observation(
+        3,
+        enemies=[boss],
+        bullets=[bullet(31, 10.0, 0.0, dx=0.0, dy=0.0)],
+    ))
+    incumbent = next(
+        item for item in escaped.evaluations
+        if item.action.discrete == first.action.discrete
+    )
+    selected = next(
+        item for item in escaped.evaluations
+        if item.action.discrete == escaped.action.discrete
+    )
+
+    assert incumbent.collided is False
+    assert incumbent.minimum_margin > teacher.config.emergency_margin
+    assert (
+        selected.minimum_margin - incumbent.minimum_margin
+        >= teacher.config.switch_margin_gain
+    )
+    assert escaped.action.discrete != first.action.discrete
+
+
+def test_transition_penalty_distinguishes_switch_reverse_and_aba() -> None:
+    teacher = EngineMPC(MPCConfig())
+    right = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (1, 0, True)
+    )
+    left = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (-1, 0, True)
+    )
+    up = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (0, 1, True)
+    )
+
+    ordinary_switch = teacher._transition_penalty(up, right, None)
+    reverse = teacher._transition_penalty(left, right, None)
+    aba_reverse = teacher._transition_penalty(left, right, left)
+
+    assert ordinary_switch == teacher.config.direction_switch_penalty
+    assert reverse == (
+        teacher.config.direction_switch_penalty
+        + teacher.config.direction_reverse_penalty
+    )
+    assert aba_reverse == reverse + teacher.config.direction_aba_penalty
+
+
+def test_clearance_reserve_prefers_more_distance_after_basic_safety() -> None:
+    preferred_y_fraction = 84.0 / 152.0
+    legacy = EngineMPC(MPCConfig(
+        observation_delay=0,
+        preferred_y_fraction=preferred_y_fraction,
+        safe_margin_target=12.0,
+        clearance_reward_weight=0.0,
+        minimum_direction_hold_frames=0,
+        direction_switch_penalty=0.0,
+        direction_reverse_penalty=0.0,
+        direction_aba_penalty=0.0,
+        speed_switch_penalty=0.0,
+    ))
+    safer = EngineMPC(MPCConfig(
+        observation_delay=0,
+        preferred_y_fraction=preferred_y_fraction,
+    ))
+    scene = observation(
+        0,
+        bullets=[bullet(31, -50.0, -30.0, dx=0.0, dy=0.0)],
+        enemies=[{
+            "id": 30,
+            "x": -80.0,
+            "y": 40.0,
+            "maxhp": 1000.0,
+            "collidable": False,
+        }],
+    )
+
+    legacy_decision = legacy.select(scene)
+    safer_decision = safer.select(scene)
+    legacy_evaluation = next(
+        item for item in legacy_decision.evaluations
+        if item.action.discrete == legacy_decision.action.discrete
+    )
+    safer_evaluation = next(
+        item for item in safer_decision.evaluations
+        if item.action.discrete == safer_decision.action.discrete
+    )
+
+    assert legacy_evaluation.collided is False
+    assert safer_evaluation.collided is False
+    assert safer_evaluation.minimum_margin >= legacy_evaluation.minimum_margin + 4.0
+    assert safer_evaluation.minimum_margin >= safer.config.safe_margin_target
+
+
 def test_region_planner_keeps_a_non_downward_wall_transition() -> None:
     lower_x = (-203.0, -155.0, -107.0, -59.0, -11.0)
     upper_x = (-186.0, -138.0, -90.0, -42.0, 6.0)
@@ -418,7 +778,12 @@ def test_48_unit_gap_reaches_its_portal_closure_boundary_at_radius_17_5() -> Non
 
 def test_side_portal_follows_translated_and_rotated_row_endpoints() -> None:
     radius = 20.0
-    side_offset = radius + 0.5 + 6.0 + 1.0
+    config = MPCConfig(
+        observation_delay=0,
+        horizon_frames=60,
+        preferred_y_fraction=39.0 / 202.0,
+    )
+    side_offset = radius + 0.5 + 6.0 + config.region_safe_margin_target
     target_y_offset = radius + 0.5 + 6.0
 
     for angle_degrees, translation_x, expected_side, endpoint_index in (
@@ -443,11 +808,7 @@ def test_side_portal_follows_translated_and_rotated_row_endpoints() -> None:
             )
             for object_id, x, y in row
         ]
-        teacher = EngineMPC(MPCConfig(
-            observation_delay=0,
-            horizon_frames=60,
-            preferred_y_fraction=39.0 / 202.0,
-        ))
+        teacher = EngineMPC(config)
         decision = teacher.select(observation(
             10,
             player_x=0.0,
@@ -638,7 +999,11 @@ def test_target_rows_ahead_comes_from_the_next_stable_band_geometry() -> None:
             for row, y in enumerate(row_y)
             for column, x in enumerate(row_x)
         ]
-        teacher = EngineMPC(MPCConfig(observation_delay=0, horizon_frames=60))
+        teacher = EngineMPC(MPCConfig(
+            observation_delay=0,
+            horizon_frames=60,
+            region_safe_margin_target=1.0,
+        ))
         return teacher.select(observation(
             10,
             player_x=-24.0,
@@ -662,6 +1027,52 @@ def test_target_rows_ahead_comes_from_the_next_stable_band_geometry() -> None:
     )
     assert narrow_then_stable_band.region_target_component == "exterior:left"
     assert narrow_then_stable_band.region_portal == "row:2:side:left"
+
+
+def test_default_region_reserve_skips_a_band_that_becomes_too_narrow() -> None:
+    row_x = (-96.0, -48.0, 0.0, 48.0, 96.0)
+    walls = [
+        wall_object(
+            row * 100 + column,
+            x,
+            y,
+            radius=7.0,
+            dx=0.0,
+            dy=0.0,
+        )
+        for row, y in enumerate((-200.0, -120.0, -60.0, 0.0))
+        for column, x in enumerate(row_x)
+    ]
+
+    def decide(region_margin: float):
+        teacher = EngineMPC(MPCConfig(
+            observation_delay=0,
+            horizon_frames=60,
+            region_safe_margin_target=region_margin,
+        ))
+        decision = teacher.select(observation(
+            10,
+            player_x=-24.0,
+            player_y=-160.0,
+            indestructibles=walls,
+            bounds=(-200.0, 200.0, -240.0, 256.0),
+        ))
+        selected = next(
+            item for item in decision.evaluations
+            if item.action.discrete == decision.action.discrete
+        )
+        return decision, selected
+
+    legacy, legacy_evaluation = decide(1.0)
+    safer, safer_evaluation = decide(8.0)
+
+    assert legacy.region_target_rows_ahead == 1
+    assert safer.region_target_rows_ahead == 3
+    assert safer.region_crossing is True
+    assert safer.region_path_margin is not None
+    assert safer.region_path_margin > 0.0
+    assert safer_evaluation.collided is False
+    assert safer_evaluation.minimum_margin > legacy_evaluation.minimum_margin + 8.0
 
 
 def test_persistent_region_intent_survives_a_blocked_straight_path() -> None:

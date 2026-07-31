@@ -286,6 +286,58 @@ All three reports bind implementation SHA-256
 The two delay-5 held-out attempts passed, and the zero-delay regression passed;
 this is not a statistical success-rate claim or Boss #4 evidence.
 
+The current controller still replans every three frames, but now targets 20
+units of ordinary clearance and 8 units inside forced-region passages. It
+normally holds a direction for nine frames. A collision forecast within 12
+frames, incumbent clearance at most 4, a new plan improving clearance by at
+least 6, or a deadline-driven `evacuate` can release that hold. The beam cost
+also penalizes a direction change, exact reversal, `A -> B -> A` oscillation,
+and same-direction speed-mode change by `3/9/6/0.75`. Collision state, first
+collision, collision-frame count, and clearance shortfall remain
+higher-priority than smoothing. A committed action cannot override a different
+direction that already passed a safety release inside the hold window.
+
+Two native macOS DirectX-free closed-loop runs started at the Spell Practice
+reset with five frames of observation delay and strictly defeated Boss #3 at
+frame 3816:
+
+| Run | Seed | HP / death | Changes / reversals / ABA | Median clearance | File SHA-256 |
+| --- | ---: | --- | --- | ---: | --- |
+| `engine-mpc-boss3-safety-sort-v46-seed20260730.json` | 20260730 | `6000 -> 0` / 0 | 487 / 20 / 20 | 8.27 | `e1a4df0fd857b3aa7cc52e6bcd6416a856f74228f34e07c26b4a19882cbe6d39` |
+| `engine-mpc-boss3-safety-sort-v47-seed20260731.json` | 20260731 | `6000 -> 0` / 0 | 502 / 10 / 30 | 8.31 | `d69d6b7fa2b88637590f5bbe5f605e1768bd7dccbd47307bdfa25fd651d50faf` |
+
+Both reports have `terminated=true`, `termination_reason=attack_complete`,
+`passed=true`, `unsafe_shot_frames=0`, and forced `spell=false`. They bind
+implementation SHA-256
+`8422915228d7b867ae01ffae0e2d0ae85d7ab8d1aac71e3a383c6b8a6e6d2044`.
+This is 2/2 among executed attempts only; it is not evidence for unexecuted
+seeds, Boss #4, or a deployable learned policy.
+These reports supersede v44/v45, which predate the final region-sort and
+committed-action safety fixes.
+
+`experiments/benchmark_engine_mpc_grid.py` compares the continuous beam with
+8/12/16-unit time-layered grids on the same recorded delay-5 observations at
+source frames `488/1292/2102/2801/3695`. Every plan is independently checked
+at every logical frame with continuous circle geometry; a grid never certifies
+its own safety. The final current-profile result is:
+
+| Planner | Collision-frame rate | Median minimum clearance | Changes per 60 frames | Mean time |
+| --- | ---: | ---: | ---: | ---: |
+| Continuous beam 20/8 | 9.09% | -4.87 | 5.66 | 0.103 s |
+| Grid 8, center sample | 11.00% | -8.51 | 7.40 | 0.638 s |
+| Grid 12, center sample | 10.67% | -5.49 | 9.40 | 0.248 s |
+| Grid 16, center sample | 47.67% | -27.67 | 10.80 | 0.085 s |
+
+Whole-cell half-diagonal inflation also lost at 14.33%/17.33%/52.00%. In the
+Grid 8 center variant, 22 of 33 collision frames fell between sampled layers
+and 11 fell on sampled layers, so the failure is not only temporal aliasing;
+space quantization and accumulated-risk routing also matter. Grids remain
+useful for visual overlays, connected regions, and global hints, while final
+movement stays with the continuous beam and per-frame geometry. Report
+SHA-256 is
+`a05c36395bc13c6bc829b5694d1b556bdf9be9fb720d554f0bfaa641bc6c67d9`.
+This is an open-loop plan ablation, not an `attack_complete` success rate.
+
 A separate full-engine native macOS OpenGL run kept the optimized F7 overlay
 enabled and passed the same strict condition. Artifact
 `engine-mpc-boss3-gpu-overlay-strict-seed20260730.json` has SHA-256
@@ -295,6 +347,9 @@ It reached episode frame 3816 with `terminated=true`,
 `death=0`, `unsafe_shot_frames=0`, and forced `spell=false`. Its
 `acceptance_claim=false` correctly scopes it as single-run live MPC teacher
 evidence, not deployable-policy acceptance or Boss #4 evidence.
+That run predates the current overlay implementation described below; it is
+historical full-engine integration evidence, not an execution proof for the
+current overlay SHA-256.
 
 `train-region-dynamics` fits the allowed cross-episode strategy memory from one
 or more native Engine MPC JSON reports:
@@ -438,18 +493,24 @@ and cannot replace native LuaSTG `attack_complete` training or acceptance.
 The engine installation's `game/plugins/SafetyZoneVisualizer` plugin toggles
 with `F7`, or starts enabled with `SR_SAFETY_ZONE_OVERLAY=1`. It grades safe,
 caution, danger, and collision cells from current colliders and linear
-projections at 0, 6, and 12 frames. Circles, rotated ellipses, rectangles, and
-straight lasers are supported. Straight-laser clearance uses the tapered
-polygon defined by `l1`, `l2`, `l3`, and `w`, including THlib laser objects
-whose generic ellipse collider reports `a=b=0`; curved-laser interiors are not
-rasterized. A standalone parity test compares every optimized cell with the
-original full scan across ellipses, rotated rectangles, tapered lasers, fast
-projections, boundary cases, and a 350-bullet field. It performed 17,803 exact
-clearance calculations instead of 705,600 (2.52%) and coalesced 672 cells into
-253 render rectangles (`253/672`, rectangles/cells) without changing any
-cell's risk level.
+projections every three frames from 0 through 24. A 16-unit cell is classified
+as a whole by inflating the player radius by its half diagonal. Red is signed
+clearance at most 0; orange is clearance at most 12 or at least five
+simultaneous nearby threats within 36; yellow is clearance at most 24 or at
+least three. Clearance takes the worst future layer, while density is counted
+within each layer before taking its maximum, so threats arriving at different
+times are not combined into a fictitious crowd. Circles, rotated ellipses,
+rectangles, and straight lasers are supported. Straight-laser clearance uses
+the tapered polygon defined by `l1`, `l2`, `l3`, and `w`, including THlib laser
+objects whose generic ellipse collider reports `a=b=0`; curved-laser interiors
+are not rasterized. A standalone parity test compares every optimized cell
+with the original full scan across ellipses, rotated rectangles, tapered
+lasers, fast projections, cell-corner collisions, time-separated density,
+boundary cases, and a 350-bullet field. It performed 34,548 exact clearance
+calculations out of 2,116,800 (1.63%) and coalesced 672 cells into 45 render
+rectangles (`45/672`, rectangles/cells) without changing any cell's risk level.
 `SafetyZoneVisualizer.lua` SHA-256 is
-`ce491f13a446c05e301c734d695b82d76336e01fadd189b6823ed2a33f14891c`.
+`a39c7a1ac49e8a6214c1af2f1df6d6ae72ea113ac7bca6bc195c83a7bcf871be`.
 The overlay is diagnostic and read-only: it does not change collision,
 objects, input, RNG, AI actions, or memory.
 
@@ -469,9 +530,10 @@ invalid samples, and peak at 421 objects.
 | OpenGL GPU/FBO / off | 59.990 | 59.867 | 58.911 | `74482a01232db58d21fa75dc51f7a9e10b8ff2f3844b3484ade9f9bf9747d126` |
 | OpenGL GPU/FBO / optimized overlay | 59.988 | 59.984 | 52.265 | `67f5c5335b317d11584c01e392e91ff1e9b039723498d437a05614fdd43e94b7` |
 
-The strict GPU-plus-overlay defeat artifact extends this to 3816 valid display
-samples, peak 532 objects, and 2844 dense samples. Dense median is 59.988 FPS
-and P10 is 59.492 FPS while the engine still returns `attack_complete`.
+The historical strict GPU-plus-overlay defeat artifact extends this to 3816
+valid display samples, peak 532 objects, and 2844 dense samples. Dense median
+is 59.988 FPS and P10 is 59.492 FPS while the engine still returns
+`attack_complete`; as noted above, that run used the earlier overlay revision.
 
 `render_performance` is reporting-only diagnostics. Its exact source is the
 60-native-frame `lstg.GetFPS` display average plus `lstg.GetnObj`, and its report
