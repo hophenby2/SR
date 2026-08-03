@@ -20,6 +20,8 @@ param(
     [int]$StartupTimeout = 120,
     [string]$RegionDynamicsMemory = '',
     [string]$OutputPath = '',
+    [string]$ReplayName = '',
+    [switch]$RecordObservations,
     [switch]$Headless,
     [switch]$DisableOverlay,
     [switch]$CloseGameWhenDone
@@ -100,6 +102,23 @@ elseif (-not [IO.Path]::IsPathRooted($RegionDynamicsMemory)) {
 }
 
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+if ([string]::IsNullOrWhiteSpace($ReplayName)) {
+    $ReplayName = "boss3-win-$timestamp"
+}
+elseif ($ReplayName.EndsWith('.rep', [StringComparison]::OrdinalIgnoreCase)) {
+    $ReplayName = $ReplayName.Substring(0, $ReplayName.Length - 4)
+}
+if ($ReplayName -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$' -or
+        $ReplayName.EndsWith('.', [StringComparison]::Ordinal)) {
+    throw 'ReplayName must contain 1-96 portable filename characters.'
+}
+$replayBaseName = $ReplayName.Split('.')[0].ToUpperInvariant()
+$reservedReplayNames = @('CON', 'PRN', 'AUX', 'NUL')
+if ($replayBaseName -in $reservedReplayNames -or
+        $replayBaseName -match '^(COM|LPT)[1-9]$') {
+    throw 'ReplayName uses a Windows reserved basename.'
+}
+
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = Join-Path `
         (Join-Path $labRoot 'artifacts') `
@@ -108,6 +127,9 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 elseif (-not [IO.Path]::IsPathRooted($OutputPath)) {
     $OutputPath = Join-Path $labRoot $OutputPath
 }
+$nativeReplayPath = Join-Path `
+    (Join-Path (Join-Path (Join-Path $LocalGameRoot 'userdata') 'replay') $modName) `
+    (Join-Path 'analysis' ($ReplayName + '.rep'))
 
 $requiredFiles = @(
     $gameExe,
@@ -216,6 +238,7 @@ try {
     Write-Host "  Scenario: $Scenario, attack $Attack, seed $Seed"
     Write-Host "  Session:  $sessionId"
     Write-Host "  Report:   $OutputPath"
+    Write-Host "  Replay:   $nativeReplayPath"
 
     $gameProcess = Start-Process `
         -FilePath $gameExe `
@@ -263,9 +286,13 @@ try {
         '--horizon-frames', $HorizonFrames.ToString(),
         '--observation-delay', $ObservationDelay.ToString(),
         '--region-dynamics-memory', $RegionDynamicsMemory,
+        '--replay-name', $ReplayName,
         '--render-every', '1',
         '--output', $OutputPath
     )
+    if ($RecordObservations) {
+        $controllerArguments += @('--record-observations-from-frame', '0')
+    }
     if ($Headless) {
         $controllerArguments += '--no-render'
     }
@@ -279,10 +306,17 @@ try {
     if ($controllerExit -ne 0) {
         throw "The test failed strict attack_complete validation (controller exit code $controllerExit). Report: $OutputPath"
     }
+    if (-not (Test-Path -LiteralPath $nativeReplayPath -PathType Leaf)) {
+        throw "The controller completed but the native replay is missing: $nativeReplayPath"
+    }
+    if ((Get-Item -LiteralPath $nativeReplayPath).Length -le 0) {
+        throw "The controller created an empty native replay: $nativeReplayPath"
+    }
 
     Write-Host ''
     Write-Host 'PASS: the engine reported attack_complete.' -ForegroundColor Green
     Write-Host "Report: $OutputPath"
+    Write-Host "Replay: $nativeReplayPath"
     $exitCode = 0
 }
 catch {

@@ -32,6 +32,22 @@ Python 端会对相同的 18 个实际加载 SR Lua 文件独立计算 CRC32 与
 
 可见性过滤不参与符卡结束判断。`attack_complete` 直接检查未经可见性过滤的 `GROUP_ENEMY` 与 `GROUP_NONTJT` 原始对象池，避免 Boss 暂时隐藏或移出画面时误判结束。
 
+### 原生 replay 录制
+
+符卡 `reset` 或最终关 `reset_stage` 可以带便携文件名 `replay_name`。桥接器会创建私有 `plus.ReplayFrameWriter`，在每个逻辑帧的 THlib `GetInput()` 完成后记录最终 `KeyState`，但不会占用全局 `replayWriter`，因此后续转场不会误访问 THlib 私有的关卡录像表。客户端使用下列命令结束录制：
+
+```json
+{"id":5,"command":"save_replay","finish":false,"reason":"attack_complete"}
+```
+
+桥接器将标准 STGR v1 文件写到 `userdata/replay/<setting.mod>/analysis/<replay_name>.rep`，随后通过 `plus.ReplayManager.ReadReplayInfo` 读回并核对文件头、序列化初态、关卡、seed、玩家和帧数；它还会实际读取全部声明的输入字节，并要求最后一帧恰好结束于 EOF。响应包含文件大小、已验证帧字节数、结束原因和 CRC32；瞬时写入、读回或校验失败会保留内存 writer 以便重试。符卡练习固定写 `group_finish=0`；只有严格成功的最终关可以写 `group_finish=1`。普通非最终关以及 ghost、关闭碰撞、额外保护帧等原生录像无法复现的测试选项会被拒绝。
+
+这里的 `verified=true` 表示 STGR 结构、元数据和帧区完整，不表示已经在原生 replay 菜单中完成了一次语义回放。需要保留旧录像时应使用不同名称；THlib 会覆盖同名文件。
+
+`engine-mpc-play --replay-name NAME` 会自动完成上述流程，并把结果放进同轮 JSON 的 `native_replay`。死亡或达到帧上限时也会保存，但 `finish=false`。`.rep` 只包含序列化初态和输入字节，不包含 MPC 的观测、预测或决策理由；分析时必须保留同轮 JSON。需要完整可见对象快照时再加 `--record-observations-from-frame 0`。
+
+2026-08-03 的最终原生 arm64 macOS headless 验证使用 Okuu Boss #3、seed `20260730`、五帧观察延迟、60 帧 horizon 和 `bullet-group-expert`。控制器在 3363 个受控帧后由引擎返回 `attack_complete`，Boss HP 为 0、自机 `death=0`、射击指令率为 1.0。3891 字节录像含中性 reset 帧共 3364 帧，`group_finish=0`、CRC32 为 `5f964c53`、SHA-256 为 `4d6be63144e7706de04112c2204e2960dffb78fda57cc19a4a0423a2b8aa85d2`。独立 STGR 解析器从 JSON 的动作保持记录重建了全部 3364 个预期输入字节，错位为 0，且 3363 个受控帧全部开枪。配套 JSON 保存 1121 次决策及完整观测，SHA-256 为 `20822e937020f0137e3d5e064e9e663f5d9c4134426f2ac698c56db3aa268170`。两者都是被忽略的本地分析产物，不作为源码 fixture 提交。
+
 ## 人类化观测
 
 部署模型只能接收可由画面获得的信息：
@@ -90,7 +106,7 @@ Python Stage 5 Boss #3 场景只近似原符卡后段的移动、周期扩张危
 - 固定动作片段或整局动作序列；
 - 只对某一次录制有效的过关路线。
 
-当前 `engine-mpc-play` 已删除动作前缀 loader、运行参数和回放分支。原生诊断报告仍保存逐帧动作、位置和绝对帧以便定位故障，但当前代码没有把报告重新解释为策略输入的入口；正式运行只能从 reset 开始由 live MPC 连续闭环控制。
+当前 `engine-mpc-play` 没有录制动作 loader 或播放分支。可选的原生 replay 只作为输出，绝不会向控制器提供动作或其他输入。原生诊断报告仍保存逐帧动作、位置和绝对帧以便定位故障，但当前代码不会把报告或 `.rep` 重新解释为策略输入；正式运行只能从 reset 开始由 live MPC 连续闭环控制。
 
 `train-region-dynamics` 从原生报告中读取 `source_frame`、可见区域半径，以及已记录控制器输入中的可碰撞不可摧毁物 `id/x/y`；`id` 只用于相邻画面匹配，产物不保存对象身份。训练器拒绝带录制动作、非 `live_mpc` 决策、authority shield 或未强制 `spell=false` 的来源，并将训练 provenance 与可加载记忆分开保存：
 
@@ -326,7 +342,7 @@ Copy-Item -LiteralPath "$SourceRoot\game\mod\$Mod\compat\testing\bridge.lua" `
 
 可见演示使用 `SR_TEST_HEADLESS=0`、`SR_TEST_LOCKSTEP=1` 和 `--render --render-every 1`。启动参数应设置 `setting.vsync=true`；这可禁止允许 tearing 的提交，但仅开 vsync 不能修复旧桥接器产生的黑帧。修改 Lua 文件后必须重启引擎，因为文件只在启动时加载。若只有风险色块闪动而游戏底图稳定，可按 F7 关闭覆盖层并单独排查；整屏明暗交替则应先检查本地 `bridge.lua` 是否已经同步。
 
-完成本地游戏复制和 `.venv-win` 安装后，可直接双击 `tools\stg_lab\run-win-boss3.cmd`。它只启动现有文件，不复制、覆盖或安装游戏与 Python 环境。脚本会校验本地桥接器与当前源码一致，默认读取已纳入版本库的 `models\region_dynamics_boss3_v2.json`，设置测试环境变量，以 `setting.vsync=true` 启动 `C:\stg-win-demo\LuaSTGSub.exe`，无连接地等待端口监听，然后运行 Boss #3 可见 MPC 测试。成功仍只接受引擎返回 `attack_complete`。报告写入带时间戳的 `tools\stg_lab\artifacts\engine-mpc-boss3-win-*.json`；默认保留游戏窗口，传入 `-CloseGameWhenDone` 才会在结束后请求关闭。
+完成本地游戏复制和 `.venv-win` 安装后，可直接双击 `tools\stg_lab\run-win-boss3.cmd`。它只启动现有文件，不复制、覆盖或安装游戏与 Python 环境。脚本会校验本地桥接器与当前源码一致，默认读取已纳入版本库的 `models\region_dynamics_boss3_v2.json`，设置测试环境变量，以 `setting.vsync=true` 启动 `C:\stg-win-demo\LuaSTGSub.exe`，无连接地等待端口监听，然后运行 Boss #3 可见 MPC 测试。成功仍只接受引擎返回 `attack_complete`。报告写入带时间戳的 `tools\stg_lab\artifacts\engine-mpc-boss3-win-*.json`；同轮原生录像写入本地游戏的 `userdata\replay\SR_Subterrain_Reanimation_v100\analysis`，脚本会验证文件非空并打印两个路径。传入 `-RecordObservations` 可从第 0 帧归档完整观测；默认保留游戏窗口，传入 `-CloseGameWhenDone` 才会在结束后请求关闭。
 
 也可从 PowerShell 覆盖默认参数：
 
@@ -599,6 +615,7 @@ uv run stg-lab engine-mpc-play \
   --scenario 'okuu:Lunatic' --attack 3 --seed 20260730 \
   --max-frames 4200 --horizon-frames 60 --observation-delay 5 \
   --region-dynamics-memory models/region_dynamics_boss3_v2.json \
+  --replay-name boss3-seed20260730 \
   --output artifacts/engine-mpc-boss3-rerun.json
 
 for report in \

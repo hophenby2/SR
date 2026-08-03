@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict, dataclass
 import math
+import re
 from typing import Any, Callable, Mapping
 
 from .engine import EngineClient, EngineProtocolError
@@ -20,6 +21,12 @@ from .vision import VisionConfig, VisionObservation
 
 
 DecisionObserver = Callable[[VisionObservation, Action, float], None]
+_REPLAY_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}")
+_WINDOWS_RESERVED_REPLAY_BASENAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +42,7 @@ class EngineMPCPlayConfig:
     record_observations_from_frame: int | None = None
     region_dynamics_memory_path: str | None = None
     region_dynamics_memory_sha256: str | None = None
+    replay_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_frames <= 0:
@@ -71,6 +79,108 @@ class EngineMPCPlayConfig:
             )
         ):
             raise ValueError("region dynamics memory SHA-256 is invalid")
+        if self.replay_name is not None:
+            if not isinstance(self.replay_name, str):
+                raise ValueError("replay_name must be a string")
+            replay_name = (
+                self.replay_name[:-4]
+                if self.replay_name.lower().endswith(".rep") else self.replay_name
+            )
+            if (
+                _REPLAY_NAME_PATTERN.fullmatch(replay_name) is None
+                or replay_name.endswith(".")
+            ):
+                raise ValueError(
+                    "replay_name must be 1-96 portable filename characters"
+                )
+            windows_basename = replay_name.partition(".")[0].upper()
+            if windows_basename in _WINDOWS_RESERVED_REPLAY_BASENAMES:
+                raise ValueError("replay_name uses a Windows reserved basename")
+            object.__setattr__(self, "replay_name", replay_name)
+
+
+def _replay_start_metadata(
+    response: Mapping[str, Any],
+    *,
+    expected_name: str,
+    expected_episode_kind: str,
+    expected_stage_name: str,
+    expected_seed: int,
+) -> dict[str, Any]:
+    reset = response.get("reset")
+    replay = reset.get("replay") if isinstance(reset, Mapping) else None
+    if not isinstance(replay, Mapping):
+        raise EngineProtocolError("engine reset did not start the requested replay")
+    result = dict(replay)
+    random_seed = result.get("random_seed")
+    if (
+        result.get("schema_version") != 1
+        or result.get("name") != expected_name
+        or result.get("episode_kind") != expected_episode_kind
+        or result.get("stage_name") != expected_stage_name
+        or random_seed != expected_seed
+        or result.get("saved") is not False
+        or not isinstance(result.get("path"), str)
+        or not result["path"]
+        or isinstance(random_seed, bool)
+        or not isinstance(random_seed, int)
+        or not isinstance(result.get("player"), str)
+        or not result["player"]
+    ):
+        raise EngineProtocolError("engine returned invalid replay start metadata")
+    return result
+
+
+def _saved_replay_metadata(
+    response: Mapping[str, Any],
+    *,
+    expected_name: str,
+    expected_episode_kind: str,
+    expected_stage_name: str,
+    expected_seed: int,
+    expected_player: str,
+    expected_path: str,
+    expected_finish: bool,
+    expected_reason: str,
+) -> dict[str, Any]:
+    replay = response.get("replay")
+    if not isinstance(replay, Mapping):
+        raise EngineProtocolError("engine did not return saved replay metadata")
+    result = dict(replay)
+    frame_count = result.get("frame_count")
+    frame_bytes_verified = result.get("frame_bytes_verified")
+    file_size = result.get("file_size")
+    crc32 = result.get("crc32")
+    expected_group_finish = 1 if expected_finish else 0
+    if (
+        result.get("schema_version") != 1
+        or result.get("name") != expected_name
+        or result.get("episode_kind") != expected_episode_kind
+        or result.get("stage_name") != expected_stage_name
+        or result.get("random_seed") != expected_seed
+        or result.get("player") != expected_player
+        or result.get("path") != expected_path
+        or result.get("finish") is not expected_finish
+        or result.get("group_finish") != expected_group_finish
+        or result.get("reason") != expected_reason
+        or result.get("saved") is not True
+        or result.get("verified") is not True
+        or not isinstance(result.get("path"), str)
+        or not result["path"]
+        or isinstance(frame_count, bool)
+        or not isinstance(frame_count, int)
+        or frame_count <= 0
+        or isinstance(frame_bytes_verified, bool)
+        or not isinstance(frame_bytes_verified, int)
+        or frame_bytes_verified != frame_count
+        or isinstance(file_size, bool)
+        or not isinstance(file_size, int)
+        or file_size < frame_bytes_verified
+        or not isinstance(crc32, str)
+        or re.fullmatch(r"[0-9a-f]{8}", crc32) is None
+    ):
+        raise EngineProtocolError("engine returned invalid saved replay metadata")
+    return result
 
 
 def _episode_frame(observation: Mapping[str, Any]) -> int | None:
@@ -243,7 +353,16 @@ def run_engine_mpc_play(
 
     ping = client.ping()
     runtime_source_verification = verify_runtime_source_fingerprints(ping)
+    if config.replay_name is not None:
+        commands = ping.get("commands")
+        if not isinstance(commands, list) or "save_replay" not in commands:
+            raise EngineProtocolError(
+                "engine bridge does not advertise native replay capture"
+            )
     catalog_response = client.catalog()
+    replay_request = (
+        {} if config.replay_name is None else {"replay_name": config.replay_name}
+    )
     if stage is None:
         assert attack is not None
         catalog_entry = _catalog_entry(catalog_response, scenario, attack)
@@ -253,6 +372,7 @@ def run_engine_mpc_play(
             seed=int(seed),
             player=player,
             options={},
+            **replay_request,
         )
     else:
         catalog_entry = _catalog_stage(catalog_response, stage)
@@ -261,7 +381,21 @@ def run_engine_mpc_play(
             seed=int(seed),
             player=player,
             options={},
+            **replay_request,
         )
+    replay_start = (
+        None
+        if config.replay_name is None else
+        _replay_start_metadata(
+            response,
+            expected_name=config.replay_name,
+            expected_episode_kind=episode_kind,
+            expected_stage_name=(
+                "Spell Practice@Spell Practice" if stage is None else stage
+            ),
+            expected_seed=int(seed),
+        )
+    )
     raw = _observation(response)
     initial_episode_frame = _episode_frame(raw)
     controller.reset()
@@ -448,6 +582,30 @@ def run_engine_mpc_play(
         and zero_death_evidence
     )
     final_episode_frame = _episode_frame(raw)
+    native_replay = None
+    if config.replay_name is not None:
+        assert replay_start is not None
+        replay_reason = (
+            termination_reason
+            if isinstance(termination_reason, str) and termination_reason else
+            "unknown"
+        )
+        replay_finish = episode_kind == "stage" and success
+        replay_response = client.save_replay(
+            finish=replay_finish,
+            reason=replay_reason,
+        )
+        native_replay = _saved_replay_metadata(
+            replay_response,
+            expected_name=config.replay_name,
+            expected_episode_kind=episode_kind,
+            expected_stage_name=replay_start["stage_name"],
+            expected_seed=replay_start["random_seed"],
+            expected_player=replay_start["player"],
+            expected_path=replay_start["path"],
+            expected_finish=replay_finish,
+            expected_reason=replay_reason,
+        )
     engine_advanced = None
     if initial_episode_frame is not None and final_episode_frame is not None:
         engine_advanced = max(0, final_episode_frame - initial_episode_frame)
@@ -527,6 +685,7 @@ def run_engine_mpc_play(
             "retired: shooting does not affect movement or collision"
         ),
         "predicted_collision_plan_frames": predicted_collision_plan_frames,
+        "native_replay": native_replay,
         "engine": {
             "protocol": ping.get("protocol"),
             "session_id": ping.get("session_id"),

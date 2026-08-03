@@ -16,6 +16,7 @@ GROUP_INDES = 5
 GROUP_NONTJT = 7
 
 setting = {
+    mod = "SR_Subterrain_Reanimation_v100",
     keys = { left = 1, right = 2, up = 3, down = 4, slow = 5, shoot = 6, spell = 7 },
 }
 
@@ -77,9 +78,18 @@ GetKeyState = native_get_key
 function GetFPS() return 47.5 end
 function GetnObj() return 123 end
 
+KeyState = {}
+function GetInput()
+    for name, code in pairs(setting.keys) do
+        KeyState[name] = GetKeyState(code)
+    end
+end
+local native_get_input = GetInput
+
 local old_frame_count = 0
 function FrameFunc()
     old_frame_count = old_frame_count + 1
+    GetInput()
     if stage.next_stage then
         stage.current_stage = stage.next_stage
         stage.next_stage = nil
@@ -107,7 +117,115 @@ lstg = {
     player = player_object,
     world = { l = -192, r = 192, b = -224, t = 224, pl = -192, pr = 192, pb = -224, pt = 224 },
     var = { lifeleft = 2, bomb = 3, power = 400, score = 0 },
+    FileManager = {
+        CreateDirectory = function() return false end,
+        DirectoryExist = function() return true end,
+    },
 }
+
+function Serialize(value)
+    check(value == lstg.var, "replay serialized an unexpected state table")
+    return "serialized-lstg-var"
+end
+
+local saved_replays = {}
+local saved_replay_bytes = {}
+local replay_frame_data_position = 32
+local replay_file_length_adjustment = 0
+local replay_save_failures = 0
+local replay_read_failures = 0
+local replay_save_calls = {}
+local replay_read_calls = {}
+local original_bit = rawget(_G, "bit")
+local original_io_open = io.open
+bit = {
+    bxor = function() return 0 end,
+    band = function() return 0 end,
+    rshift = function() return 0 end,
+    bnot = function() return 0 end,
+}
+io.open = function(path, mode)
+    if mode == "rb" and saved_replay_bytes[path] then
+        local bytes = saved_replay_bytes[path]
+        local position = 0
+        return {
+            read = function(_, count)
+                if position >= #bytes then return nil end
+                count = tonumber(count) or (#bytes - position)
+                local value = string.sub(bytes, position + 1, position + count)
+                position = position + #value
+                return value
+            end,
+            seek = function(_, origin, offset)
+                origin = origin or "cur"
+                offset = offset or 0
+                local base = origin == "set" and 0
+                    or origin == "end" and #bytes or position
+                local target = base + offset
+                if target < 0 then return nil, "invalid seek" end
+                position = target
+                return position
+            end,
+            close = function() end,
+        }
+    end
+    return original_io_open(path, mode)
+end
+plus = {
+    ReplayFrameWriter = function()
+        local writer = { count = 0, states = {} }
+        function writer:Record(state)
+            self.count = self.count + 1
+            self.states[self.count] = {
+                left = state.left == true,
+                right = state.right == true,
+                shoot = state.shoot == true,
+            }
+        end
+        function writer:GetCount() return self.count end
+        function writer:CopyToFileStream() end
+        return writer
+    end,
+    ReplayManager = {},
+}
+function plus.ReplayManager.SaveReplayInfo(path, data)
+    replay_save_calls[path] = (replay_save_calls[path] or 0) + 1
+    if replay_save_failures > 0 then
+        replay_save_failures = replay_save_failures - 1
+        error("injected SaveReplayInfo failure")
+    end
+    saved_replays[path] = data
+    local frame_count = data.stages[1].frameData:GetCount()
+    local length = math.max(0,
+        replay_frame_data_position + frame_count + replay_file_length_adjustment)
+    saved_replay_bytes[path] = string.rep("\0", length)
+end
+function plus.ReplayManager.ReadReplayInfo(path)
+    replay_read_calls[path] = (replay_read_calls[path] or 0) + 1
+    if replay_read_failures > 0 then
+        replay_read_failures = replay_read_failures - 1
+        error("injected ReadReplayInfo failure")
+    end
+    local data = saved_replays[path]
+    check(data ~= nil, "replay verification read an unknown path")
+    return {
+        fileVersion = 1,
+        gameName = data.gameName,
+        gameVersion = data.gameVersion,
+        userName = data.userName,
+        group_finish = data.group_finish,
+        stages = {
+            {
+                stageName = data.stages[1].stageName,
+                stageExtendInfo = data.stages[1].stageExtendInfo,
+                randomSeed = data.stages[1].randomSeed,
+                stagePlayer = data.stages[1].stagePlayer,
+                frameCount = data.stages[1].frameData:GetCount(),
+                frameDataPosition = replay_frame_data_position,
+            },
+        },
+    }
+end
 
 local spell_stage = { stage_name = "Spell Practice@Spell Practice", is_menu = false, timer = 0 }
 local stage4 = { stage_name = "Stage 4@Lunatic", is_menu = false, timer = 0 }
@@ -433,6 +551,286 @@ groups[GROUP_ENEMY] = {}
 check(instance:_check_stop(instance:collect_observation()) == "attack_complete",
     "empty authoritative enemy pool did not finish the attack")
 groups[GROUP_ENEMY] = { enemy_object }
+
+instance:_handle_request({
+    id = 30, command = "reset", scenario = "okuu:Lunatic", attack = 2,
+    seed = 100, player = "reimu_player", replay_name = "../invalid",
+})
+check(encoded_values[#encoded_values].id == 30
+        and encoded_values[#encoded_values].ok == false,
+    "unsafe replay filename was accepted")
+check(string.find(encoded_values[#encoded_values].error, "portable filename", 1, true),
+    "unsafe replay filename returned the wrong error")
+check(instance.replay_capture == nil,
+    "invalid replay filename unexpectedly started a capture")
+
+instance:_handle_request({
+    id = 300, command = "reset", scenario = "okuu:Lunatic", attack = 2,
+    seed = 100, player = "reimu_player", replay_name = "trailing-dot.",
+})
+check(encoded_values[#encoded_values].id == 300
+        and encoded_values[#encoded_values].ok == false,
+    "Windows-trimmed trailing-dot replay filename was accepted")
+
+for index, reserved_name in ipairs({
+    "CON", "con.rep", "PrN.REP", "AUX.trace", "nul.rep",
+    "COM1", "com9.rep", "LPT1.trace.rep", "lPt9.ReP",
+}) do
+    instance:_handle_request({
+        id = 3000 + index,
+        command = "reset",
+        scenario = "okuu:Lunatic",
+        attack = 2,
+        seed = 100 + index,
+        player = "reimu_player",
+        replay_name = reserved_name,
+    })
+    local reserved_response = encoded_values[#encoded_values]
+    check(reserved_response.id == 3000 + index and reserved_response.ok == false,
+        "Windows reserved replay name was accepted: " .. reserved_name)
+    check(string.find(
+            reserved_response.error, "Windows reserved device basename", 1, true),
+        "Windows reserved replay name returned the wrong error: " .. reserved_name)
+    check(instance.replay_capture == nil,
+        "Windows reserved replay name unexpectedly started a capture")
+end
+
+instance:_handle_request({
+    id = 31, command = "reset", scenario = "okuu:Lunatic", attack = 2,
+    seed = 101, player = "reimu_player", replay_name = "non-reproducible",
+    options = { player_ghost = true },
+})
+check(encoded_values[#encoded_values].id == 31
+        and encoded_values[#encoded_values].ok == false,
+    "non-reproducible replay options were accepted")
+check(string.find(encoded_values[#encoded_values].error, "player_ghost", 1, true),
+    "non-reproducible replay options returned the wrong error")
+check(instance.replay_capture == nil,
+    "rejected replay options unexpectedly started a capture")
+
+instance:_handle_request({
+    id = 32, command = "reset_stage", stage = "Stage 4@Lunatic",
+    seed = 102, player = "reimu_player", replay_name = "stage4-rejected",
+})
+check(encoded_values[#encoded_values].id == 32
+        and encoded_values[#encoded_values].ok == false,
+    "non-final stage replay capture was accepted")
+check(string.find(encoded_values[#encoded_values].error, "final stages", 1, true),
+    "non-final stage replay rejection returned the wrong error")
+check(instance.replay_capture == nil,
+    "rejected Stage 4 replay unexpectedly started a capture")
+
+instance:_handle_request({
+    id = 33, command = "reset", scenario = "okuu:Lunatic", attack = 2,
+    seed = 20260730, player = "reimu_player", replay_name = "boss3-analysis.REP",
+    options = {},
+})
+check(instance.replay_capture ~= nil,
+    "spell-practice reset did not start replay capture")
+check(instance.replay_capture.writer:GetCount() == 0,
+    "replay capture recorded input before the reset frame")
+FrameFunc()
+local replay_reset = encoded_values[#encoded_values]
+check(replay_reset.id == 33 and replay_reset.ok,
+    "spell-practice replay reset failed")
+check(replay_reset.reset.replay.name == "boss3-analysis",
+    "replay reset did not normalize the .rep suffix")
+check(replay_reset.reset.replay.random_seed == 20260730,
+    "replay reset metadata seed mismatch")
+check(replay_reset.reset.replay.player == "Reimu",
+    "replay reset did not use the registered replay player label")
+local attack_writer = instance.replay_capture.writer
+check(attack_writer:GetCount() == 1,
+    "reset frame was not recorded exactly once")
+check(not attack_writer.states[1].left
+        and not attack_writer.states[1].right
+        and not attack_writer.states[1].shoot,
+    "reset frame did not record neutral input")
+
+instance:_handle_request({
+    id = 34, command = "step",
+    action = { move_x = 1, move_y = 0, shoot = true },
+    ["repeat"] = 2,
+})
+FrameFunc()
+FrameFunc()
+check(attack_writer:GetCount() == 3,
+    "held replay input did not record one sample per logical frame")
+check(attack_writer.states[2].right and attack_writer.states[2].shoot
+        and attack_writer.states[3].right and attack_writer.states[3].shoot,
+    "replay input samples did not preserve held movement and shooting")
+
+instance:_handle_request({
+    id = 349, command = "save_replay", finish = "false",
+    reason = "attack_complete",
+})
+local invalid_finish_type = encoded_values[#encoded_values]
+check(invalid_finish_type.id == 349 and invalid_finish_type.ok == false,
+    "save_replay accepted a non-Boolean finish value")
+check(instance.replay_capture ~= nil,
+    "invalid save_replay fields discarded the active capture")
+
+instance:_handle_request({
+    id = 350, command = "save_replay", finish = true,
+    reason = "attack_complete",
+})
+local invalid_attack_finish = encoded_values[#encoded_values]
+check(invalid_attack_finish.id == 350 and invalid_attack_finish.ok == false,
+    "spell-practice replay accepted finish=true")
+check(instance.replay_capture ~= nil,
+    "rejected finish=true discarded the active spell-practice capture")
+
+local attack_path = "userdata/replay/SR_Subterrain_Reanimation_v100/analysis/boss3-analysis.rep"
+local attack_capture = instance.replay_capture
+replay_save_failures = 1
+instance:_handle_request({
+    id = 351, command = "save_replay", finish = false,
+    reason = "attack_complete",
+})
+local failed_attack_save = encoded_values[#encoded_values]
+check(failed_attack_save.id == 351 and failed_attack_save.ok == false,
+    "injected SaveReplayInfo failure unexpectedly succeeded")
+check(string.find(failed_attack_save.error, "SaveReplayInfo failure", 1, true),
+    "SaveReplayInfo failure returned the wrong error")
+check(instance.replay_capture == attack_capture
+        and instance.replay_capture.writer == attack_writer,
+    "SaveReplayInfo failure discarded or replaced the active capture")
+check(instance.replay_capture.writer:GetCount() == 3,
+    "SaveReplayInfo failure changed the captured frame stream")
+check(saved_replays[attack_path] == nil,
+    "failed SaveReplayInfo unexpectedly published replay data")
+
+instance:_handle_request({
+    id = 35, command = "save_replay", finish = false,
+    reason = "attack_complete",
+})
+local attack_save = encoded_values[#encoded_values]
+check(attack_save.id == 35 and attack_save.ok,
+    "spell-practice replay save failed")
+check(attack_save.replay.saved and attack_save.replay.verified,
+    "spell-practice replay was not reported as saved and verified")
+check(attack_save.replay.frame_count == 3
+        and attack_save.replay.frame_bytes_verified == 3
+        and attack_save.replay.file_size == replay_frame_data_position + 3
+        and attack_save.replay.reason == "attack_complete"
+        and attack_save.replay.finish == false
+        and attack_save.replay.group_finish == 0,
+    "spell-practice replay result metadata mismatch")
+check(instance.replay_capture == nil,
+    "saved replay capture remained active")
+check(replay_save_calls[attack_path] == 2,
+    "SaveReplayInfo retry did not perform exactly two save attempts")
+local attack_replay = saved_replays[attack_path]
+check(type(attack_replay) == "table", "spell-practice replay used the wrong path")
+check(attack_replay.gameName == setting.mod
+        and attack_replay.gameVersion == 1
+        and attack_replay.userName == "stg-lab",
+    "spell-practice replay header metadata mismatch")
+check(attack_replay.group_finish == 0,
+    "spell-practice replay was incorrectly marked as a finished group")
+check(#attack_replay.stages == 1
+        and attack_replay.stages[1].stageName == "Spell Practice@Spell Practice"
+        and attack_replay.stages[1].stageExtendInfo == "serialized-lstg-var"
+        and attack_replay.stages[1].randomSeed == 20260730
+        and attack_replay.stages[1].stagePlayer == "Reimu"
+        and attack_replay.stages[1].frameData == attack_writer,
+    "spell-practice replay stage metadata mismatch")
+
+instance:_handle_request({
+    id = 36, command = "reset_stage", stage = "Stage 5@Lunatic",
+    seed = 20260731, player = "reimu_player", replay_name = "stage5-final",
+})
+check(instance.replay_capture ~= nil,
+    "final-stage reset did not start replay capture")
+FrameFunc()
+local stage5_reset = encoded_values[#encoded_values]
+check(stage5_reset.id == 36 and stage5_reset.ok,
+    "final-stage replay reset failed")
+check(stage5_reset.reset.replay.episode_kind == "stage"
+        and stage5_reset.reset.replay.stage_name == "Stage 5@Lunatic",
+    "final-stage replay reset metadata mismatch")
+instance:_handle_request({
+    id = 370, command = "save_replay", finish = true,
+    reason = "stage_complete",
+})
+local premature_stage5_save = encoded_values[#encoded_values]
+check(premature_stage5_save.id == 370 and premature_stage5_save.ok == false,
+    "unfinished final-stage replay accepted finish=true")
+check(instance.replay_capture ~= nil,
+    "rejected final-stage finish discarded the active capture")
+instance.terminated = true
+instance.termination_reason = "stage_complete"
+local stage5_path = "userdata/replay/SR_Subterrain_Reanimation_v100/analysis/stage5-final.rep"
+local stage5_capture = instance.replay_capture
+local stage5_writer = stage5_capture.writer
+replay_read_failures = 1
+instance:_handle_request({
+    id = 371, command = "save_replay", finish = true,
+    reason = "stage_complete",
+})
+local failed_stage5_read = encoded_values[#encoded_values]
+check(failed_stage5_read.id == 371 and failed_stage5_read.ok == false,
+    "injected ReadReplayInfo failure unexpectedly succeeded")
+check(string.find(failed_stage5_read.error, "ReadReplayInfo failure", 1, true),
+    "ReadReplayInfo failure returned the wrong error")
+check(instance.replay_capture == stage5_capture
+        and instance.replay_capture.writer == stage5_writer,
+    "ReadReplayInfo failure discarded or replaced the active capture")
+check(instance.replay_capture.writer:GetCount() == 1,
+    "ReadReplayInfo failure changed the captured frame stream")
+
+replay_file_length_adjustment = -1
+instance:_handle_request({
+    id = 372, command = "save_replay", finish = true,
+    reason = "stage_complete",
+})
+local truncated_stage5_save = encoded_values[#encoded_values]
+check(truncated_stage5_save.id == 372 and truncated_stage5_save.ok == false,
+    "truncated replay frame data unexpectedly passed verification")
+check(string.find(truncated_stage5_save.error, "frame data is truncated", 1, true),
+    "truncated replay returned the wrong verification error")
+check(instance.replay_capture == stage5_capture,
+    "truncated replay verification discarded the active capture")
+
+replay_file_length_adjustment = 1
+instance:_handle_request({
+    id = 373, command = "save_replay", finish = true,
+    reason = "stage_complete",
+})
+local trailing_stage5_save = encoded_values[#encoded_values]
+check(trailing_stage5_save.id == 373 and trailing_stage5_save.ok == false,
+    "replay with trailing bytes unexpectedly passed verification")
+check(string.find(trailing_stage5_save.error, "replay EOF mismatch", 1, true),
+    "trailing replay data returned the wrong verification error")
+check(instance.replay_capture == stage5_capture,
+    "trailing replay verification discarded the active capture")
+
+replay_file_length_adjustment = 0
+instance:_handle_request({
+    id = 37, command = "save_replay", finish = true,
+    reason = "stage_complete",
+})
+local stage5_save = encoded_values[#encoded_values]
+check(stage5_save.id == 37 and stage5_save.ok,
+    "final-stage replay save failed")
+check(stage5_save.replay.finish == true
+        and stage5_save.replay.group_finish == 1,
+    "final-stage replay result did not preserve its completion flag")
+check(instance.replay_capture == nil,
+    "successful ReadReplayInfo retry left the capture active")
+check(replay_save_calls[stage5_path] == 4
+        and replay_read_calls[stage5_path] == 4,
+    "replay verification retries did not perform four save/read attempts")
+local stage5_replay = saved_replays[stage5_path]
+check(type(stage5_replay) == "table", "final-stage replay used the wrong path")
+check(stage5_replay.group_finish == 1,
+    "completed final-stage replay was not marked as a finished group")
+check(stage5_replay.stages[1].stageName == "Stage 5@Lunatic"
+        and stage5_replay.stages[1].randomSeed == 20260731
+        and stage5_replay.stages[1].stagePlayer == "Reimu"
+        and stage5_replay.stages[1].frameData:GetCount() == 1,
+    "final-stage replay stage metadata mismatch")
+
 SR_SAFETY_ZONE_CONTROLLER_STATE = { revision = 99 }
 instance:_disconnect("closed")
 check(SR_SAFETY_ZONE_CONTROLLER_STATE == nil,
@@ -444,6 +842,7 @@ check(old_render_count == 5, "rendering did not resume after disconnect")
 instance:uninstall()
 check(FrameFunc ~= instance.frame_wrapper, "FrameFunc was not restored")
 check(GetKeyState == native_get_key, "GetKeyState was not restored")
+check(GetInput == native_get_input, "GetInput was not restored")
 
 local function make_startup_transport(accept_on_call)
     local startup_client = { closed = false, timeouts = {} }
@@ -519,5 +918,7 @@ check(Bridge.config_from_env().startup_accept_timeout == 1.25,
     "startup timeout environment override mismatch")
 os.getenv = original_getenv
 SR_TEST_MODE = original_test_mode
+io.open = original_io_open
+bit = original_bit
 
 print("bridge stub tests passed")

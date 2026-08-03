@@ -36,7 +36,7 @@ local TEST_MODE_STARTUP_ACCEPT_TIMEOUT = 30
 local ACTION_NAMES = { "move_x", "move_y", "slow", "shoot", "spell" }
 local COMMAND_NAMES = {
     "ping", "catalog", "reset", "reset_stage", "step", "observe",
-    "display", "close", "shutdown",
+    "display", "save_replay", "close", "shutdown",
 }
 local RUNTIME_SOURCE_FILES = {
     "root.lua",
@@ -173,6 +173,83 @@ local function crc32_file(path)
     return string.format("%08x", crc)
 end
 
+local function verify_replay_frame_data(path, stages)
+    if type(stages) ~= "table" or #stages < 1 then
+        return nil, "replay has no frame data stages"
+    end
+    local stream, open_error = io.open(path, "rb")
+    if not stream then
+        return nil, "failed to open saved replay: " .. tostring(open_error)
+    end
+    local operation_ok, verified, verify_error, file_size, frame_bytes = pcall(
+        function()
+            local preceding_end = 0
+            local total_frames = 0
+            for index, stage_info in ipairs(stages) do
+                local position = type(stage_info) == "table"
+                    and stage_info.frameDataPosition or nil
+                local count = type(stage_info) == "table"
+                    and stage_info.frameCount or nil
+                if type(position) ~= "number" or position < 0
+                        or position ~= math.floor(position) then
+                    return nil, "stage " .. index
+                        .. " has an invalid frame data position"
+                end
+                if type(count) ~= "number" or count < 0
+                        or count ~= math.floor(count) then
+                    return nil, "stage " .. index .. " has an invalid frame count"
+                end
+                if position < preceding_end then
+                    return nil, "stage " .. index .. " frame data overlaps prior data"
+                end
+                local seek_position, seek_error = stream:seek("set", position)
+                if seek_position ~= position then
+                    return nil, "failed to seek to stage " .. index
+                        .. " frame data: " .. tostring(seek_error)
+                end
+                local remaining = count
+                while remaining > 0 do
+                    local requested = math.min(remaining, 65536)
+                    local block, read_error = stream:read(requested)
+                    if type(block) ~= "string" or #block ~= requested then
+                        return nil, "stage " .. index .. " frame data is truncated: "
+                            .. tostring(read_error or (count - remaining +
+                                (type(block) == "string" and #block or 0))
+                                .. "/" .. count .. " bytes")
+                    end
+                    remaining = remaining - requested
+                end
+                preceding_end = position + count
+                total_frames = total_frames + count
+            end
+            local eof, seek_error = stream:seek("end", 0)
+            if type(eof) ~= "number" then
+                return nil, "failed to determine replay EOF: " .. tostring(seek_error)
+            end
+            if eof ~= preceding_end then
+                return nil, "replay EOF mismatch: expected " .. preceding_end
+                    .. ", got " .. eof
+            end
+            return true, nil, eof, total_frames
+        end
+    )
+    local close_ok, close_error = pcall(stream.close, stream)
+    if not operation_ok then
+        return nil, "frame data verification failed: " .. tostring(verified)
+    end
+    if not verified then
+        return nil, verify_error
+    end
+    if not close_ok then
+        return nil, "failed to close replay after verification: "
+            .. tostring(close_error)
+    end
+    return {
+        file_size = file_size,
+        frame_bytes = frame_bytes,
+    }
+end
+
 local function runtime_identity(config, dependencies)
     if type(dependencies.runtime_identity) == "table" then
         return copy_table(dependencies.runtime_identity)
@@ -274,6 +351,12 @@ function Instance:_open_server()
 end
 
 function Instance:_disconnect(reason)
+    if self.replay_capture then
+        local _, replay_error = self:_finish_replay_capture(false, "disconnect")
+        if replay_error then
+            self:_log("failed to save replay on disconnect: " .. tostring(replay_error))
+        end
+    end
     if self.client then
         safe_close(self.client)
     end
@@ -501,6 +584,269 @@ function Instance:_seed(seed)
     return seed
 end
 
+local WINDOWS_RESERVED_DEVICE_NAMES = {
+    CON = true,
+    PRN = true,
+    AUX = true,
+    NUL = true,
+}
+
+local function is_windows_reserved_device_name(value)
+    local basename = string.match(value, "^([^.]*)") or value
+    basename = string.upper(basename)
+    return WINDOWS_RESERVED_DEVICE_NAMES[basename] == true
+        or string.match(basename, "^COM[1-9]$") ~= nil
+        or string.match(basename, "^LPT[1-9]$") ~= nil
+end
+
+local function normalized_replay_name(value)
+    if value == nil then
+        return nil
+    end
+    if type(value) ~= "string" then
+        return nil, "replay_name must be a string"
+    end
+    if is_windows_reserved_device_name(value) then
+        return nil, "replay_name uses a Windows reserved device basename"
+    end
+    if #value >= 4 and string.lower(string.sub(value, -4)) == ".rep" then
+        value = string.sub(value, 1, -5)
+    end
+    if is_windows_reserved_device_name(value) then
+        return nil, "replay_name uses a Windows reserved device basename"
+    end
+    if #value < 1 or #value > 96
+            or string.sub(value, -1) == "."
+            or not string.match(value, "^[A-Za-z0-9][A-Za-z0-9_.-]*$") then
+        return nil, "replay_name must be 1-96 portable filename characters"
+    end
+    return value
+end
+
+local function replay_directory()
+    local mod_name = type(setting) == "table" and setting.mod or "unknown_mod"
+    mod_name = string.gsub(tostring(mod_name), "[^A-Za-z0-9_.-]", "_")
+    return "userdata/replay/" .. mod_name .. "/analysis"
+end
+
+local function create_replay_directories(directory)
+    local manager = type(lstg) == "table" and lstg.FileManager or nil
+    if type(manager) ~= "table" or type(manager.CreateDirectory) ~= "function" then
+        return nil, "lstg.FileManager.CreateDirectory is unavailable"
+    end
+    for _, path in ipairs({
+        "userdata",
+        "userdata/replay",
+        string.match(directory, "^(.*)/analysis$") or directory,
+        directory,
+    }) do
+        local ok, created, create_error = pcall(manager.CreateDirectory, path)
+        if not ok then
+            return nil, "failed to create replay directory: " .. tostring(created)
+        end
+        -- std::filesystem::create_directories returns false when the target
+        -- already exists. LuaSTG forwards that value without treating it as
+        -- an error, so verify existence before reporting a failure.
+        if created == false and type(manager.DirectoryExist) == "function" then
+            local exists_ok, exists = pcall(manager.DirectoryExist, path)
+            if not exists_ok or not exists then
+                return nil, "failed to create replay directory: "
+                    .. tostring(create_error or path)
+            end
+        elseif created == false and create_error ~= nil then
+            return nil, "failed to create replay directory: "
+                .. tostring(create_error)
+        end
+    end
+    return true
+end
+
+function Instance:_start_replay_capture(
+        name, stage_name, seed, player_name, episode_kind)
+    local replay_name, name_error = normalized_replay_name(name)
+    if name_error then
+        return nil, name_error
+    end
+    if not replay_name then
+        return nil
+    end
+    if seed > 4294967295 then
+        return nil, "replay seed exceeds the STGR uint32 limit"
+    end
+    if type(plus) ~= "table"
+            or plus.ReplayFrameWriter == nil
+            or type(plus.ReplayManager) ~= "table"
+            or type(plus.ReplayManager.SaveReplayInfo) ~= "function"
+            or type(plus.ReplayManager.ReadReplayInfo) ~= "function" then
+        return nil, "THlib replay writer is unavailable"
+    end
+    local serializer = rawget(_G, "Serialize")
+    if type(serializer) ~= "function" then
+        return nil, "THlib Serialize is unavailable"
+    end
+    local directory = replay_directory()
+    local _, directory_error = create_replay_directories(directory)
+    if directory_error then
+        return nil, directory_error
+    end
+    local writer_ok, writer = pcall(plus.ReplayFrameWriter)
+    if not writer_ok or type(writer) ~= "table"
+            or type(writer.Record) ~= "function"
+            or type(writer.GetCount) ~= "function"
+            or type(writer.CopyToFileStream) ~= "function" then
+        return nil, "failed to create THlib replay writer: " .. tostring(writer)
+    end
+    local serialize_ok, stage_extend_info = pcall(serializer, lstg.var)
+    if not serialize_ok or type(stage_extend_info) ~= "string" then
+        return nil, "failed to serialize replay initial state: "
+            .. tostring(stage_extend_info)
+    end
+
+    local path = directory .. "/" .. replay_name .. ".rep"
+    self.replay_capture = {
+        schema_version = 1,
+        name = replay_name,
+        path = path,
+        stage_name = stage_name,
+        random_seed = seed,
+        player = player_name,
+        episode_kind = episode_kind,
+        stage_extend_info = stage_extend_info,
+        stage_date = os.time(),
+        started_at = os.time(),
+        writer = writer,
+    }
+    self.last_replay = nil
+    return {
+        schema_version = 1,
+        name = replay_name,
+        path = path,
+        stage_name = stage_name,
+        random_seed = seed,
+        player = player_name,
+        episode_kind = episode_kind,
+        saved = false,
+    }
+end
+
+function Instance:_finish_replay_capture(finish, reason)
+    local capture = self.replay_capture
+    if not capture then
+        return nil, "no replay capture is active"
+    end
+    local effective_finish = finish == true
+    if effective_finish and (capture.episode_kind ~= "stage"
+            or self.terminated ~= true
+            or self.termination_reason ~= "stage_complete"
+            or self.config.stop_on_player_hit ~= true) then
+        return nil, "finish=true requires a zero-death final-stage completion"
+    end
+    if capture.record_error then
+        self.replay_capture = nil
+        return nil, capture.record_error
+    end
+
+    local frame_count = capture.writer:GetCount()
+    local save_data = {
+        gameName = type(setting) == "table" and tostring(setting.mod or "") or "",
+        gameVersion = 1,
+        userName = tostring(self.config.session_id or "stg-lab"),
+        group_finish = effective_finish and 1 or 0,
+        stages = {
+            {
+                stageName = capture.stage_name,
+                stageExtendInfo = capture.stage_extend_info,
+                score = type(lstg) == "table" and type(lstg.var) == "table"
+                    and tonumber(lstg.var.score) or 0,
+                randomSeed = capture.random_seed,
+                stageTime = math.max(0, os.time() - capture.started_at),
+                stageDate = capture.stage_date,
+                stagePlayer = capture.player,
+                frameData = capture.writer,
+            },
+        },
+    }
+    local save_ok, save_error = pcall(
+        plus.ReplayManager.SaveReplayInfo,
+        capture.path,
+        save_data
+    )
+    if not save_ok then
+        return nil, "THlib replay save failed: " .. tostring(save_error)
+    end
+    local read_ok, replay_info = pcall(
+        plus.ReplayManager.ReadReplayInfo,
+        capture.path
+    )
+    local stage_info = read_ok and type(replay_info) == "table"
+        and type(replay_info.stages) == "table" and replay_info.stages[1] or nil
+    local verified = type(stage_info) == "table"
+        and replay_info.fileVersion == 1
+        and replay_info.gameName == save_data.gameName
+        and replay_info.gameVersion == save_data.gameVersion
+        and replay_info.userName == save_data.userName
+        and #replay_info.stages == 1
+        and replay_info.group_finish == (effective_finish and 1 or 0)
+        and stage_info.stageName == capture.stage_name
+        and stage_info.stageExtendInfo == capture.stage_extend_info
+        and stage_info.randomSeed == capture.random_seed
+        and stage_info.stagePlayer == capture.player
+        and stage_info.frameCount == frame_count
+    if not verified then
+        return nil, "saved replay failed THlib metadata verification: "
+            .. tostring(read_ok and "metadata mismatch" or replay_info)
+    end
+    local frame_verification, frame_error = verify_replay_frame_data(
+        capture.path,
+        replay_info.stages
+    )
+    if not frame_verification then
+        return nil, "saved replay failed frame data verification: "
+            .. tostring(frame_error)
+    end
+    local checksum, checksum_error = crc32_file(capture.path)
+    if not checksum then
+        return nil, "saved replay checksum failed: " .. tostring(checksum_error)
+    end
+    local result = {
+        schema_version = 1,
+        name = capture.name,
+        path = capture.path,
+        stage_name = capture.stage_name,
+        random_seed = capture.random_seed,
+        player = capture.player,
+        episode_kind = capture.episode_kind,
+        frame_count = frame_count,
+        finish = effective_finish,
+        group_finish = effective_finish and 1 or 0,
+        reason = tostring(reason or "requested"),
+        saved = true,
+        verified = true,
+        file_size = frame_verification.file_size,
+        frame_bytes_verified = frame_verification.frame_bytes,
+        crc32 = checksum,
+    }
+    self.replay_capture = nil
+    self.last_replay = result
+    return result
+end
+
+function Instance:_record_replay_input()
+    local capture = self.replay_capture
+    if not capture or capture.record_error then
+        return
+    end
+    local key_state = rawget(_G, "KeyState")
+    if type(key_state) ~= "table" then
+        capture.record_error = "THlib KeyState is unavailable during replay capture"
+        return
+    end
+    local ok, err = pcall(capture.writer.Record, capture.writer, key_state)
+    if not ok then
+        capture.record_error = "THlib replay input recording failed: " .. tostring(err)
+    end
+end
+
 local function resolve_player(player_name)
     if type(player_name) ~= "string" or player_name == "" then
         return type(lstg) == "table" and lstg.var and lstg.var.player_name or nil
@@ -513,6 +859,28 @@ local function resolve_player(player_name)
             if player_name == entry[1] or player_name == entry[2] or player_name == entry[3] then
                 return entry[2]
             end
+        end
+    end
+end
+
+local function replay_player_label(player_name)
+    if type(player_list) == "table" then
+        for _, entry in ipairs(player_list) do
+            if type(entry) == "table" and entry[2] == player_name then
+                return tostring(entry[3] or entry[1] or player_name)
+            end
+        end
+    end
+    return tostring(player_name)
+end
+
+local function replay_options_error(options)
+    for _, key in ipairs({
+        "lifeleft", "bomb", "power", "faith", "score",
+        "player_protect_frames", "player_collidable", "player_ghost",
+    }) do
+        if options[key] ~= nil then
+            return "native replay cannot reproduce reset option: " .. key
         end
     end
 end
@@ -603,6 +971,22 @@ end
 
 function Instance:_reset(request)
     local options = type(request.options) == "table" and request.options or {}
+    local replay_name, replay_name_error = normalized_replay_name(request.replay_name)
+    if replay_name_error then
+        return nil, replay_name_error
+    end
+    if replay_name then
+        local options_error = replay_options_error(options)
+        if options_error then
+            return nil, options_error
+        end
+    end
+    if self.replay_capture then
+        local _, replay_error = self:_finish_replay_capture(false, "reset")
+        if replay_error then
+            return nil, "failed to finalize preceding replay: " .. replay_error
+        end
+    end
     local _, card_index, err = resolve_attack(request.scenario, request.attack, options)
     if err then
         return nil, err
@@ -643,6 +1027,16 @@ function Instance:_reset(request)
     end
     stage.Set("Spell Practice@Spell Practice", "none")
     local seed = self:_seed(request.seed)
+    local replay, replay_error = self:_start_replay_capture(
+        request.replay_name,
+        "Spell Practice@Spell Practice",
+        seed,
+        replay_player_label(player_name),
+        "attack"
+    )
+    if replay_error then
+        return nil, replay_error
+    end
 
     self.episode_frame = 0
     self.terminated = false
@@ -661,11 +1055,28 @@ function Instance:_reset(request)
         card_index = card_index,
         seed = seed,
         player = player_name,
+        replay = replay,
     }
 end
 
 function Instance:_reset_stage(request)
     local options = type(request.options) == "table" and request.options or {}
+    local replay_name, replay_name_error = normalized_replay_name(request.replay_name)
+    if replay_name_error then
+        return nil, replay_name_error
+    end
+    if replay_name then
+        local options_error = replay_options_error(options)
+        if options_error then
+            return nil, options_error
+        end
+    end
+    if self.replay_capture then
+        local _, replay_error = self:_finish_replay_capture(false, "reset")
+        if replay_error then
+            return nil, "failed to finalize preceding replay: " .. replay_error
+        end
+    end
     local stage_entry, err = resolve_stage(request.stage)
     if err then
         return nil, err
@@ -676,6 +1087,11 @@ function Instance:_reset_stage(request)
     end
     if type(stage) ~= "table" or type(stage.Set) ~= "function" then
         return nil, "stage switching is unavailable"
+    end
+    local expected_stage_successor, expected_stage_menu =
+        stage_completion_contract(stage_entry)
+    if replay_name and not expected_stage_menu then
+        return nil, "native replay capture supports only attacks and final stages"
     end
 
     lstg.var = lstg.var or {}
@@ -697,14 +1113,24 @@ function Instance:_reset_stage(request)
     end
     stage.Set(request.stage, "none")
     local seed = self:_seed(request.seed)
+    local replay, replay_error = self:_start_replay_capture(
+        request.replay_name,
+        request.stage,
+        seed,
+        replay_player_label(player_name),
+        "stage"
+    )
+    if replay_error then
+        return nil, replay_error
+    end
 
     self.episode_frame = 0
     self.terminated = false
     self.termination_reason = nil
     self.seen_enemy = false
     self.expected_stage = request.stage
-    self.expected_stage_successor, self.expected_stage_menu =
-        stage_completion_contract(stage_entry)
+    self.expected_stage_successor = expected_stage_successor
+    self.expected_stage_menu = expected_stage_menu
     self.episode_kind = "stage"
     self.episode_scenario = request.stage
     self.pending_options = options
@@ -715,6 +1141,7 @@ function Instance:_reset_stage(request)
         difficulty = string_value(stage_entry.difficulty),
         seed = seed,
         player = player_name,
+        replay = replay,
     }
 end
 
@@ -854,6 +1281,23 @@ function Instance:_handle_request(request)
             self.config.headless = not request.render
             self.config.render_every = render_every
             self:_response(id, true, { render = request.render, every = render_every })
+        end
+    elseif command == "save_replay" then
+        if type(request.finish) ~= "boolean" then
+            self:_response(id, false, { error = "save_replay finish must be a Boolean" })
+        elseif request.reason ~= nil
+                and (type(request.reason) ~= "string" or request.reason == "") then
+            self:_response(id, false, { error = "save_replay reason must be a nonempty string" })
+        else
+            local replay, replay_error = self:_finish_replay_capture(
+                request.finish,
+                request.reason or self.termination_reason or "requested"
+            )
+            if not replay then
+                self:_response(id, false, { error = replay_error })
+            else
+                self:_response(id, true, { replay = replay })
+            end
         end
     elseif command == "ping" then
         self:_response(id, true, {
@@ -1230,22 +1674,30 @@ function Instance:install()
     end
     if type(rawget(_G, "FrameFunc")) ~= "function"
             or type(rawget(_G, "RenderFunc")) ~= "function"
-            or type(rawget(_G, "GetKeyState")) ~= "function" then
-        return nil, "FrameFunc, RenderFunc, and GetKeyState must exist before bridge installation"
+            or type(rawget(_G, "GetKeyState")) ~= "function"
+            or type(rawget(_G, "GetInput")) ~= "function" then
+        return nil, "FrameFunc, RenderFunc, GetKeyState, and GetInput must exist before bridge installation"
     end
     self.original_frame = FrameFunc
     self.original_render = RenderFunc
     self.original_global_get_key = GetKeyState
     self.original_lstg_get_key = type(lstg) == "table" and lstg.GetKeyState or nil
+    self.original_get_input = GetInput
     self:_refresh_key_map()
 
     local instance = self
     self.frame_wrapper = function(...) return instance:_frame(...) end
     self.render_wrapper = function(...) return instance:_render(...) end
     self.key_wrapper = function(vkey) return instance:_key_state(vkey) end
+    self.get_input_wrapper = function(...)
+        local result = instance.original_get_input(...)
+        instance:_record_replay_input()
+        return result
+    end
     FrameFunc = self.frame_wrapper
     RenderFunc = self.render_wrapper
     GetKeyState = self.key_wrapper
+    GetInput = self.get_input_wrapper
     if type(lstg) == "table" then
         lstg.GetKeyState = self.key_wrapper
     end
@@ -1260,6 +1712,7 @@ function Instance:uninstall()
         if FrameFunc == self.frame_wrapper then FrameFunc = self.original_frame end
         if RenderFunc == self.render_wrapper then RenderFunc = self.original_render end
         if GetKeyState == self.key_wrapper then GetKeyState = self.original_global_get_key end
+        if GetInput == self.get_input_wrapper then GetInput = self.original_get_input end
         if type(lstg) == "table" and lstg.GetKeyState == self.key_wrapper then
             lstg.GetKeyState = self.original_lstg_get_key
         end

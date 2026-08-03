@@ -64,15 +64,18 @@ class EngineClient:
         seed: int,
         player: str = "reimu_player",
         options: Mapping[str, Any] | None = None,
+        replay_name: str | None = None,
     ) -> dict[str, Any]:
-        return self.request(
-            "reset",
-            scenario=scenario,
-            attack=attack,
-            seed=seed,
-            player=player,
-            options=dict(options or {}),
-        )
+        payload: dict[str, Any] = {
+            "scenario": scenario,
+            "attack": attack,
+            "seed": seed,
+            "player": player,
+            "options": dict(options or {}),
+        }
+        if replay_name is not None:
+            payload["replay_name"] = replay_name
+        return self.request("reset", **payload)
 
     def reset_stage(
         self,
@@ -81,16 +84,19 @@ class EngineClient:
         seed: int,
         player: str = "reimu_player",
         options: Mapping[str, Any] | None = None,
+        replay_name: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(stage, str) or not stage:
             raise ValueError("stage must be a nonempty string")
-        return self.request(
-            "reset_stage",
-            stage=stage,
-            seed=seed,
-            player=player,
-            options=dict(options or {}),
-        )
+        payload: dict[str, Any] = {
+            "stage": stage,
+            "seed": seed,
+            "player": player,
+            "options": dict(options or {}),
+        }
+        if replay_name is not None:
+            payload["replay_name"] = replay_name
+        return self.request("reset_stage", **payload)
 
     def ping(self) -> dict[str, Any]:
         return self.request("ping")
@@ -107,6 +113,13 @@ class EngineClient:
         if isinstance(every, bool) or not isinstance(every, int) or not 1 <= every <= 600:
             raise ValueError("every must be an integer in [1, 600]")
         return self.request("display", render=enabled, every=every)
+
+    def save_replay(self, *, finish: bool, reason: str) -> dict[str, Any]:
+        if not isinstance(finish, bool):
+            raise TypeError("finish must be a Boolean")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("reason must be a nonempty string")
+        return self.request("save_replay", finish=finish, reason=reason)
 
     def step(
         self,

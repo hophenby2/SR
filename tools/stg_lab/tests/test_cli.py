@@ -1054,6 +1054,7 @@ def test_engine_mpc_play_selects_general_controller_profile(
         "--profile", "general",
         "--horizon-frames", "60",
         "--no-gap-prediction",
+        "--replay-name", "boss3-analysis.rep",
         "--output", str(output),
     ]) == 0
 
@@ -1064,6 +1065,7 @@ def test_engine_mpc_play_selects_general_controller_profile(
     assert controller_config.safe_margin_target == 20.0
     assert controller_config.region_safe_margin_target == 8.0
     assert controller_config.gap_prediction_enabled is False
+    assert calls["config"].replay_name == "boss3-analysis"
     assert connected == {
         "host": "127.0.0.2",
         "port": 25000,

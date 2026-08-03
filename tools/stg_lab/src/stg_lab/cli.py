@@ -1139,6 +1139,7 @@ def _command_engine_mpc_play(args: argparse.Namespace) -> int:
             if args.region_dynamics_memory is None else
             file_sha256(args.region_dynamics_memory)
         ),
+        replay_name=args.replay_name,
     )
     builder = NativeDemonstrationBuilder() if args.save_demos is not None else None
     episode = (
@@ -2255,6 +2256,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--demos-manifest",
         type=Path,
         help="write native demonstration provenance (defaults beside --save-demos)",
+    )
+    engine_mpc_parser.add_argument(
+        "--replay-name",
+        help=(
+            "save a verified native THlib replay under the engine replay "
+            "analysis directory"
+        ),
     )
     engine_mpc_parser.add_argument(
         "--render",

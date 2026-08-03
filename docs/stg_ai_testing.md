@@ -108,6 +108,55 @@ condition queries the raw `GROUP_ENEMY` and `GROUP_NONTJT` object pools, so a
 temporarily hidden or off-playfield boss does not cause a false
 `attack_complete`.
 
+### Native replay capture
+
+An attack `reset` or final-stage `reset_stage` may include a portable
+`replay_name`. The bridge then owns a private `plus.ReplayFrameWriter`, records
+the final THlib `KeyState` after every logical `GetInput()`, and leaves the
+global `replayWriter` untouched. This avoids corrupting THlib's private stage
+record table during later transitions. The client finalizes the file with:
+
+```json
+{"id":5,"command":"save_replay","finish":false,"reason":"attack_complete"}
+```
+
+The bridge writes standard STGR v1 data to
+`userdata/replay/<setting.mod>/analysis/<replay_name>.rep`, reads it back with
+`plus.ReplayManager.ReadReplayInfo`, compares the saved header and serialized
+initial state, reads every declared input byte, and requires the final frame to
+end exactly at EOF. The result includes the file size, verified frame-byte
+count, completion reason, and CRC32. A transient write, read, or verification
+failure retains the in-memory writer so the save can be retried. Spell Practice
+always uses `group_finish=0`; only a strictly completed final stage may use
+`group_finish=1`. Capture is rejected for non-final isolated stages and for
+test-only reset overrides such as ghost/collision/protection settings because
+those states cannot be reproduced by the native replay alone.
+This is structural verification, not a claim that a native replay-menu load has
+already reproduced the run. Use a unique name when retaining prior captures;
+THlib overwrites an existing file with the same name.
+
+`engine-mpc-play --replay-name NAME` performs this lifecycle automatically and
+stores the returned metadata in the JSON report as `native_replay`. Death and
+frame-limit runs are saved too, with `finish=false`. A `.rep` contains the
+initial serialized game state and input bytes, not MPC observations, forecasts,
+or decision reasons; keep the same run's JSON report for analysis. Use
+`--record-observations-from-frame 0` when full visible object snapshots are
+needed in addition to the normal decision trace.
+
+The final native arm64 macOS headless validation on 2026-08-03 used Okuu Boss
+#3, seed `20260730`, five-frame observation delay, a 60-frame horizon, and the
+`bullet-group-expert` profile. It reached `attack_complete` after 3363
+controlled frames with boss HP 0, player death 0, and a 1.0 shoot-command rate.
+The 3891-byte verified replay has 3364 frames including the neutral reset
+frame, `group_finish=0`, CRC32 `5f964c53`, and SHA-256
+`4d6be63144e7706de04112c2204e2960dffb78fda57cc19a4a0423a2b8aa85d2`.
+An independent STGR parser reconstructed all 3364 expected bytes from the JSON
+decision holds with zero mismatches; all 3363 controlled frames fired. Its
+paired 1121-decision/full-observation report has SHA-256
+`20822e937020f0137e3d5e064e9e663f5d9c4134426f2ac698c56db3aa268170`.
+Both files are ignored local analysis artifacts rather than source-controlled
+fixtures.
+
 When `SR_TEST_MODE` is enabled, `SR_TEST_STARTUP_ACCEPT_TIMEOUT` defaults to 30
 seconds (otherwise zero). The bridge can therefore accept the first client and
 activate lockstep/headless interception before the first Render/Present path.
@@ -242,11 +291,12 @@ following is strategy memory:
 - a fixed action fragment or full-episode action sequence;
 - a route that is specific to one recording.
 
-The current `engine-mpc-play` command has no recorded-action loader, CLI option,
-or replay branch. Diagnostic reports retain per-frame actions, coordinates, and
-absolute frames for failure analysis, but current code cannot reinterpret a
-report as a policy input. Every formal run is controlled continuously by live
-MPC from reset.
+The current `engine-mpc-play` command has no recorded-action loader or playback
+branch. Its optional native replay capture is output-only and never supplies an
+action or other controller input. Diagnostic reports retain per-frame actions,
+coordinates, and absolute frames for failure analysis, but current code cannot
+reinterpret either a report or `.rep` as a policy input. Every formal run is
+controlled continuously by live MPC from reset.
 
 `train-region-dynamics` reads source time, visible region radius, and adjacent
 visible indestructible positions from recorded controller-input observations.

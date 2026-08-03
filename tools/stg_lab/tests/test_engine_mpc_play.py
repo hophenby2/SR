@@ -90,10 +90,22 @@ class FakeEngineClient:
         self.actions: list[Action] = []
         self.controller_overlay_states: list[Mapping[str, Any] | None] = []
         self.runtime_source_crc32 = local_runtime_source_fingerprints()[0]
+        self.commands = [
+            "ping", "catalog", "reset", "reset_stage", "step", "observe",
+            "display", "save_replay", "close", "shutdown",
+        ]
+        self.replay_name: str | None = None
+        self.replay_episode_kind: str | None = None
+        self.replay_seed: int | None = None
+        self.replay_player: str | None = None
+        self.save_replay_calls: list[tuple[bool, str]] = []
+        self.invalid_replay_save = False
+        self.replay_frame_bytes_delta = 0
 
     def ping(self):
         return {
             "protocol": 2,
+            "commands": self.commands,
             "session_id": "fake-mpc-prefix",
             "process_nonce": "fake-process",
             "runtime_identity": {
@@ -109,14 +121,48 @@ class FakeEngineClient:
             {"stage": "Stage 5@Lunatic", "stage_index": 5},
         ]}}
 
-    def reset(self, scenario, attack, *, seed, player, options):
+    def _reset_response(self, *, replay_name, episode_kind, stage_name, seed, player):
         self.frame = self.initial_frame
-        return {"observation": observation(self.frame)}
+        response = {"observation": observation(self.frame)}
+        if replay_name is not None:
+            self.replay_name = replay_name
+            self.replay_episode_kind = episode_kind
+            self.replay_seed = seed
+            self.replay_player = player
+            response["reset"] = {"replay": {
+                "schema_version": 1,
+                "name": replay_name,
+                "path": f"userdata/replay/test/analysis/{replay_name}.rep",
+                "stage_name": stage_name,
+                "random_seed": seed,
+                "player": player,
+                "episode_kind": episode_kind,
+                "saved": False,
+            }}
+        return response
 
-    def reset_stage(self, stage, *, seed, player, options):
+    def reset(
+        self, scenario, attack, *, seed, player, options, replay_name=None,
+    ):
+        return self._reset_response(
+            replay_name=replay_name,
+            episode_kind="attack",
+            stage_name="Spell Practice@Spell Practice",
+            seed=seed,
+            player=player,
+        )
+
+    def reset_stage(
+        self, stage, *, seed, player, options, replay_name=None,
+    ):
         assert stage == "Stage 5@Lunatic"
-        self.frame = self.initial_frame
-        return {"observation": observation(self.frame)}
+        return self._reset_response(
+            replay_name=replay_name,
+            episode_kind="stage",
+            stage_name=stage,
+            seed=seed,
+            player=player,
+        )
 
     def set_rendering(self, enabled: bool, *, every: int = 1):
         return {"render": enabled, "every": every}
@@ -139,6 +185,38 @@ class FakeEngineClient:
             reason=self.completion_reason if terminated else None,
             death=self.final_death if terminated else 0,
         )}
+
+    def save_replay(self, *, finish: bool, reason: str):
+        self.save_replay_calls.append((finish, reason))
+        if self.invalid_replay_save:
+            return {"replay": {"saved": False}}
+        assert self.replay_name is not None
+        assert self.replay_episode_kind is not None
+        assert self.replay_seed is not None
+        assert self.replay_player is not None
+        frame_count = len(self.actions) + 1
+        return {"replay": {
+            "schema_version": 1,
+            "name": self.replay_name,
+            "path": f"userdata/replay/test/analysis/{self.replay_name}.rep",
+            "stage_name": (
+                "Stage 5@Lunatic"
+                if self.replay_episode_kind == "stage" else
+                "Spell Practice@Spell Practice"
+            ),
+            "random_seed": self.replay_seed,
+            "player": self.replay_player,
+            "episode_kind": self.replay_episode_kind,
+            "frame_count": frame_count,
+            "frame_bytes_verified": frame_count + self.replay_frame_bytes_delta,
+            "file_size": 512 + frame_count,
+            "finish": finish,
+            "group_finish": 1 if finish else 0,
+            "reason": reason,
+            "saved": True,
+            "verified": True,
+            "crc32": "89abcdef",
+        }}
 
 
 class PredictedCollisionMPC(EngineMPC):
@@ -256,6 +334,218 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
     assert first_overlay_state is not None
     assert first_overlay_state["schema_version"] == 1
     assert first_overlay_state["region_navigation_active"] is False
+
+
+@pytest.mark.parametrize("replay_name", [
+    "CON",
+    "prn",
+    "Aux.rep",
+    "nul.REP",
+    "CON.analysis.rep",
+    *(f"cOm{index}.rep" for index in range(1, 10)),
+    *(f"LpT{index}" for index in range(1, 10)),
+])
+def test_replay_name_rejects_windows_reserved_basenames(
+    replay_name: str,
+) -> None:
+    with pytest.raises(ValueError, match="Windows reserved basename"):
+        EngineMPCPlayConfig(replay_name=replay_name)
+
+
+@pytest.mark.parametrize("replay_name", [
+    "console",
+    "COM0",
+    "COM10",
+    "x.CON",
+    "COM1-analysis",
+])
+def test_replay_name_accepts_nonreserved_near_matches(replay_name: str) -> None:
+    assert EngineMPCPlayConfig(replay_name=replay_name).replay_name == replay_name
+
+
+def test_replay_name_rejects_windows_trimmed_trailing_dot() -> None:
+    with pytest.raises(ValueError, match="portable filename"):
+        EngineMPCPlayConfig(replay_name="boss3-analysis.")
+
+
+def test_native_replay_is_saved_for_successful_attack_with_group_finish_false() -> None:
+    client = FakeEngineClient()
+    config = EngineMPCPlayConfig(
+        max_frames=12,
+        observation_delay=0,
+        replay_name="boss3-analysis.REP",
+    )
+
+    report = run_engine_mpc_play(
+        client,  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+        config=config,
+    )
+
+    assert config.replay_name == "boss3-analysis"
+    assert client.replay_name == "boss3-analysis"
+    assert client.save_replay_calls == [(False, "attack_complete")]
+    assert report["success"] is True
+    assert report["native_replay"] == {
+        "schema_version": 1,
+        "name": "boss3-analysis",
+        "path": "userdata/replay/test/analysis/boss3-analysis.rep",
+        "stage_name": "Spell Practice@Spell Practice",
+        "random_seed": 42,
+        "player": "reimu_player",
+        "episode_kind": "attack",
+        "frame_count": 7,
+        "frame_bytes_verified": 7,
+        "file_size": 519,
+        "finish": False,
+        "group_finish": 0,
+        "reason": "attack_complete",
+        "saved": True,
+        "verified": True,
+        "crc32": "89abcdef",
+    }
+    assert report["config"]["replay_name"] == "boss3-analysis"
+
+
+def test_native_replay_is_saved_when_attack_does_not_complete() -> None:
+    client = FakeEngineClient(terminate_at=99)
+
+    report = run_engine_mpc_play(
+        client,  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+        config=EngineMPCPlayConfig(
+            max_frames=6,
+            observation_delay=0,
+            replay_name="boss3-timeout",
+        ),
+    )
+
+    assert report["success"] is False
+    assert report["termination_reason"] == "max_frames"
+    assert client.save_replay_calls == [(False, "max_frames")]
+    assert report["native_replay"]["saved"] is True
+    assert report["native_replay"]["finish"] is False
+
+
+def test_native_replay_marks_only_strict_full_stage_success_as_finished() -> None:
+    client = FakeEngineClient(completion_reason="stage_complete")
+
+    report = run_engine_mpc_play(
+        client,  # type: ignore[arg-type]
+        scenario="Stage 5@Lunatic",
+        attack=None,
+        stage="Stage 5@Lunatic",
+        seed=42,
+        player="reimu_player",
+        controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+        config=EngineMPCPlayConfig(
+            max_frames=12,
+            observation_delay=0,
+            replay_name="stage5-clear",
+        ),
+    )
+
+    assert report["success"] is True
+    assert client.save_replay_calls == [(True, "stage_complete")]
+    assert report["native_replay"]["episode_kind"] == "stage"
+    assert report["native_replay"]["finish"] is True
+
+    failed_client = FakeEngineClient(
+        completion_reason="stage_complete",
+        final_death=1,
+    )
+    failed = run_engine_mpc_play(
+        failed_client,  # type: ignore[arg-type]
+        scenario="Stage 5@Lunatic",
+        attack=None,
+        stage="Stage 5@Lunatic",
+        seed=43,
+        player="reimu_player",
+        controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+        config=EngineMPCPlayConfig(
+            max_frames=12,
+            observation_delay=0,
+            replay_name="stage5-death",
+        ),
+    )
+    assert failed["success"] is False
+    assert failed_client.save_replay_calls == [(False, "stage_complete")]
+    assert failed["native_replay"]["finish"] is False
+
+
+def test_native_replay_requires_advertised_bridge_command_before_reset() -> None:
+    client = FakeEngineClient()
+    client.commands.remove("save_replay")
+
+    with pytest.raises(EngineProtocolError, match="does not advertise"):
+        run_engine_mpc_play(
+            client,  # type: ignore[arg-type]
+            scenario="okuu:Lunatic",
+            attack=3,
+            seed=42,
+            player="reimu_player",
+            controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+            config=EngineMPCPlayConfig(
+                max_frames=12,
+                observation_delay=0,
+                replay_name="unsupported",
+            ),
+        )
+
+    assert client.replay_name is None
+    assert client.actions == []
+
+
+def test_native_replay_rejects_invalid_save_response() -> None:
+    client = FakeEngineClient()
+    client.invalid_replay_save = True
+
+    with pytest.raises(EngineProtocolError, match="invalid saved replay metadata"):
+        run_engine_mpc_play(
+            client,  # type: ignore[arg-type]
+            scenario="okuu:Lunatic",
+            attack=3,
+            seed=42,
+            player="reimu_player",
+            controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+            config=EngineMPCPlayConfig(
+                max_frames=12,
+                observation_delay=0,
+                replay_name="invalid-save",
+            ),
+        )
+
+    assert client.save_replay_calls == [(False, "attack_complete")]
+
+
+def test_native_replay_rejects_unverified_frame_bytes() -> None:
+    client = FakeEngineClient()
+    client.replay_frame_bytes_delta = -1
+
+    with pytest.raises(EngineProtocolError, match="invalid saved replay metadata"):
+        run_engine_mpc_play(
+            client,  # type: ignore[arg-type]
+            scenario="okuu:Lunatic",
+            attack=3,
+            seed=42,
+            player="reimu_player",
+            controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+            config=EngineMPCPlayConfig(
+                max_frames=12,
+                observation_delay=0,
+                replay_name="invalid-frame-data",
+            ),
+        )
+
+    assert client.save_replay_calls == [(False, "attack_complete")]
 
 
 def test_predicted_collision_never_stops_continuous_fire() -> None:

@@ -451,9 +451,10 @@ include the effective horizon, probability, shield checks, and probability
 skips so the selected execution level can be audited.
 
 `engine-mpc-play` starts at the attack reset and remains under continuous live
-MPC control. The command has no recorded-action prefix loader, prefix CLI
-option, or replay branch. Its movement candidates and emitted actions always
-set `spell=false`. Shooting remains enabled on every active logical frame:
+MPC control. It has no recorded-action loader or playback branch. Optional
+native replay capture is output-only and never feeds the controller. Its
+movement candidates and emitted actions always set `spell=false`. Shooting
+remains enabled on every active logical frame:
 player firing does not change movement speed or collision, so coupling it to
 forecast clearance only reduces damage and extends exposure to the attack.
 The legacy `--shoot-minimum-margin` option remains parseable for existing
@@ -472,8 +473,43 @@ uv run stg-lab engine-mpc-play \
   --observation-delay 5 --horizon-frames 60 \
   --gap-prediction \
   --region-dynamics-memory models/region_dynamics_boss3_v2.json \
+  --replay-name boss3-seed20260730 \
   --output artifacts/engine-mpc-boss3.json
 ```
+
+With `--replay-name`, the bridge records the final THlib key state for every
+logical frame and saves a verified STGR v1 file at
+`userdata/replay/<mod>/analysis/<name>.rep`. The report's `native_replay`
+section binds that file to its stage, fixed seed, player, frame count, outcome,
+file size, verified frame-byte count, and CRC32. Verification compares the
+read-back header and serialized initial state, reads every declared input byte,
+and requires exact EOF. Failed, killed, and frame-limited episodes are retained
+with `finish=false`; Spell Practice always has `group_finish=0`. Native capture
+is rejected for non-final isolated stages and reset options that a plain replay
+cannot reproduce.
+`verified=true` describes STGR structure, metadata, and frame-region integrity;
+it does not claim that a native replay-menu load has already reproduced the
+episode. Use unique names to retain earlier captures because THlib overwrites
+an existing file with the same name.
+
+The `.rep` stores only initial state and input. Keep the JSON beside it for MPC
+decisions and forecasts; add `--record-observations-from-frame 0` when analysis
+also needs full visible object snapshots. Replay names accept 1-96 portable
+`A-Z`, `a-z`, `0-9`, `_`, `.`, and `-` characters and may optionally end in
+`.rep`. Windows device basenames such as `CON`, `COM1`, and `LPT1`, as well as
+names ending in `.`, are rejected.
+
+The final native arm64 macOS headless capture on 2026-08-03 completed Okuu
+Boss #3 at seed `20260730` with zero deaths in 3363 controlled frames. The
+3891-byte replay contains 3364 input frames including reset, CRC32 `5f964c53`,
+and SHA-256
+`4d6be63144e7706de04112c2204e2960dffb78fda57cc19a4a0423a2b8aa85d2`.
+Independent parsing matched every replay byte to the JSON action holds; all
+3363 controlled frames fired. The paired 1121-decision/full-observation JSON
+has SHA-256
+`20822e937020f0137e3d5e064e9e663f5d9c4134426f2ac698c56db3aa268170`.
+These are ignored local artifacts named `boss3-analysis-seed20260730.rep` and
+`engine-mpc-boss3-analysis-seed20260730.json`.
 
 The fitted Boss #3 memory is versioned at
 `models/region_dynamics_boss3_v2.json`; training commands may still write new
@@ -659,7 +695,10 @@ runs. If the game is copied to a local Windows directory, replace that copy's
 On Windows, double-click `run-win-boss3.cmd` after the local game and
 `.venv-win` already exist. The launcher does not copy or install anything; it
 validates those prerequisites, starts the local engine, waits for the listener
-without consuming the bridge connection, and runs the strict Boss #3 test.
+without consuming the bridge connection, and runs the strict Boss #3 test. It
+also assigns a timestamped replay name, verifies the resulting file is nonempty,
+and prints both the JSON report and native `.rep` paths. Pass
+`-RecordObservations` to archive full observations from frame zero.
 Use `run-win-boss3.ps1` directly when command-line parameter overrides are
 needed.
 
