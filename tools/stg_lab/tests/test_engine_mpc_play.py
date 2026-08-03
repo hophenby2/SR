@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import inspect
 from typing import Any
 
 import pytest
 
 from stg_lab.engine import EngineProtocolError
-from stg_lab.engine_mpc import EngineMPC, MPCConfig
+from stg_lab.engine_mpc import EngineMPC, MPCConfig, MPCDecision
 from stg_lab.engine_mpc_play import (
     EngineMPCPlayConfig,
     _controller_observation,
@@ -126,6 +127,24 @@ class FakeEngineClient:
         )}
 
 
+class PredictedCollisionMPC(EngineMPC):
+    def select(self, observed) -> MPCDecision:
+        decision = super().select(observed)
+        evaluations = tuple(
+            replace(
+                evaluation,
+                collided=True,
+                collision_frames=1,
+                earliest_collision_frame=1,
+                minimum_margin=-1.0,
+            )
+            if evaluation.action.discrete == decision.action.discrete else
+            evaluation
+            for evaluation in decision.evaluations
+        )
+        return replace(decision, evaluations=evaluations)
+
+
 def test_controller_observation_delays_hazards_but_not_own_player() -> None:
     delayed = observation(10)
     delayed["player"]["x"] = -40.0
@@ -167,7 +186,7 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
     assert report["engine"]["runtime_source_verification"]["matched"] is True
     assert report["engine"]["runtime_source_verification"]["source_count"] == 18
     assert "recorded_prefix" not in report
-    assert report["unsafe_shot_frames_excludes_recorded_actions"] is False
+    assert report["schema_version"] == 3
     assert all(item["control_source"] == "live_mpc" for item in report["decisions"])
     assert all(action.spell is False for action in client.actions)
     assert all(item["predicted_collision"] is False for item in report["decisions"])
@@ -195,6 +214,40 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
         "maximum_corridor_count": 0,
     }
     assert report["render_performance"]["dense_frames"]["median"] == 59.5
+    assert report["continuous_fire"] is True
+    assert report["shoot_frames"] == report["frames"]
+    assert report["shoot_rate"] == 1.0
+    assert all(action.shoot for action in client.actions)
+
+
+def test_predicted_collision_never_stops_continuous_fire() -> None:
+    client = FakeEngineClient()
+    report = run_engine_mpc_play(
+        client,  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        controller=PredictedCollisionMPC(MPCConfig(
+            observation_delay=0,
+            horizon_frames=36,
+        )),
+        config=EngineMPCPlayConfig(
+            max_frames=12,
+            observation_delay=0,
+            shoot_minimum_margin=1_000_000.0,
+        ),
+    )
+
+    assert all(action.shoot and not action.spell for action in client.actions)
+    assert all(item["predicted_collision"] for item in report["decisions"])
+    assert report["continuous_fire"] is True
+    assert report["shoot_frames"] == report["frames"] == 6
+    assert report["shoot_rate"] == 1.0
+    assert report["predicted_collision_plan_frames"] == 6
+    assert report["unsafe_shot_frames"] is None
+    assert report["unsafe_shot_frames_deprecated"] is True
+    assert report["config"]["shoot_minimum_margin_controls_fire"] is False
 
 
 def test_engine_mpc_rejects_stale_runtime_lua_before_reset() -> None:

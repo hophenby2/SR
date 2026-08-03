@@ -45,6 +45,7 @@ class EngineDAggerConfig:
     intervention_margin: float = 12.0
     intervention_regret: float = 8.0
     intervene_on_disagreement: bool = False
+    # Retained for CLI/report compatibility; it no longer gates firing.
     shoot_minimum_margin: float = 12.0
     supervision_mode: str = "teacher"
     render: bool = False
@@ -131,17 +132,12 @@ def _intervention_reason(
     return None
 
 
-def _movement_with_safe_shooting(
-    movement: Action,
-    evaluation: CandidateEvaluation,
-    *,
-    minimum_margin: float,
-) -> Action:
+def _movement_with_continuous_fire(movement: Action) -> Action:
     return Action(
         move_x=movement.move_x,
         move_y=movement.move_y,
         slow=movement.slow,
-        shoot=not evaluation.collided and evaluation.minimum_margin >= minimum_margin,
+        shoot=True,
         spell=False,
     )
 
@@ -256,11 +252,7 @@ def run_engine_dagger_play(
             teacher_decision,
             teacher_decision.action,
         )
-        teacher_action = _movement_with_safe_shooting(
-            teacher_decision.action,
-            teacher_evaluation,
-            minimum_margin=config.shoot_minimum_margin,
-        )
+        teacher_action = _movement_with_continuous_fire(teacher_decision.action)
         student_evaluation = _evaluation_for_action(teacher_decision, student_action)
         forced = rng.random() < config.teacher_probability
         reason = _intervention_reason(
@@ -274,12 +266,7 @@ def run_engine_dagger_play(
         )
         intervened = reason is not None
         movement = teacher_action if intervened else student_action
-        movement_evaluation = teacher_evaluation if intervened else student_evaluation
-        action = _movement_with_safe_shooting(
-            movement,
-            movement_evaluation,
-            minimum_margin=config.shoot_minimum_margin,
-        )
+        action = _movement_with_continuous_fire(movement)
 
         supervised_action = (
             action if config.supervision_mode == "corrective" else teacher_action
@@ -375,7 +362,7 @@ def run_engine_dagger_play(
     runtime_identity = ping.get("runtime_identity")
     decision_count = len(decisions)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_kind": "live_luastg_native_dagger",
         "acceptance_claim": False,
         "training_only": True,
@@ -408,6 +395,9 @@ def run_engine_dagger_play(
         "decision_count": decision_count,
         "shoot_frames": shot_frames,
         "shoot_rate": shot_frames / logical_frames if logical_frames else 0.0,
+        "shoot_command_frames": shot_frames,
+        "shoot_command_rate": shot_frames / logical_frames if logical_frames else 0.0,
+        "continuous_fire": True,
         "student_teacher_agreements": agreements,
         "student_teacher_agreement_rate": (
             agreements / decision_count if decision_count else 0.0
@@ -482,6 +472,8 @@ def run_engine_dagger_play(
             **asdict(config),
             "vision": asdict(vision_config),
             "reset_options": {},
+            "continuous_fire": True,
+            "shoot_minimum_margin_controls_fire": False,
             "spell_forced_off": True,
             "student_control_inputs": _stream_policy_control_inputs(student),
             "teacher_data_is_training_only": True,

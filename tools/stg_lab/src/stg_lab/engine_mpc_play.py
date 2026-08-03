@@ -27,6 +27,8 @@ class EngineMPCPlayConfig:
     max_frames: int = 7200
     decision_interval: int = 3
     observation_delay: int = 5
+    # Retained for CLI/report compatibility. Shooting is continuous because it
+    # does not alter player movement or collision; this threshold is diagnostic.
     shoot_minimum_margin: float = 12.0
     render: bool = False
     render_every: int = 1
@@ -197,17 +199,12 @@ def _controller_observation(
     return controller_observation(delayed, current)
 
 
-def _effective_action(decision: MPCDecision, config: EngineMPCPlayConfig) -> Action:
-    evaluation = _selected_evaluation(decision)
-    safe_to_shoot = (
-        not evaluation.collided
-        and evaluation.minimum_margin >= config.shoot_minimum_margin
-    )
+def _effective_action(decision: MPCDecision) -> Action:
     return Action(
         move_x=decision.action.move_x,
         move_y=decision.action.move_y,
         slow=decision.action.slow,
-        shoot=safe_to_shoot,
+        shoot=True,
         spell=False,
     )
 
@@ -294,7 +291,7 @@ def run_engine_mpc_play(
     decisions: list[dict[str, Any]] = []
     logical_frames = 0
     shot_frames = 0
-    unsafe_shot_frames = 0
+    predicted_collision_plan_frames = 0
     terminal_before: Mapping[str, Any] | None = None
     terminal_action: Action | None = None
 
@@ -304,7 +301,7 @@ def run_engine_mpc_play(
         start_frame = _episode_frame(raw)
         decision = controller.select(controller_observation)
         evaluation = _selected_evaluation(decision)
-        action = _effective_action(decision, config)
+        action = _effective_action(decision)
         if decision_observer is not None:
             assert stream_vision is not None
             decision_observer(
@@ -337,9 +334,7 @@ def run_engine_mpc_play(
             logical_frames += 1
             advanced += 1
             shot_frames += int(action.shoot)
-            unsafe_shot_frames += int(
-                action.shoot and evaluation.collided
-            )
+            predicted_collision_plan_frames += int(evaluation.collided)
             if raw.get("terminated") is True:
                 terminal_before = before
                 terminal_action = action
@@ -477,7 +472,7 @@ def run_engine_mpc_play(
         ),
     }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_kind": "live_luastg_delayed_visible_mpc_teacher",
         "acceptance_claim": False,
         "implementation_sha256": source_tree_sha256(),
@@ -512,8 +507,15 @@ def run_engine_mpc_play(
         "decision_count": len(decisions),
         "shoot_frames": shot_frames,
         "shoot_rate": shot_frames / logical_frames if logical_frames else 0.0,
-        "unsafe_shot_frames": unsafe_shot_frames,
-        "unsafe_shot_frames_excludes_recorded_actions": False,
+        "shoot_command_frames": shot_frames,
+        "shoot_command_rate": shot_frames / logical_frames if logical_frames else 0.0,
+        "continuous_fire": True,
+        "unsafe_shot_frames": None,
+        "unsafe_shot_frames_deprecated": True,
+        "unsafe_shot_frames_definition": (
+            "retired: shooting does not affect movement or collision"
+        ),
+        "predicted_collision_plan_frames": predicted_collision_plan_frames,
         "engine": {
             "protocol": ping.get("protocol"),
             "session_id": ping.get("session_id"),
@@ -551,6 +553,8 @@ def run_engine_mpc_play(
             **asdict(config),
             "reset_options": {},
             "authority_state_shield": False,
+            "continuous_fire": True,
+            "shoot_minimum_margin_controls_fire": False,
             "spell_forced_off": True,
             "control_inputs": [
                 "delayed_visible_positions",

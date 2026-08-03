@@ -574,7 +574,8 @@ def test_engine_play_holds_each_visible_decision_for_three_frames() -> None:
     assert report["engine"]["catalog_entry"]["card_index"] == 4
     assert report["outcome_evidence"]["reporting_only_not_controller_input"] is True
     assert report["outcome_evidence"]["boss_hp_initial"] == 100.0
-    assert report["unsafe_shot_frames"] == 0
+    assert report["unsafe_shot_frames"] is None
+    assert report["unsafe_shot_frames_deprecated"] is True
     assert len(observed) == 3
     assert all(isinstance(value[0], VisionObservation) for value in observed)
     assert [value[1].move_x for value in observed] == [-1, 1, -1]
@@ -653,7 +654,7 @@ def test_engine_play_rejects_boolean_false_as_zero_death() -> None:
     assert report["episode_completed"] is False
 
 
-def test_engine_play_visible_threat_gate_suppresses_shooting_and_timeout_fails() -> None:
+def test_engine_play_visible_threat_is_diagnostic_and_never_stops_shooting() -> None:
     client = FakeEngineClient(
         terminate_at=None,
         reason=None,
@@ -669,14 +670,22 @@ def test_engine_play_visible_threat_gate_suppresses_shooting_and_timeout_fails()
         config=play_config(max_frames=3),
     )
 
-    assert all(not action.shoot for action, _repeat in client.actions)
-    assert report["action_steps"][0]["shoot_gate"]["safe"] is False
-    assert report["action_steps"][0]["shoot_gate"]["risk"] > 0.25
+    assert all(action.shoot for action, _repeat in client.actions)
+    diagnostic = report["action_steps"][0]["local_threat_diagnostic"]
+    assert diagnostic["low_risk"] is False
+    assert diagnostic["risk"] > 0.25
+    assert diagnostic["reporting_only"] is True
+    assert diagnostic["controls_fire"] is False
     assert report["terminated"] is False
     assert report["termination_reason"] == "max_frames"
     assert report["engine_termination_reason"] is None
     assert report["success"] is False
-    assert report["shoot_rate"] == 0.0
+    assert report["continuous_fire"] is True
+    assert report["shoot_frames"] == report["frames"] == 3
+    assert report["shoot_rate"] == 1.0
+    assert report["shoot_command_frames"] == report["frames"]
+    assert report["shoot_command_rate"] == 1.0
+    assert report["config"]["shoot_gate_controls_fire"] is False
 
 
 def test_engine_play_player_hit_never_counts_as_success() -> None:

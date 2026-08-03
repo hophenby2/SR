@@ -344,27 +344,31 @@ so dense geometry no longer runs a Python route search for every corridor.
 These figures are not a native episode A/B, real-time throughput, or
 success-rate claim.
 
-A final same-source native A/B used Okuu #3 seed `20260730`. Both reports bind
-implementation SHA-256
-`811513e348b893bd41618f9d828ef2f54bc7dd1278a86dd12ec80ba655e216f2`,
-have identical top-level run configuration, and differ in controller
-configuration only at `gap_prediction_enabled`.
+A final same-source, continuous-fire native A/B used Okuu #3 seed `20260730`.
+Both reports bind implementation SHA-256
+`002d770a1e4d10ad98a2ce00f21796dd7deeddc931b08ab638a3e07e0bbefb86`,
+have identical top-level run configuration and runtime source maps, and differ
+in controller configuration only at `gap_prediction_enabled`.
 
 | Gap prediction | Strict engine outcome | Gap telemetry | Movement diagnostics | Report SHA-256 |
 | --- | --- | --- | --- | --- |
-| on | `attack_complete`; 3,815 frames; Boss HP `6000 -> 0`; death 0; unsafe shots 0 | 167 detected; 52 selected; observe/enter/hold/exit `105/52/0/10`; maxima `49/12`; 52/52 entry movements match their certified first action, 46 nonneutral | path 10782.4653; 420 direction changes (110.0917/1,000 frames); 18 exact reversals; 122 sharp turns; 10 ABA; median hold 6 frames | `5f56b184bf7116b789187e6d3b03c1c43714f24250a9f8f857363b7bad60e2bd` |
-| off | `attack_complete`; 3,815 frames; Boss HP `6000 -> 0`; death 0; unsafe shots 0 | disabled; all gap counts zero | path 10785.4956; 416 direction changes (109.0433/1,000 frames); 18 exact reversals; 139 sharp turns; 6 ABA; median hold 6 frames | `3c37da04b902332b41734cb93ead1695a582918c1fdd28037efb7ca605702db3` |
+| on | `attack_complete`, `passed=true`; 3,363 frames / 1,121 decisions; Boss HP `6000 -> 0`; death 0; shoot commands `3363/3363` (1.0); predicted-collision movement plans 522 frames | 172 detected; 44 selected; observe/enter/hold/exit `119/44/0/9`; maxima `54/13` | path 9621.0025; 316 direction changes (93.9637/1,000 frames); 26 exact reversals; 112 sharp turns; 7 ABA; hold min/median/mean/max `3/9/10.6088/291` frames | `7dc328637957f0682974d97e0227475bea10f4eb79994334bea9599b76b18ea1` |
+| off | `attack_complete`, `passed=true`; 3,360 frames / 1,120 decisions; Boss HP `6000 -> 0`; death 0; shoot commands `3360/3360` (1.0); predicted-collision movement plans 528 frames | disabled; all gap counts zero | path 9500.6747; 308 direction changes (91.6667/1,000 frames); 26 exact reversals; 122 sharp turns; 6 ABA; hold min/median/mean/max `3/9/10.8738/291` frames | `93f27f603bb852021ccab8f62e87285072140a1788cab510a02d69ed51c15e3a` |
 
-Direct comparison finds 947 different emitted actions, including 930 different
-movement choices, and 1,110 different observed decision-boundary positions.
-Thus the certified entries affected native control rather than telemetry only,
-while both sides still strictly completed. The enabled run's lower sharp-turn
-count is descriptive for this episode, not a general smoothness result. Because
-it recorded no `hold` decision, this native episode evidences certified entry
-rather than sustained corridor holding; the deterministic regression covers
-`enter -> hold`. Because this is one seed and both sides already pass, it does
-not establish a success-rate improvement. These `acceptance_claim=false` live
-MPC-teacher reports are not learned-policy evidence.
+Across 1,120 common decisions, direct comparison finds 802 different emitted
+actions, including 749 different movement choices, 947 different planned-action
+arrays, and 952 different observed decision-boundary positions. The enabled run
+has one additional terminal decision; the first action and position divergence
+is decision 168. Gap prediction therefore activated and changed native movement
+while both sides still strictly completed. Its smoothness figures are
+descriptive for this episode, not a general result. Because it recorded no
+`hold` decision, this native episode does not evidence sustained corridor
+holding; the deterministic regression covers `enter -> hold`. Schema 3 retires
+the unsafe-shot metric, so `unsafe_shot_frames=null` is not a zero count. Because
+this is one seed and both sides already pass, the pair demonstrates activation
+and non-regression, not a success-rate improvement. These
+`acceptance_claim=false` live MPC-teacher reports are not learned-policy
+evidence.
 
 The predictor is a general visual teacher rule, not spell-specific memory
 inserted into the released neural checkpoint. The A/B reports have not yet been
@@ -949,9 +953,16 @@ stage instead requires `termination_reason=stage_complete` with the same
 zero-death evidence. Reaching `max_frames`, surviving longer, reducing boss HP
 without attack completion, completing after death, or omitting valid death
 evidence does not count as success. Every action keeps `spell=false`; shooting
-is enabled only when predicted safety margin meets the configured threshold and
-is disabled during danger. The current command has no recorded-action prefix
-loader; externally prefix-assisted evidence would be ineligible.
+stays enabled on every active logical frame. Firing does not change player
+movement or collision, so tying it to forecast clearance only lowers damage and
+extends attack exposure. Legacy shoot-risk and minimum-margin options remain
+parseable for command/report compatibility but are reporting-only and cannot
+disable firing. Live runner reports now use schema 3 with `continuous_fire` and
+explicit `shoot_command_frames`/`shoot_command_rate` fields. The misleading
+schema-2 `unsafe_shot_frames` value remains only as `null` with a deprecation
+marker; movement-plan collision forecasts are separate diagnostics. The current
+command has no recorded-action prefix loader;
+externally prefix-assisted evidence would be ineligible.
 
 ### Engine acceptance
 

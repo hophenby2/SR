@@ -453,9 +453,17 @@ skips so the selected execution level can be audited.
 `engine-mpc-play` starts at the attack reset and remains under continuous live
 MPC control. The command has no recorded-action prefix loader, prefix CLI
 option, or replay branch. Its movement candidates and emitted actions always
-set `spell=false`. Shooting is enabled only when the selected forecast has no
-collision and its minimum margin reaches `--shoot-minimum-margin`; the runner
-therefore stops shooting when its forecast is unsafe.
+set `spell=false`. Shooting remains enabled on every active logical frame:
+player firing does not change movement speed or collision, so coupling it to
+forecast clearance only reduces damage and extends exposure to the attack.
+The legacy `--shoot-minimum-margin` option remains parseable for existing
+launchers and report comparison, but is reporting-only and does not control
+firing. MPC, checkpoint-policy, and DAgger reports expose `continuous_fire=true`
+and explicit `shoot_command_frames`/`shoot_command_rate` fields, and mark their
+legacy shoot-risk thresholds as non-controlling. These live reports now use
+schema 3. The misleading schema-2 `unsafe_shot_frames` field is retained as
+`null` plus a deprecation marker; movement-plan collision forecasts are reported
+separately and never gate firing.
 
 ```bash
 uv run stg-lab engine-mpc-play \
@@ -519,27 +527,31 @@ entry certification is explicitly capped after geometry instead of running for
 all 276 corridors. These are focused algorithm-performance checks, not native
 closed-loop success or real-time throughput claims.
 
-A same-source native A/B then exercised the predictor on Okuu #3 seed
-`20260730`. Both runs bind implementation SHA-256
-`811513e348b893bd41618f9d828ef2f54bc7dd1278a86dd12ec80ba655e216f2`;
-their top-level run configuration is identical, and the only controller-config
-difference is `gap_prediction_enabled`.
+A final same-source, continuous-fire native A/B exercised the predictor on Okuu
+#3 seed `20260730`. Both runs bind implementation SHA-256
+`002d770a1e4d10ad98a2ce00f21796dd7deeddc931b08ab638a3e07e0bbefb86`;
+their top-level run configuration, runtime source map, and seed are identical,
+and the only controller-config difference is `gap_prediction_enabled`.
 
 | Gap prediction | Strict outcome | Gap telemetry | Path and smoothness | Report SHA-256 |
 | --- | --- | --- | --- | --- |
-| on | `attack_complete`, 3,815 frames, HP `6000 -> 0`, death 0, unsafe shots 0 | detected 167; selected 52; observe/enter/hold/exit `105/52/0/10`; maximum groups/corridors `49/12`; all 52 entry movements match the certified first action, 46 nonneutral | path 10782.4653; changes 420 (110.0917/1,000 frames); reversals 18; sharp turns 122; ABA 10; median hold 6 | `5f56b184bf7116b789187e6d3b03c1c43714f24250a9f8f857363b7bad60e2bd` |
-| off | `attack_complete`, 3,815 frames, HP `6000 -> 0`, death 0, unsafe shots 0 | disabled; all gap counts 0 | path 10785.4956; changes 416 (109.0433/1,000 frames); reversals 18; sharp turns 139; ABA 6; median hold 6 | `3c37da04b902332b41734cb93ead1695a582918c1fdd28037efb7ca605702db3` |
+| on | `attack_complete`, `passed=true`; 3,363 frames / 1,121 decisions; HP `6000 -> 0`; death 0; shoot commands `3363/3363` (1.0); predicted-collision movement plans 522 frames | detected 172; selected 44; observe/enter/hold/exit `119/44/0/9`; maximum groups/corridors `54/13` | path 9621.0025; changes 316 (93.9637/1,000 frames); reversals 26; sharp turns 112; ABA 7; hold min/median/mean/max `3/9/10.6088/291` | `7dc328637957f0682974d97e0227475bea10f4eb79994334bea9599b76b18ea1` |
+| off | `attack_complete`, `passed=true`; 3,360 frames / 1,120 decisions; HP `6000 -> 0`; death 0; shoot commands `3360/3360` (1.0); predicted-collision movement plans 528 frames | disabled; all gap counts 0 | path 9500.6747; changes 308 (91.6667/1,000 frames); reversals 26; sharp turns 122; ABA 6; hold min/median/mean/max `3/9/10.8738/291` | `93f27f603bb852021ccab8f62e87285072140a1788cab510a02d69ed51c15e3a` |
 
-Direct comparison finds 947 different emitted actions, including 930 different
-movement choices, and 1,110 different observed decision-boundary positions.
-The enabled route therefore changed native movement and still strictly cleared;
-its lower sharp-turn count is descriptive for this run, not a general
-smoothness claim. It recorded no `hold` decision, so this native run evidences
-certified entry rather than sustained corridor holding; the deterministic
-regression covers `enter -> hold`. With one seed and both sides already
-successful, the pair does not establish a success-rate improvement. Both
-reports remain `acceptance_claim=false` live MPC-teacher evidence, not
-learned-policy results.
+Across 1,120 common decisions, direct comparison finds 802 different emitted
+actions, including 749 different movement choices, 947 different planned-action
+arrays, and 952 different observed decision-boundary positions. The enabled run
+has one additional terminal decision; the first action and position divergence
+is decision 168. Gap prediction therefore activated and changed native
+movement while both sides still strictly cleared. The enabled run's smoothness
+figures are descriptive for this episode, not a general result. It recorded no
+`hold` decision, so the native episode does not evidence sustained corridor
+holding; the deterministic regression covers `enter -> hold`. Schema 3 retires
+the old unsafe-shot metric, so `unsafe_shot_frames=null` is not a zero count.
+With one seed and both sides already successful, the pair demonstrates
+activation and non-regression, not a success-rate improvement. Both reports
+remain `acceptance_claim=false` live MPC-teacher evidence, not learned-policy
+results.
 
 This is a general visual teacher rule, not spell-specific memory added to the
 released neural checkpoint. The A/B reports have not yet been converted into a

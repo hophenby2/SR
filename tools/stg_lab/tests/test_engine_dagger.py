@@ -5,7 +5,11 @@ from typing import Any
 import pytest
 
 from stg_lab.engine import EngineProtocolError
-from stg_lab.engine_dagger import EngineDAggerConfig, run_engine_dagger_play
+from stg_lab.engine_dagger import (
+    EngineDAggerConfig,
+    _movement_with_continuous_fire,
+    run_engine_dagger_play,
+)
 from stg_lab.engine_mpc import CandidateEvaluation, MPCConfig, MPCDecision, movement_actions
 from stg_lab.engine_runtime import local_runtime_source_fingerprints
 from stg_lab.native_dataset import NativeEpisodeBuffer, NativeEpisodeIdentity
@@ -121,9 +125,15 @@ class FixedStudent:
 
 
 class FixedTeacher:
-    def __init__(self, *, student_collides: bool) -> None:
+    def __init__(
+        self,
+        *,
+        student_collides: bool,
+        student_minimum_margin: float = 30.0,
+    ) -> None:
         self.config = MPCConfig(observation_delay=0, horizon_frames=36)
         self.student_collides = student_collides
+        self.student_minimum_margin = student_minimum_margin
 
     def reset(self) -> None:
         return None
@@ -138,7 +148,13 @@ class FixedTeacher:
                 collided=self.student_collides and is_student,
                 collision_frames=int(self.student_collides and is_student),
                 earliest_collision_frame=(1 if self.student_collides and is_student else None),
-                minimum_margin=(-1.0 if self.student_collides and is_student else 30.0),
+                minimum_margin=(
+                    -1.0
+                    if self.student_collides and is_student else
+                    self.student_minimum_margin
+                    if is_student else
+                    30.0
+                ),
                 boundary_penalty=0.0,
                 boss_alignment=0.0,
             ))
@@ -173,6 +189,7 @@ class FixedTeacher:
 def _run(
     *,
     student_collides: bool,
+    student_minimum_margin: float = 30.0,
     death: int = 0,
     student_action: Action = Action(move_x=-1, slow=True),
     supervision_mode: str = "teacher",
@@ -193,7 +210,10 @@ def _run(
         seed=42,
         player="reimu_player",
         student=student,  # type: ignore[arg-type]
-        teacher=FixedTeacher(student_collides=student_collides),  # type: ignore[arg-type]
+        teacher=FixedTeacher(
+            student_collides=student_collides,
+            student_minimum_margin=student_minimum_margin,
+        ),  # type: ignore[arg-type]
         episode=episode,
         config=EngineDAggerConfig(
             max_frames=12,
@@ -237,6 +257,55 @@ def test_dagger_records_teacher_labels_on_student_executed_states() -> None:
     assert [
         (action.discrete, frames) for action, frames in student_controller.commits
     ] == [(student, 3), (student, 3)]
+    assert report["continuous_fire"] is True
+    assert report["shoot_frames"] == report["frames"]
+    assert report["shoot_rate"] == 1.0
+    assert all(action.shoot and not action.spell for action in client.actions)
+
+
+def test_dagger_continuous_fire_wrapper_preserves_only_movement_and_focus() -> None:
+    action = _movement_with_continuous_fire(Action(
+        move_x=-1,
+        move_y=1,
+        slow=False,
+        shoot=False,
+        spell=True,
+    ))
+
+    assert action == Action(
+        move_x=-1,
+        move_y=1,
+        slow=False,
+        shoot=True,
+        spell=False,
+    )
+
+
+def test_dagger_low_margin_student_action_never_stops_continuous_fire() -> None:
+    client, _episode, report, _student = _run(
+        student_collides=False,
+        student_minimum_margin=8.0,
+        student_action=Action(
+            move_x=-1,
+            slow=True,
+            shoot=False,
+            spell=True,
+        ),
+        supervision_mode="corrective",
+    )
+
+    assert report["teacher_interventions"] == 0
+    assert all(action.shoot and not action.spell for action in client.actions)
+    assert all(
+        decision["student_predicted_minimum_margin"] == 8.0
+        and decision["executed_action"]["shoot"] is True
+        and decision["supervised_action"]["shoot"] is True
+        for decision in report["decisions"]
+    )
+    assert report["continuous_fire"] is True
+    assert report["shoot_frames"] == report["frames"] == 6
+    assert report["shoot_rate"] == 1.0
+    assert report["config"]["shoot_minimum_margin_controls_fire"] is False
 
 
 def test_dagger_intervenes_when_student_candidate_would_collide() -> None:

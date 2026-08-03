@@ -89,6 +89,12 @@ def test_candidate_generation_is_seed_reproducible_and_baseline_first() -> None:
     )
     assert first[1:] != other[1:]
     assert len({candidate.candidate_id for candidate in first}) == 12
+    assert all(
+        candidate.shoot_gate_radius == 12.0
+        and candidate.shoot_risk_threshold == 0.25
+        and candidate.shoot_motion_weight == 0.5
+        for candidate in first
+    )
 
 
 def test_training_seed_sets_must_be_disjoint() -> None:

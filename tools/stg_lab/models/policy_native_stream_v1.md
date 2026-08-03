@@ -294,15 +294,20 @@ the tested native action sequence or produce a strict completion. No v14-v25
 checkpoint replaces the published v1 model.
 
 The current parallel-wave gap logic is still an Engine MPC planner/teacher
-feature. The final same-source v5 gap-enabled and gap-disabled reports bind
-implementation SHA-256
-`811513e348b893bd41618f9d828ef2f54bc7dd1278a86dd12ec80ba655e216f2`
-and both strictly complete Okuu #3 seed 20260730. The enabled report records 167
-detections and 52 certified entries; all entry movements match their certified
-first action, and 930 movement decisions differ from the disabled run. Their
-report SHA-256 values are respectively
-`5f56b184bf7116b789187e6d3b03c1c43714f24250a9f8f857363b7bad60e2bd`
-and `3c37da04b902332b41734cb93ead1695a582918c1fdd28037efb7ca605702db3`.
+feature. The final same-source continuous-fire gap-enabled and gap-disabled
+reports bind implementation SHA-256
+`002d770a1e4d10ad98a2ce00f21796dd7deeddc931b08ab638a3e07e0bbefb86`
+and both strictly complete Okuu #3 seed 20260730. They send shoot commands on
+3,363/3,363 and 3,360/3,360 logical frames even though their selected movement
+plans predict collisions on 522 and 528 frames respectively.
+The enabled report records 172 detections and 44 selections; across 1,120 common
+decisions, 749 movement choices differ from the disabled run. Their report
+SHA-256 values are respectively
+`7dc328637957f0682974d97e0227475bea10f4eb79994334bea9599b76b18ea1`
+and `93f27f603bb852021ccab8f62e87285072140a1788cab510a02d69ed51c15e3a`.
+This single passing seed demonstrates gap activation and non-regression, not a
+success-rate improvement. Both are `acceptance_claim=false` MPC-teacher reports,
+not learned-policy evidence.
 These reports are not training archives: no gap-aware DAgger or demonstration
 archive has yet been generated, and the GRU has not been retrained from one.
 Therefore the v14-v25 results neither train nor validate learned gap-entry

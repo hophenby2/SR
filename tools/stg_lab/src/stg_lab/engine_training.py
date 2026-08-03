@@ -36,6 +36,7 @@ class CandidateStrategy:
     vertical_sign: int = 1
     slow_mode: str = "preserve"
     decision_offset: int = 0
+    # Compatibility metadata for the reporting-only local threat diagnostic.
     shoot_gate_radius: float = 20.0
     shoot_risk_threshold: float = 0.25
     shoot_motion_weight: float = 0.5
@@ -172,28 +173,20 @@ def generate_candidate_strategies(
 
     if count <= 0:
         raise ValueError("candidate count must be positive")
-    maximum_radius = min(base.vision.local_extent_x, base.vision.local_extent_y)
-    radii = sorted({
-        round(max(1.0, min(maximum_radius, base.shoot_gate_radius * scale)), 6)
-        for scale in (0.65, 1.0, 1.35)
-    })
-    thresholds = sorted({
-        round(max(0.0, base.shoot_risk_threshold * scale), 6)
-        for scale in (0.6, 1.0, 1.6)
-    })
-    motion_weights = sorted({
-        round(max(0.0, base.shoot_motion_weight * scale), 6)
-        for scale in (0.0, 1.0, 2.0)
-    })
     values = [
-        CandidateStrategy(x, y, slow, offset, radius, threshold, motion)
+        CandidateStrategy(
+            x,
+            y,
+            slow,
+            offset,
+            base.shoot_gate_radius,
+            base.shoot_risk_threshold,
+            base.shoot_motion_weight,
+        )
         for x in (1, -1)
         for y in (1, -1)
         for slow in ("preserve", "focus", "unfocus")
         for offset in (0, -6, 6, -3, 3)
-        for radius in radii
-        for threshold in thresholds
-        for motion in motion_weights
     ]
     baseline = CandidateStrategy(
         shoot_gate_radius=base.shoot_gate_radius,

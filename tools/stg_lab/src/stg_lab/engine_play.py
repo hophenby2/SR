@@ -50,6 +50,8 @@ class EnginePlayConfig:
     max_frames: int = 7200
     decision_interval: int = 3
     vision: VisionConfig = VisionConfig()
+    # Legacy reporting-only threat diagnostic. These values no longer gate
+    # shooting because firing has no movement or collision side effect.
     shoot_gate_radius: float = 20.0
     shoot_risk_threshold: float = 0.25
     shoot_motion_weight: float = 0.5
@@ -568,7 +570,7 @@ def visible_shoot_gate(
     visible: VisionObservation,
     config: EnginePlayConfig,
 ) -> ShootGateSample:
-    """Gate shooting from the latest delayed local semantic frame only."""
+    """Report local threat intensity without controlling the shoot button."""
 
     frames = np.asarray(visible.local_frames, dtype=np.float32)
     if frames.ndim != 4 or frames.shape[0] == 0 or frames.shape[1] < 3:
@@ -603,12 +605,12 @@ def visible_shoot_gate(
     )
 
 
-def _effective_action(preferred: Action, gate: ShootGateSample) -> Action:
+def _effective_action(preferred: Action) -> Action:
     return Action(
         move_x=preferred.move_x,
         move_y=preferred.move_y,
         slow=preferred.slow,
-        shoot=gate.safe,
+        shoot=True,
         # The live dodge demonstration does not use bombs as a survival aid.
         spell=False,
     )
@@ -783,7 +785,7 @@ def run_engine_play(
         preferred = safety.action
         visible_safety_interventions += int(safety.intervened)
         gate = visible_shoot_gate(visible, config)
-        action = _effective_action(preferred, gate)
+        action = _effective_action(preferred)
         if decision_observer is not None:
             decision_observer(
                 visible,
@@ -832,7 +834,14 @@ def run_engine_play(
                 "prediction_horizon_frames": visible_safety_horizon,
             },
             "action": action.to_dict(),
-            "shoot_gate": asdict(gate),
+            "local_threat_diagnostic": {
+                "low_risk": gate.safe,
+                "risk": gate.risk,
+                "occupancy_peak": gate.occupancy_peak,
+                "occupancy_mass": gate.occupancy_mass,
+                "reporting_only": True,
+                "controls_fire": False,
+            },
         })
 
     engine_terminated = raw.get("terminated") is True
@@ -877,7 +886,7 @@ def run_engine_play(
         and controller.proficiency.suboptimal_action_probability == 0.0
     )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_kind": "live_luastg_ai_demonstration",
         "acceptance_claim": False,
         "implementation_sha256": source_tree_sha256(),
@@ -908,11 +917,18 @@ def run_engine_play(
         "decision_count": len(action_steps),
         "shoot_rate": shot_frames / logical_frames if logical_frames else 0.0,
         "shoot_frames": shot_frames,
-        "safe_shoot_decisions": safe_decisions,
+        "shoot_command_rate": shot_frames / logical_frames if logical_frames else 0.0,
+        "shoot_command_frames": shot_frames,
+        "continuous_fire": True,
+        "low_risk_decisions": safe_decisions,
         "visible_safety_interventions": visible_safety_interventions,
         "visible_safety_checks": visible_safety_checks,
         "visible_safety_probability_skips": visible_safety_probability_skips,
-        "unsafe_shot_frames": 0,
+        "unsafe_shot_frames": None,
+        "unsafe_shot_frames_deprecated": True,
+        "unsafe_shot_frames_definition": (
+            "retired: shooting does not affect movement or collision"
+        ),
         "controller": metadata,
         "engine": {
             "protocol": ping.get("protocol"),
@@ -930,6 +946,8 @@ def run_engine_play(
             "shoot_gate_radius": config.shoot_gate_radius,
             "shoot_risk_threshold": config.shoot_risk_threshold,
             "shoot_motion_weight": config.shoot_motion_weight,
+            "continuous_fire": True,
+            "shoot_gate_controls_fire": False,
             "reset_options": {},
             "authority_state_shield": False,
             "visible_safety_shield": config.visible_safety_shield,

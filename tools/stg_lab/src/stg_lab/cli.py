@@ -2133,9 +2133,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=(72.0, 72.0),
         metavar=("X", "Y"),
     )
-    engine_play_parser.add_argument("--shoot-gate-radius", type=float, default=20.0)
-    engine_play_parser.add_argument("--shoot-risk-threshold", type=float, default=0.25)
-    engine_play_parser.add_argument("--shoot-motion-weight", type=float, default=0.5)
+    engine_play_parser.add_argument(
+        "--shoot-gate-radius",
+        type=float,
+        default=20.0,
+        help="reporting-only local threat radius; firing remains continuous",
+    )
+    engine_play_parser.add_argument(
+        "--shoot-risk-threshold",
+        type=float,
+        default=0.25,
+        help="reporting-only local threat threshold; firing remains continuous",
+    )
+    engine_play_parser.add_argument(
+        "--shoot-motion-weight",
+        type=float,
+        default=0.5,
+        help="reporting-only local threat motion weight; firing remains continuous",
+    )
     engine_play_parser.add_argument(
         "--visible-safety-shield",
         action=argparse.BooleanOptionalAction,
@@ -2206,7 +2221,12 @@ def build_parser() -> argparse.ArgumentParser:
     engine_mpc_parser.add_argument("--boundary-weight", type=float, default=1.0)
     engine_mpc_parser.add_argument("--boss-alignment-weight", type=float, default=1.0)
     engine_mpc_parser.add_argument("--stale-track-frames", type=int, default=48)
-    engine_mpc_parser.add_argument("--shoot-minimum-margin", type=float, default=12.0)
+    engine_mpc_parser.add_argument(
+        "--shoot-minimum-margin",
+        type=float,
+        default=12.0,
+        help="legacy reporting-only threshold; firing remains continuous",
+    )
     engine_mpc_parser.add_argument(
         "--gap-prediction",
         action=argparse.BooleanOptionalAction,
@@ -2306,7 +2326,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--boss-alignment-weight", type=float, default=1.0,
     )
     engine_dagger_parser.add_argument("--stale-track-frames", type=int, default=48)
-    engine_dagger_parser.add_argument("--shoot-minimum-margin", type=float, default=12.0)
+    engine_dagger_parser.add_argument(
+        "--shoot-minimum-margin",
+        type=float,
+        default=12.0,
+        help="legacy reporting-only threshold; firing remains continuous",
+    )
     engine_dagger_parser.add_argument(
         "--teacher-probability",
         type=float,
@@ -2399,7 +2424,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     engine_matrix_parser.add_argument("--stale-track-frames", type=int, default=48)
     engine_matrix_parser.add_argument(
-        "--shoot-minimum-margin", type=float, default=12.0,
+        "--shoot-minimum-margin",
+        type=float,
+        default=12.0,
+        help="legacy reporting-only threshold; firing remains continuous",
     )
     engine_matrix_parser.add_argument(
         "--render", action=argparse.BooleanOptionalAction, default=False,
@@ -2481,13 +2509,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("X", "Y"),
     )
     engine_policy_matrix_parser.add_argument(
-        "--shoot-gate-radius", type=float, default=20.0,
+        "--shoot-gate-radius",
+        type=float,
+        default=20.0,
+        help="reporting-only local threat radius; firing remains continuous",
     )
     engine_policy_matrix_parser.add_argument(
-        "--shoot-risk-threshold", type=float, default=0.25,
+        "--shoot-risk-threshold",
+        type=float,
+        default=0.25,
+        help="reporting-only local threat threshold; firing remains continuous",
     )
     engine_policy_matrix_parser.add_argument(
-        "--shoot-motion-weight", type=float, default=0.5,
+        "--shoot-motion-weight",
+        type=float,
+        default=0.5,
+        help="reporting-only local threat motion weight; firing remains continuous",
     )
     engine_policy_matrix_parser.add_argument(
         "--visible-safety-shield",
@@ -2581,9 +2618,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=(72.0, 72.0),
         metavar=("X", "Y"),
     )
-    engine_train_parser.add_argument("--shoot-gate-radius", type=float, default=20.0)
-    engine_train_parser.add_argument("--shoot-risk-threshold", type=float, default=0.25)
-    engine_train_parser.add_argument("--shoot-motion-weight", type=float, default=0.5)
+    engine_train_parser.add_argument(
+        "--shoot-gate-radius",
+        type=float,
+        default=20.0,
+        help="reporting-only local threat radius; firing remains continuous",
+    )
+    engine_train_parser.add_argument(
+        "--shoot-risk-threshold",
+        type=float,
+        default=0.25,
+        help="reporting-only local threat threshold; firing remains continuous",
+    )
+    engine_train_parser.add_argument(
+        "--shoot-motion-weight",
+        type=float,
+        default=0.5,
+        help="reporting-only local threat motion weight; firing remains continuous",
+    )
     engine_train_parser.add_argument("--trace-directory", type=Path)
     engine_train_parser.add_argument("--strategy-output", type=Path, required=True)
     engine_train_parser.add_argument("--output", type=Path, required=True)
