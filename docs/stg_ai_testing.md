@@ -636,38 +636,74 @@ module. It does not execute arbitrary SR Lua and cannot replace full-engine
 `attack_complete` acceptance.
 
 `game/plugins/SafetyZoneVisualizer` adds an in-engine F7 overlay, or it can be
-enabled at launch with `SR_SAFETY_ZONE_OVERLAY=1`. It grades safe, caution,
-danger, and collision cells from current colliders and linear projections at
-every logical frame from 0 through 24. A 16-unit cell is classified as a whole
-by inflating the player radius by its half diagonal. Red is signed clearance at
-most 0; orange is clearance at most 16 or at least five simultaneous nearby
-threats within 36; yellow is clearance at most 28 or at least three. Clearance
-takes the worst future frame, while density is counted per frame before taking
-its maximum, so threats arriving at different times are not combined into a
-fictitious crowd. Ellipse radii extrapolate only growth: recent rebuilds provide
-the observed growth rate, and `GROUP_INDES` ellipses use at least the Boss #3
-0.7-unit-per-frame guard. The forecast never assumes shrinkage to classify a
-cell as safe. Circles, rotated ellipses, rectangles, and straight lasers are
-supported. Straight lasers are evaluated as tapered polygons from `l1`, `l2`,
-`l3`, and `w`, including THlib laser objects whose generic ellipse fields
-`a=b=0`; curved-laser interiors are not rasterized.
+enabled at launch with `SR_SAFETY_ZONE_OVERLAY=1`. The 16-unit lattice now
+samples each cell center instead of inflating the player radius to certify the
+whole cell. During `engine-mpc-play`, each decision publishes the exact
+`PredictedThreat` records used by EngineMPC, profile margins, adjusted player
+bounds and radius, region-navigation state, and per-frame region-radius
+envelope. The bridge publishes this once per three-frame action hold and the
+overlay directly evaluates stationary samples at future frames 1 through the
+configured horizon. It therefore cannot drift to a different velocity or Boss
+#3 phase model. Runtime telemetry reports `data_source=controller` and the
+consumed revision.
 
-The conservative spatial index registers only cells inside
-classification-relevant projected bounds. The standalone test compares every
-optimized cell with the full scan, covering ellipses, rotated rectangles,
-tapered lasers, a fast bullet crossing between the former three-frame layers,
-expanding forced-region colliders, cell-corner collisions, time-separated
-density, boundary cases, and a 350-bullet field; any lower risk level fails.
-It required 94,585 exact clearance calculations out of 5,880,000 (1.61%) and
-coalesced 672 cells into 45 render rectangles (`45/672`, rectangles/cells)
-while preserving exact per-cell parity. The implementation SHA-256 is
-`b87ff9802e43345a300bca9329572917e9454e8dda62a720ef7b3f471011c4ee`.
-The overlay reads geometry only and does not alter input, RNG, collision, or AI
-memory.
+The strict shortfall boundaries are red for any signed clearance `<= 0`,
+orange for ordinary clearance `0 < margin < 16`, yellow for ordinary clearance
+`16 <= margin < 20`, and green at `margin >= 20`. An active forced region uses
+its separate 8-unit target; `0 < region_margin < 8` is yellow and `>= 8`
+satisfies that layer. Values exactly equal to 16, 20, or 8 have no shortfall.
+Only worst projected clearance controls the grade; threat count and local
+density never upgrade it. The 4-unit emergency margin releases movement
+hysteresis rather than defining another color. Clearance above 20 still earns
+a continuous MPC preference reward up to 48, which four colors cannot encode.
+
+Published ellipses and rectangles already use EngineMPC's conservative
+`max(a,b)` circle, and straight/bent lasers already use its 16--32-unit
+segment-circle cover. Enemy bullets and indestructibles retain the full motion
+horizon; enemies, `GROUP_NONTJT`, and lasers move for at most nine future
+frames, and radius trends stop after six. The controller's actual region anchor
+selects the separate 8-unit layer; without an anchor, indestructibles use the
+ordinary 16/20 margins. Its learned Boss #3 7/28, 0.7-per-frame envelope is
+published directly, including the conservative contraction hold.
+
+Without controller state, the plugin retains a local read-only fallback. It
+mirrors bridge visibility and the same delayed displacement, circle, laser,
+motion-horizon, and radius-horizon rules, but it does not claim the controller's
+learned region phase. F7 mid-episode needs a short local-history warm-up only
+in this fallback mode.
+
+The standalone test includes an independent boundary oracle, density
+counterexamples, the 1..60 frame contract, the 9/60-frame motion split, the
+six-frame radius cap, delayed displacement, laser-circle coverage, controller
+state ingestion, region topology, and indexed/full-scan parity. Its
+deterministic 350-bullet field uses 51,257 exact clearance calculations out of
+14,112,000 possible calls (0.36%) and coalesces 672 cells into 179 render
+rectangles. `SafetyZoneVisualizer.lua` SHA-256 is
+`8f3d3941c5fa644b5391902935dacad5df3b964222d918ccf6300538ede09178`.
+The overlay remains a
+read-only static-field diagnostic. It does not alter input, RNG, collision, AI
+actions, or memory, and it does not reproduce moving-path, boundary, Boss,
+portal, gap-entry, or direction-hysteresis scores.
 
 ### Native renderer performance and metric boundaries
 
-The retained renderer benchmark uses LuaSTG Sub v0.21.129 on native arm64
+The current controller-fed overlay was validated on native arm64 macOS with a
+visible `640x480` OpenGL window, VSync, per-frame rendering, Okuu Stage 5 Boss
+#3, seed `20260730`, and the `bullet-group-expert` profile. The engine returned
+`attack_complete` after 3363 controlled frames, Boss HP changed from 6000 to 0,
+the player had zero deaths, and the shoot-command rate was 1.0. The final
+engine telemetry proves the enabled overlay consumed controller revision 3356
+with horizon 60 and margins 16/20/8. Across 3364 valid display samples, the
+`OBJ >= 300` subset has 2540 samples, median 59.989 FPS, P10 59.765 FPS, and
+minimum 51.364 FPS; peak object count is 504. The report is
+`tools/stg_lab/artifacts/engine-mpc-boss3-controller-overlay-rendered-validation.json`,
+SHA-256
+`399a8f6358703e03bd7bd0ba4d3dbf81cdc65a916685e6d3b88dd4520294b4ac`.
+Artifacts remain ignored working data rather than repository source.
+
+The retained renderer benchmark predates the current 60-frame MPC-aligned
+overlay and is historical performance evidence for the earlier 24-frame
+whole-cell/density revision. It uses LuaSTG Sub v0.21.129 on native arm64
 macOS 15.7.3, an Apple M4 Max with a 40-core GPU, a visible `640x480` window,
 and VSync enabled. Every 1200-sample run uses Stage 5 Boss #3, seed `20260730`,
 `render=true`, `render_every=1`, decision interval 3, observation delay 5, and

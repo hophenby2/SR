@@ -302,6 +302,10 @@ def run_engine_mpc_play(
         decision = controller.select(controller_observation)
         evaluation = _selected_evaluation(decision)
         action = _effective_action(decision)
+        controller_overlay_state = (
+            controller.controller_overlay_state(decision, controller_observation)
+            if config.render else None
+        )
         if decision_observer is not None:
             assert stream_vision is not None
             decision_observer(
@@ -312,10 +316,16 @@ def run_engine_mpc_play(
         source_frame = decision.source_frame
         requested = min(config.decision_interval, config.max_frames - logical_frames)
         advanced = 0
-        for _ in range(requested):
+        for action_frame in range(requested):
             before = raw
             before_frame = _episode_frame(before)
-            response = client.step(action, repeat=1)
+            response = client.step(
+                action,
+                repeat=1,
+                controller_overlay_state=(
+                    controller_overlay_state if action_frame == 0 else None
+                ),
+            )
             raw = _observation(response)
             if stream_vision is not None:
                 stream_vision.push(raw)
@@ -442,6 +452,7 @@ def run_engine_mpc_play(
     if initial_episode_frame is not None and final_episode_frame is not None:
         engine_advanced = max(0, final_episode_frame - initial_episode_frame)
     runtime_identity = ping.get("runtime_identity")
+    overlay_status = raw.get("safety_zone_overlay")
     gap_diagnostics = {
         "enabled": controller.config.gap_prediction_enabled,
         "detected_decision_count": sum(
@@ -525,6 +536,10 @@ def run_engine_mpc_play(
             ),
             "runtime_source_verification": runtime_source_verification,
             "catalog_entry": catalog_entry,
+            "safety_zone_overlay": (
+                dict(overlay_status)
+                if isinstance(overlay_status, Mapping) else None
+            ),
         },
         "outcome_evidence": outcome_evidence,
         "render_performance": render_performance.report(),
@@ -556,6 +571,7 @@ def run_engine_mpc_play(
             "continuous_fire": True,
             "shoot_minimum_margin_controls_fire": False,
             "spell_forced_off": True,
+            "controller_overlay_state_published": config.render,
             "control_inputs": [
                 "delayed_visible_positions",
                 "delayed_visible_collision_shapes",

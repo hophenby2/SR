@@ -277,6 +277,7 @@ function Instance:_disconnect(reason)
     if self.client then
         safe_close(self.client)
     end
+    rawset(_G, "SR_SAFETY_ZONE_CONTROLLER_STATE", nil)
     self.client = nil
     self.rx_partial = ""
     self.tx_buffer = ""
@@ -813,6 +814,7 @@ function Instance:_handle_request(request)
             self:_response(id, false, { error = err })
             return
         end
+        rawset(_G, "SR_SAFETY_ZONE_CONTROLLER_STATE", nil)
         self.action = normalize_action(nil)
         self.pending = { id = id, command = command, remaining = 1, reset = info }
     elseif command == "reset_stage" then
@@ -821,6 +823,7 @@ function Instance:_handle_request(request)
             self:_response(id, false, { error = err })
             return
         end
+        rawset(_G, "SR_SAFETY_ZONE_CONTROLLER_STATE", nil)
         self.action = normalize_action(nil)
         self.pending = { id = id, command = command, remaining = 1, reset = info }
     elseif command == "step" then
@@ -829,6 +832,13 @@ function Instance:_handle_request(request)
             return
         end
         self.action = normalize_action(request.action)
+        if type(request.controller_overlay_state) == "table" then
+            rawset(
+                _G,
+                "SR_SAFETY_ZONE_CONTROLLER_STATE",
+                request.controller_overlay_state
+            )
+        end
         self.pending = {
             id = id,
             command = command,
@@ -1057,6 +1067,14 @@ function Instance:collect_observation()
             object_count = engine_metric("GetnObj"),
         },
     }
+    local visualizer = rawget(_G, "SafetyZoneVisualizer")
+    if type(visualizer) == "table"
+            and type(visualizer.getRuntimeStatus) == "function" then
+        local ok, status = pcall(visualizer.getRuntimeStatus)
+        if ok and type(status) == "table" then
+            observation.safety_zone_overlay = status
+        end
+    end
     for _, key in ipairs({ "l", "r", "b", "t", "pl", "pr", "pb", "pt" }) do
         put_number(observation.world, key, world[key])
     end

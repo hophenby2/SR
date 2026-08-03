@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import inspect
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
@@ -31,6 +31,12 @@ def observation(
         "termination_reason": reason,
         "performance": {"native_fps": 59.5, "object_count": 320},
         "stage": {"card_index": 4},
+        "safety_zone_overlay": {
+            "schema_version": 2,
+            "enabled": True,
+            "data_source": "controller",
+            "controller_revision": frame,
+        },
         "world": {
             "pl": -192.0,
             "pr": 192.0,
@@ -82,6 +88,7 @@ class FakeEngineClient:
         self.final_death = final_death
         self.frame = initial_frame
         self.actions: list[Action] = []
+        self.controller_overlay_states: list[Mapping[str, Any] | None] = []
         self.runtime_source_crc32 = local_runtime_source_fingerprints()[0]
 
     def ping(self):
@@ -114,9 +121,16 @@ class FakeEngineClient:
     def set_rendering(self, enabled: bool, *, every: int = 1):
         return {"render": enabled, "every": every}
 
-    def step(self, action: Action, *, repeat: int = 1):
+    def step(
+        self,
+        action: Action,
+        *,
+        repeat: int = 1,
+        controller_overlay_state: Mapping[str, Any] | None = None,
+    ):
         assert repeat == 1
         self.actions.append(action)
+        self.controller_overlay_states.append(controller_overlay_state)
         self.frame += self.frame_step
         terminated = self.frame >= self.terminate_at
         return {"observation": observation(
@@ -161,6 +175,7 @@ def test_controller_observation_delays_hazards_but_not_own_player() -> None:
     assert visible["own_player_observation_delay"] == 0
     assert visible["own_player_observation_frame"] == 15
     assert "performance" not in visible
+    assert "safety_zone_overlay" not in visible
 
 
 def test_attack_complete_is_strict_live_policy_success() -> None:
@@ -172,7 +187,11 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
         seed=42,
         player="reimu_player",
         controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
-        config=EngineMPCPlayConfig(max_frames=12, observation_delay=0),
+        config=EngineMPCPlayConfig(
+            max_frames=12,
+            observation_delay=0,
+            render=True,
+        ),
     )
 
     assert report["success"] is True
@@ -185,6 +204,12 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
     assert report["passed"] is True
     assert report["engine"]["runtime_source_verification"]["matched"] is True
     assert report["engine"]["runtime_source_verification"]["source_count"] == 18
+    assert report["engine"]["safety_zone_overlay"] == {
+        "schema_version": 2,
+        "enabled": True,
+        "data_source": "controller",
+        "controller_revision": 6,
+    }
     assert "recorded_prefix" not in report
     assert report["schema_version"] == 3
     assert all(item["control_source"] == "live_mpc" for item in report["decisions"])
@@ -217,7 +242,20 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
     assert report["continuous_fire"] is True
     assert report["shoot_frames"] == report["frames"]
     assert report["shoot_rate"] == 1.0
+    assert report["config"]["controller_overlay_state_published"] is True
     assert all(action.shoot for action in client.actions)
+    assert [state is not None for state in client.controller_overlay_states] == [
+        True,
+        False,
+        False,
+        True,
+        False,
+        False,
+    ]
+    first_overlay_state = client.controller_overlay_states[0]
+    assert first_overlay_state is not None
+    assert first_overlay_state["schema_version"] == 1
+    assert first_overlay_state["region_navigation_active"] is False
 
 
 def test_predicted_collision_never_stops_continuous_fire() -> None:
@@ -248,6 +286,8 @@ def test_predicted_collision_never_stops_continuous_fire() -> None:
     assert report["unsafe_shot_frames"] is None
     assert report["unsafe_shot_frames_deprecated"] is True
     assert report["config"]["shoot_minimum_margin_controls_fire"] is False
+    assert report["config"]["controller_overlay_state_published"] is False
+    assert all(state is None for state in client.controller_overlay_states)
 
 
 def test_engine_mpc_rejects_stale_runtime_lua_before_reset() -> None:

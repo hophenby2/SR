@@ -27,6 +27,7 @@ def controller_observation(
 
     result = dict(delayed)
     result.pop("performance", None)
+    result.pop("safety_zone_overlay", None)
     player = current.get("player")
     if isinstance(player, Mapping):
         result["player"] = dict(player)

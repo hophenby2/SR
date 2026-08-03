@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import math
 from typing import Any
 
@@ -119,6 +120,58 @@ def test_linear_bullet_prediction_avoids_neutral_collision() -> None:
     assert (decision.action.move_x, decision.action.move_y) != (0, 0)
     assert decision.action.spell is False
     assert decision.threats[0].at(12)[:2] == (0.0, 0.0)
+
+
+def test_controller_overlay_state_uses_live_decision_and_phase_envelope() -> None:
+    teacher = EngineMPC(MPCConfig(observation_delay=5, horizon_frames=36))
+    observed = observation(
+        12,
+        bullets=[bullet(7, 20.0, 40.0, dx=1.5, dy=-2.0)],
+    )
+    decision = replace(
+        teacher.select(observed),
+        region_anchor=(24.0, -36.0),
+    )
+    radius_after_calls: list[int] = []
+
+    def radius_after(future_frame: int) -> float | None:
+        radius_after_calls.append(future_frame)
+        return None if future_frame == 8 else 7.0 + future_frame * 0.1
+
+    teacher._region_phase.radius_after = radius_after  # type: ignore[method-assign]
+    state = teacher.controller_overlay_state(decision, observed)
+
+    assert state["schema_version"] == 1
+    assert state["revision"] == state["source_frame"] == decision.source_frame
+    assert state["horizon_frames"] == 36
+    assert state["future_start"] == 1
+    assert state["danger_margin"] == teacher.config.danger_margin_target
+    assert state["safe_margin"] == teacher.config.safe_margin_target
+    assert state["region_safe_margin"] == teacher.config.region_safe_margin_target
+    assert state["region_navigation_active"] is True
+    assert state["player_radius"] == 0.5
+    assert state["bounds"] == {
+        "left": -92.0,
+        "right": 92.0,
+        "bottom": -84.0,
+        "top": 68.0,
+    }
+    assert radius_after_calls == list(range(6, 42))
+    assert len(state["region_phase_radii"]) == 36
+    assert state["region_phase_radii"][2] is None
+    assert state["threats"] == [{
+        "key": decision.threats[0].key,
+        "source": decision.threats[0].source,
+        "x": decision.threats[0].x,
+        "y": decision.threats[0].y,
+        "vx": decision.threats[0].vx,
+        "vy": decision.threats[0].vy,
+        "radius": decision.threats[0].radius,
+        "radius_rate": decision.threats[0].radius_rate,
+        "radius_rate_horizon": decision.threats[0].radius_rate_horizon,
+        "motion_horizon": decision.threats[0].motion_horizon,
+    }]
+    json.dumps(state, allow_nan=False)
 
 
 def test_straight_laser_is_covered_without_duplicate_object_threat() -> None:

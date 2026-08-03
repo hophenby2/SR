@@ -912,35 +912,67 @@ nonempty `480x560` 32-bit BMPs. This partial runtime does not execute arbitrary 
 and cannot replace native LuaSTG `attack_complete` training or acceptance.
 
 The engine installation's `game/plugins/SafetyZoneVisualizer` plugin toggles
-with `F7`, or starts enabled with `SR_SAFETY_ZONE_OVERLAY=1`. It grades safe,
-caution, danger, and collision cells from current colliders and linear
-projections at every logical frame from 0 through 24. Growing indestructible
-ellipses use the larger of their observed nonnegative radius rate and the
-Boss #3 guard of 0.7 units per frame; the overlay never assumes shrinkage will
-make a future cell safe. A 16-unit cell is classified
-as a whole by inflating the player radius by its half diagonal. Red is signed
-clearance at most 0; orange is clearance at most 16 or at least five
-simultaneous nearby threats within 36; yellow is clearance at most 28 or at
-least three. Clearance takes the worst future layer, while density is counted
-within each layer before taking its maximum, so threats arriving at different
-times are not combined into a fictitious crowd. Circles, rotated ellipses,
-rectangles, and straight lasers are supported. Straight-laser clearance uses
-the tapered polygon defined by `l1`, `l2`, `l3`, and `w`, including THlib laser
-objects whose generic ellipse collider reports `a=b=0`; curved-laser interiors
-are not rasterized. A standalone parity test compares every optimized cell
-with the original full scan across ellipses, rotated rectangles, tapered
-lasers, fast projections, cell-corner collisions, time-separated density,
-boundary cases, and a 350-bullet field. It performed 94,585 exact clearance
-calculations out of 5,880,000 (1.61%) and coalesced 672 cells into 45 render
-rectangles (`45/672`, rectangles/cells) without changing any cell's risk level.
-`SafetyZoneVisualizer.lua` SHA-256 is
-`b87ff9802e43345a300bca9329572917e9454e8dda62a720ef7b3f471011c4ee`.
-The overlay is diagnostic and read-only: it does not change collision,
-objects, input, RNG, AI actions, or memory.
+with `F7`, or starts enabled with `SR_SAFETY_ZONE_OVERLAY=1`. Its 16-unit
+display cells now sample their centers rather than adding a half-cell collision
+guard. During `engine-mpc-play`, each decision publishes the exact
+`PredictedThreat` records used by EngineMPC, current margins, adjusted player
+bounds and radius, region-navigation state, and per-frame region-radius
+envelope. The bridge publishes this once per three-frame action hold. The
+overlay therefore evaluates stationary samples at future frames 1 through the
+configured horizon without independently re-inferring motion or Boss #3 phase.
+Its runtime status exposes `data_source=controller` and the consumed revision.
+
+The levels mirror current live MPC shortfalls. Red means any signed clearance
+`<= 0`; ordinary threats are orange at `0 < margin < 16`, yellow at
+`16 <= margin < 20`, and green at `margin >= 20`. Active forced-region
+geometry uses a separate 8-unit target, with `0 < region_margin < 8` yellow.
+Equality at 16, 20, or 8 satisfies that target. Threat count and density do not
+upgrade the level. The 4-unit emergency value only releases movement
+hysteresis, while green clearances still receive a continuous soft reward up
+to 48.
+
+Published ellipses and rectangles already use EngineMPC's conservative
+`max(a,b)` circle, while straight and bent lasers already use its 16--32-unit
+segment-circle cover. Bullets and indestructibles retain the full motion
+horizon; enemies, `GROUP_NONTJT`, and lasers move for at most nine future
+frames, and radius trends stop after six. The controller's actual region anchor
+selects the separate 8-unit layer; its learned Boss #3 envelope is published
+directly, including the conservative contraction hold.
+
+Without controller state the plugin falls back to local, read-only sampling.
+That path mirrors bridge visibility, five-frame delay, three-frame displacement
+estimation and the same geometry/horizon rules, but does not claim the
+controller's learned region phase. Only this fallback needs a short history
+warm-up when F7 is enabled mid-episode.
+
+The standalone test contains independent strict-boundary, density-negative,
+1..60 timing, delayed-motion, laser-cover, controller-ingestion,
+region-topology, indexed/full-scan, and F7 checks. Its 350-bullet fixture
+performs 51,257 of 14,112,000 possible clearance calculations (0.36%) and
+coalesces 672 cells into 179 render rectangles. `SafetyZoneVisualizer.lua`
+SHA-256 is
+`8f3d3941c5fa644b5391902935dacad5df3b964222d918ccf6300538ede09178`.
+The overlay remains read-only and visualizes a static point field, not MPC's
+moving trajectory, boundary, Boss, portal, gap-entry, or hysteresis scores.
 
 ### Native renderer benchmark and metric boundaries
 
-The retained benchmark uses LuaSTG Sub v0.21.129 on native arm64 macOS 15.7.3,
+The current controller-fed overlay was validated on native arm64 macOS with a
+visible `640x480` OpenGL window, VSync, per-frame rendering, Okuu Stage 5 Boss
+#3, seed `20260730`, and the `bullet-group-expert` profile. The engine returned
+`attack_complete` after 3363 controlled frames, reduced Boss HP from 6000 to 0,
+recorded zero player deaths, and maintained a 1.0 shoot-command rate. Final
+engine telemetry proves the enabled overlay consumed controller revision 3356
+with horizon 60 and margins 16/20/8. The `OBJ >= 300` subset contains 2540 of
+3364 valid samples, with median 59.989 FPS, P10 59.765 FPS, minimum 51.364 FPS,
+and peak object count 504. The local ignored report is
+`artifacts/engine-mpc-boss3-controller-overlay-rendered-validation.json`,
+SHA-256
+`399a8f6358703e03bd7bd0ba4d3dbf81cdc65a916685e6d3b88dd4520294b4ac`.
+
+The retained benchmark predates the current 60-frame MPC-aligned overlay and
+is historical evidence for the earlier 24-frame whole-cell/density revision.
+It uses LuaSTG Sub v0.21.129 on native arm64 macOS 15.7.3,
 an Apple M4 Max with a 40-core GPU, a visible `640x480` window, and VSync. Each
 1200-sample run uses Stage 5 Boss #3, seed `20260730`, per-frame rendering,
 decision interval 3, observation delay 5, and the same live MPC settings.

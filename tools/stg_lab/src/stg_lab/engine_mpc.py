@@ -4851,6 +4851,60 @@ class EngineMPC:
             threats=threats,
         )
 
+    def controller_overlay_state(
+        self,
+        decision: MPCDecision,
+        observation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Expose the live planner geometry without duplicating its inference."""
+
+        observation = _unwrap_observation(observation)
+        player_radius = self._player(
+            observation,
+            self.config.observation_delay,
+        )[2]
+        left, right, bottom, top = self._bounds(observation, player_radius)
+        region_phase_radii = [
+            self._region_phase.radius_after(
+                self.config.observation_delay + future_frame,
+            )
+            for future_frame in range(1, self.config.horizon_frames + 1)
+        ]
+        return {
+            "schema_version": 1,
+            "revision": decision.source_frame,
+            "source_frame": decision.source_frame,
+            "horizon_frames": self.config.horizon_frames,
+            "future_start": 1,
+            "danger_margin": self.config.danger_margin_target,
+            "safe_margin": self.config.safe_margin_target,
+            "region_safe_margin": self.config.region_safe_margin_target,
+            "region_navigation_active": decision.region_anchor is not None,
+            "player_radius": player_radius,
+            "bounds": {
+                "left": left,
+                "right": right,
+                "bottom": bottom,
+                "top": top,
+            },
+            "threats": [
+                {
+                    "key": threat.key,
+                    "source": threat.source,
+                    "x": threat.x,
+                    "y": threat.y,
+                    "vx": threat.vx,
+                    "vy": threat.vy,
+                    "radius": threat.radius,
+                    "radius_rate": threat.radius_rate,
+                    "radius_rate_horizon": threat.radius_rate_horizon,
+                    "motion_horizon": threat.motion_horizon,
+                }
+                for threat in decision.threats
+            ],
+            "region_phase_radii": region_phase_radii,
+        }
+
     def observe(self, observation: Mapping[str, Any]) -> int:
         """Update visible tracks and external phase memory without beam search."""
 

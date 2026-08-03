@@ -108,7 +108,19 @@ class EngineClient:
             raise ValueError("every must be an integer in [1, 600]")
         return self.request("display", render=enabled, every=every)
 
-    def step(self, action: Action, *, repeat: int = 1) -> dict[str, Any]:
+    def step(
+        self,
+        action: Action,
+        *,
+        repeat: int = 1,
+        controller_overlay_state: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if repeat <= 0:
             raise ValueError("repeat must be positive")
-        return self.request("step", action=action.to_dict(), repeat=repeat)
+        payload: dict[str, Any] = {
+            "action": action.to_dict(),
+            "repeat": repeat,
+        }
+        if controller_overlay_state is not None:
+            payload["controller_overlay_state"] = dict(controller_overlay_state)
+        return self.request("step", **payload)

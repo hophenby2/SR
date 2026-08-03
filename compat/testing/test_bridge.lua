@@ -267,8 +267,21 @@ check(encoded_values[#encoded_values].catalog.stages[2].completion_reason == "st
     "catalog stage completion contract mismatch")
 encoded_values = {}
 
+SafetyZoneVisualizer = {
+    getRuntimeStatus = function()
+        return {
+            schema_version = 2,
+            enabled = true,
+            data_source = "controller",
+            controller_revision = 4,
+        }
+    end,
+}
+SR_SAFETY_ZONE_CONTROLLER_STATE = { stale = true }
 FrameFunc()
 check(old_frame_count == 1, "reset must advance exactly one frame")
+check(SR_SAFETY_ZONE_CONTROLLER_STATE == nil,
+    "attack reset did not clear stale controller overlay state")
 check(seed_value == 42, "reset seed was not applied")
 check(lstg.var.sc_pr_data.scene_index == 4, "attack ordinal did not resolve to card index")
 check(lstg.var.sc_index == nil, "direct spell-practice reset must not leave a zero menu index")
@@ -283,6 +296,9 @@ check(encoded_values[#encoded_values].observation.performance.native_fps == 47.5
     "native FPS telemetry mismatch")
 check(encoded_values[#encoded_values].observation.performance.object_count == 123,
     "native object-count telemetry mismatch")
+check(encoded_values[#encoded_values].observation.safety_zone_overlay.data_source
+        == "controller",
+    "safety-zone overlay runtime status missing")
 check(getmetatable(encoded_values[#encoded_values].observation.nontjt_enemies) == fake_cjson.array_mt,
     "empty observation arrays must retain JSON array identity")
 
@@ -290,9 +306,18 @@ requests.STEP = {
     id = 2, command = "step",
     action = { move_x = 1, move_y = -1, slow = true, shoot = true, spell = false },
     ["repeat"] = 3,
+    controller_overlay_state = {
+        schema_version = 1,
+        revision = 4,
+        region_navigation_active = true,
+    },
 }
 client.input[#client.input + 1] = "STEP"
 FrameFunc()
+local controller_overlay_state = SR_SAFETY_ZONE_CONTROLLER_STATE
+check(type(controller_overlay_state) == "table"
+        and controller_overlay_state.revision == 4,
+    "step did not publish controller overlay state")
 check(#encoded_values == 1, "step responded before repeat completed")
 FrameFunc()
 check(#encoded_values == 1, "step responded before final repeat")
@@ -303,6 +328,15 @@ check(encoded_values[#encoded_values].id == 2, "step response id mismatch")
 check(encoded_values[#encoded_values].observation.episode_frame == 4, "episode frame mismatch")
 
 instance:_handle_request({
+    id = 19, command = "step",
+    action = { move_x = 0, move_y = 0, shoot = true },
+    ["repeat"] = 1,
+})
+check(SR_SAFETY_ZONE_CONTROLLER_STATE == controller_overlay_state,
+    "step without overlay state discarded the previous controller state")
+FrameFunc()
+
+instance:_handle_request({
     id = 20, command = "reset_stage", stage = "Stage 4@Lunatic",
     seed = 77, player = "reimu_player",
     options = {
@@ -311,6 +345,8 @@ instance:_handle_request({
         player_ghost = false,
     },
 })
+check(SR_SAFETY_ZONE_CONTROLLER_STATE == nil,
+    "stage reset did not clear controller overlay state")
 FrameFunc()
 check(instance.episode_kind == "stage", "stage reset did not set episode kind")
 check(instance.expected_stage == "Stage 4@Lunatic", "stage reset expected-stage mismatch")
@@ -397,7 +433,10 @@ groups[GROUP_ENEMY] = {}
 check(instance:_check_stop(instance:collect_observation()) == "attack_complete",
     "empty authoritative enemy pool did not finish the attack")
 groups[GROUP_ENEMY] = { enemy_object }
+SR_SAFETY_ZONE_CONTROLLER_STATE = { revision = 99 }
 instance:_disconnect("closed")
+check(SR_SAFETY_ZONE_CONTROLLER_STATE == nil,
+    "disconnect did not clear stale controller overlay state")
 check(GetKeyState(99) == true, "native key input did not resume after disconnect")
 RenderFunc()
 check(old_render_count == 5, "rendering did not resume after disconnect")
