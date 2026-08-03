@@ -155,6 +155,9 @@ def controller_factory_from_template(controller: VisibleController) -> Controlle
             controller.model,
             controller.scenario_key,
             device=controller.device,
+            proficiency=controller.proficiency,
+            seed=controller.seed,
+            scenario_vocabulary=controller.scenario_vocabulary,
         )
     raise TypeError(f"cannot clone controller type {type(controller).__name__}")
 
@@ -244,7 +247,24 @@ def _strict_episode_evidence(
     reason = report.get("engine_termination_reason") if terminated else None
     if terminated and reason is None:
         reason = report.get("termination_reason")
-    strict_success = terminated and reason == "attack_complete"
+    outcome_evidence = report.get("outcome_evidence")
+    outcome_evidence = outcome_evidence if isinstance(outcome_evidence, Mapping) else {}
+    final_player = outcome_evidence.get("final_player")
+    final_player = final_player if isinstance(final_player, Mapping) else {}
+    death_value = final_player.get("death")
+    final_death = (
+        float(death_value)
+        if (
+            not isinstance(death_value, bool)
+            and isinstance(death_value, (int, float))
+            and math.isfinite(float(death_value))
+        ) else None
+    )
+    strict_success = (
+        terminated
+        and reason == "attack_complete"
+        and final_death == 0.0
+    )
     action_steps = report.get("action_steps")
     if not isinstance(action_steps, list):
         action_steps = []
@@ -261,6 +281,7 @@ def _strict_episode_evidence(
         "runner_success_matches_strict_metric": (report.get("success") is True) == strict_success,
         "terminated": terminated,
         "termination_reason": reason if terminated else "max_frames",
+        "final_death": final_death,
         "frames": report.get("frames"),
         "decision_count": report.get("decision_count"),
         "shoot_rate": report.get("shoot_rate"),
@@ -401,7 +422,10 @@ def run_engine_training(
         "implementation_sha256": source_tree_sha256(),
         "search_completed": True,
         "passed": passed,
-        "success_criterion": "terminated=true and engine_termination_reason=attack_complete",
+        "success_criterion": (
+            "terminated=true, engine_termination_reason=attack_complete, and "
+            "outcome_evidence.final_player.death=0"
+        ),
         "selection_metric": "maximum strict training successes; generation order breaks ties",
         "scenario": scenario,
         "attack": int(attack),

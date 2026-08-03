@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,13 +13,13 @@ from stg_lab.metrics import EpisodeMetrics
 from stg_lab.training import Demonstrations, TrainingMetrics
 
 
-def demonstrations(episode_ids=(0, 1)) -> Demonstrations:
+def demonstrations(episode_ids=(0, 1), *, steps: int = 2) -> Demonstrations:
     samples = len(episode_ids)
     return Demonstrations(
-        global_frames=np.zeros((samples, 2, 6, 8, 8), dtype=np.float32),
-        local_frames=np.zeros((samples, 2, 6, 8, 8), dtype=np.float32),
-        actions=np.zeros((samples, 2), dtype=np.int64),
-        risks=np.zeros((samples, 2), dtype=np.float32),
+        global_frames=np.zeros((samples, steps, 6, 8, 8), dtype=np.float32),
+        local_frames=np.zeros((samples, steps, 6, 8, 8), dtype=np.float32),
+        actions=np.zeros((samples, steps), dtype=np.int64),
+        risks=np.zeros((samples, steps), dtype=np.float32),
         episode_ids=np.asarray(episode_ids, dtype=np.int64),
     )
 
@@ -185,6 +186,7 @@ def test_train_consumes_demonstration_archive(monkeypatch, tmp_path, capsys) -> 
     assert called["output"] == checkpoint
     assert called["policy_config"].channels == 6
     assert called["policy_config"].feature_size == 12
+    assert called["policy_config"].memory_size == 4
     assert called["policy_config"].inference_mode == "stream"
     assert called["training_config"].epochs == 1
     assert called["training_config"].class_balance is True
@@ -195,6 +197,444 @@ def test_train_consumes_demonstration_archive(monkeypatch, tmp_path, capsys) -> 
     assert summary["run"]["run_kind"] == "dataset_training"
     assert summary["run"]["acceptance_claim"] is False
     assert summary["final_metrics"]["action_accuracy"] == 0.75
+
+
+def test_stateful_train_disables_handwritten_inputs(monkeypatch, tmp_path, capsys) -> None:
+    import stg_lab.stateful_training as stateful_training
+
+    demos_path = tmp_path / "native.npz"
+    demonstrations((0, 0, 1, 1, 2, 2)).save(demos_path)
+    called = {}
+
+    def fake_train(loaded, *, policy_config, training_config, output, training_data):
+        called.update(
+            loaded=loaded,
+            policy_config=policy_config,
+            training_config=training_config,
+            output=output,
+            training_data=training_data,
+        )
+        return object(), [TrainingMetrics(1, 0.4, 0.5, 0.8, 0.1)]
+
+    monkeypatch.setattr(
+        stateful_training,
+        "train_stateful_behavior_cloning",
+        fake_train,
+    )
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--checkpoint", str(tmp_path / "stream.pt"),
+        "--metrics", str(tmp_path / "metrics.json"),
+        "--stateful-tbptt",
+        "--tbptt-chunk-length", "17",
+        "--validation-episode-id", "1",
+        "--validation-episode-id", "2",
+        "--no-scenario-memory-conditioning",
+        "--no-proficiency-conditioning",
+        "--no-restore-best-validation",
+        "--movement-onset-weight", "5",
+        "--direction-change-weight", "2.5",
+        "--exact-action-loss-weight", "0.25",
+        "--direction-loss-weight", "1.0",
+        "--speed-loss-weight", "0.2",
+        "--direction-consistency-weight", "0.1",
+        "--future-visual-loss-weight", "0.35",
+        "--future-visual-horizons", "2", "4", "8",
+        "--episode-balanced",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 0
+
+    assert called["policy_config"].inference_mode == "stream"
+    assert called["policy_config"].memory_size == 0
+    assert called["policy_config"].proficiency_size == 0
+    assert called["training_config"].chunk_length == 17
+    assert called["training_config"].validation_episode_ids == (1, 2)
+    assert called["training_config"].restore_best_validation is False
+    assert called["training_config"].movement_onset_weight == 5.0
+    assert called["training_config"].direction_change_weight == 2.5
+    assert called["training_config"].exact_action_loss_weight == 0.25
+    assert called["training_config"].direction_loss_weight == 1.0
+    assert called["training_config"].speed_loss_weight == 0.2
+    assert called["training_config"].direction_consistency_weight == 0.1
+    assert called["training_config"].future_visual_loss_weight == 0.35
+    assert called["training_config"].future_visual_horizons == (2, 4, 8)
+    assert called["training_config"].episode_balanced is True
+    assert called["loaded"].memory is None
+    assert called["loaded"].proficiency is None
+    assert called["training_data"]["scenario_memory_input"] is False
+    assert called["training_data"]["proficiency_conditioning_input"] is False
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["training_mode"] == "episode_stateful_tbptt"
+    assert summary["stateful_loss_controls"] == {
+        "movement_onset_weight": 5.0,
+        "direction_change_weight": 2.5,
+        "episode_balanced": True,
+        "exact_action_loss_weight": 0.25,
+        "direction_loss_weight": 1.0,
+        "speed_loss_weight": 0.2,
+        "direction_consistency_weight": 0.1,
+        "previous_action_dropout_probability": 0.0,
+        "future_visual_loss_weight": 0.35,
+        "future_visual_horizons": [2, 4, 8],
+    }
+
+
+def test_correction_only_train_routes_action_and_risk_supervision(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    import stg_lab.stateful_training as stateful_training
+
+    demos_path = tmp_path / "corrections.npz"
+    values = demonstrations((0, 0, 1, 1))
+    values.supervision_mask = np.zeros_like(values.actions, dtype=np.bool_)
+    values.supervision_mask[1, -1] = True
+    values.supervision_mask[3, -1] = True
+    values.save(demos_path)
+    called = {}
+
+    def fake_train(loaded, *, policy_config, training_config, output, training_data):
+        called.update(
+            loaded=loaded,
+            training_config=training_config,
+        )
+        return object(), [TrainingMetrics(1, 0.4, 0.5, 0.8, 0.1)]
+
+    monkeypatch.setattr(
+        stateful_training,
+        "train_stateful_behavior_cloning",
+        fake_train,
+    )
+
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--checkpoint", str(tmp_path / "corrections.pt"),
+        "--stateful-tbptt",
+        "--correction-only",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 0
+
+    assert called["training_config"].correction_only is True
+    np.testing.assert_array_equal(
+        called["loaded"].supervision_mask,
+        values.supervision_mask,
+    )
+    controls = json.loads(capsys.readouterr().out)["stateful_loss_controls"]
+    assert controls["correction_only"] is True
+    assert controls["action_supervision"] == "supervision_mask"
+    assert controls["risk_supervision"] == "all_decisions"
+
+
+def test_correction_only_train_requires_stateful_tbptt(tmp_path, capsys) -> None:
+    demos_path = tmp_path / "corrections.npz"
+    values = demonstrations((0, 0, 1, 1))
+    values.supervision_mask = np.ones_like(values.actions, dtype=np.bool_)
+    values.save(demos_path)
+
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--correction-only",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 2
+    assert "require --stateful-tbptt" in capsys.readouterr().err
+
+
+def test_train_rejects_nonzero_memory_with_scenario_conditioning_disabled(
+    tmp_path, capsys,
+) -> None:
+    demos_path = tmp_path / "native.npz"
+    demonstrations((0, 0, 1, 1)).save(demos_path)
+
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--no-scenario-memory-conditioning",
+        "--memory-size", "4",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 2
+    assert "requires --memory-size 0" in capsys.readouterr().err
+
+
+def test_train_rejects_memory_width_that_disagrees_with_archive(
+    tmp_path, capsys,
+) -> None:
+    demos_path = tmp_path / "conditioned.npz"
+    conditioned = demonstrations((0, 0, 1, 1))
+    conditioned.memory = np.zeros((*conditioned.actions.shape, 4), dtype=np.float32)
+    conditioned.save(demos_path)
+
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--memory-size", "3",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 2
+    assert "does not match the demonstration memory width" in capsys.readouterr().err
+
+
+def test_stateful_train_can_continue_the_complete_recurrent_policy(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab.policy import PolicyConfig
+    import stg_lab.stateful_training as stateful_training
+
+    demos_path = tmp_path / "native.npz"
+    parent_path = tmp_path / "parent.pt"
+    parent_path.write_bytes(b"parent")
+    demonstrations((0, 0, 1, 1)).save(demos_path)
+    parent = type("Parent", (), {})()
+    parent.config = PolicyConfig(
+        channels=6,
+        feature_size=12,
+        recurrent_size=16,
+        memory_size=0,
+        proficiency_size=0,
+        inference_mode="stream",
+    )
+    called = {}
+
+    monkeypatch.setattr(
+        cli,
+        "_load_checkpoint",
+        lambda path, device: (
+            parent,
+            {"version": 3, "policy_config": asdict(parent.config), "history": []},
+        ),
+    )
+
+    def fake_train(
+        loaded, *, model, policy_config, training_config, output, training_data,
+    ):
+        called.update(
+            model=model,
+            policy_config=policy_config,
+            training_data=training_data,
+        )
+        return model, [TrainingMetrics(1, 0.4, 0.5, 0.8, 0.1)]
+
+    monkeypatch.setattr(
+        stateful_training,
+        "train_stateful_behavior_cloning",
+        fake_train,
+    )
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--checkpoint", str(tmp_path / "continued.pt"),
+        "--init-checkpoint", str(parent_path),
+        "--stateful-tbptt",
+        "--validation-episode-id", "1",
+        "--feature-size", "12",
+        "--recurrent-size", "16",
+        "--memory-size", "0",
+        "--no-scenario-memory-conditioning",
+        "--no-proficiency-conditioning",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 0
+
+    assert called["model"] is parent
+    assert called["training_data"]["initialization"] == "complete_policy_state"
+    assert called["training_data"]["parent_checkpoint"] == str(parent_path)
+    assert len(called["training_data"]["parent_checkpoint_sha256"]) == 64
+    assert json.loads(capsys.readouterr().out)["epochs"] == 1
+
+
+def test_full_checkpoint_continuation_rejects_permuted_context_metadata() -> None:
+    parent = SimpleNamespace(
+        scenario_vocabulary=("<unknown>", "attack:a#1"),
+        previous_action_size=18,
+        previous_action_offset=2,
+    )
+
+    cli._validate_initial_policy_context(
+        parent,
+        ("<unknown>", "attack:a#1"),
+        18,
+        2,
+    )
+    with np.testing.assert_raises_regex(cli.CLIError, "context metadata"):
+        cli._validate_initial_policy_context(
+            parent,
+            ("<unknown>", "attack:b#1"),
+            18,
+            2,
+        )
+
+
+def test_merge_demos_renumbers_episode_groups(tmp_path, capsys) -> None:
+    first = tmp_path / "first.npz"
+    second = tmp_path / "second.npz"
+    output = tmp_path / "merged.npz"
+    first_values = demonstrations((4, 4, 9))
+    first_values.supervision_mask = np.asarray(
+        ((True, False), (False, True), (True, False)),
+        dtype=np.bool_,
+    )
+    first_values.save(first)
+    demonstrations((12, 12)).save(second)
+
+    assert cli.main([
+        "merge-demos",
+        str(first),
+        str(second),
+        "--output", str(output),
+    ]) == 0
+
+    merged = Demonstrations.load(output)
+    np.testing.assert_array_equal(merged.episode_ids, (0, 0, 1, 2, 2))
+    np.testing.assert_array_equal(
+        merged.supervision_mask,
+        (
+            (True, False),
+            (False, True),
+            (True, False),
+            (True, True),
+            (True, True),
+        ),
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["samples"] == 5
+    assert report["episode_groups"] == 3
+    assert report["action_supervision"] == "supervision_mask"
+    assert report["supervised_labels"] == 7
+
+
+def test_contextualize_demos_uses_strict_manifest_episode_order(
+    tmp_path, capsys,
+) -> None:
+    source = tmp_path / "source.npz"
+    source_manifest = tmp_path / "source.manifest.json"
+    output = tmp_path / "context.npz"
+    output_manifest = tmp_path / "context.manifest.json"
+    demonstrations((7, 7, 9), steps=1).save(source)
+    source_manifest.write_text(json.dumps({
+        "accepted_episodes": [
+            {
+                "episode_kind": "attack",
+                "scenario": "okuu:Lunatic",
+                "attack": 3,
+                "seed": 10,
+                "profile": "teacher",
+            },
+            {
+                "episode_kind": "stage",
+                "scenario": "Stage 1@Normal",
+                "attack": None,
+                "seed": 11,
+                "profile": "teacher",
+            },
+        ],
+    }), encoding="utf-8")
+
+    assert cli.main([
+        "contextualize-demos",
+        "--demos", str(source),
+        "--source-manifest", str(source_manifest),
+        "--output", str(output),
+        "--manifest", str(output_manifest),
+        "--previous-action-conditioning",
+    ]) == 0
+
+    conditioned = Demonstrations.load(output)
+    assert conditioned.memory.shape == (3, 1, 21)
+    np.testing.assert_array_equal(conditioned.memory[0, 0, :3], (0, 1, 0))
+    np.testing.assert_array_equal(conditioned.memory[2, 0, :3], (0, 0, 1))
+    report = json.loads(output_manifest.read_text(encoding="utf-8"))
+    assert report["scenario_vocabulary"] == [
+        "<unknown>",
+        "attack:okuu:Lunatic#3",
+        "stage:Stage 1@Normal",
+    ]
+    assert report["previous_action_offset"] == 3
+    assert report["previous_action_size"] == 18
+    assert json.loads(capsys.readouterr().out)["episode_groups"] == 2
+
+
+def test_relabel_dagger_command_writes_corrective_archive_and_manifest(
+    tmp_path, capsys,
+) -> None:
+    source = tmp_path / "teacher.npz"
+    report_path = tmp_path / "dagger.json"
+    output = tmp_path / "corrective.npz"
+    manifest_path = tmp_path / "corrective.manifest.json"
+    demonstrations((0,), steps=1).save(source)
+    report_path.write_text(json.dumps({
+        "run_kind": "live_luastg_native_dagger",
+        "implementation_sha256": "b" * 64,
+        "success": True,
+        "passed": True,
+        "episode_kind": "stage",
+        "scenario": "Stage 1@Normal",
+        "attack": None,
+        "seed": 42,
+        "terminated": True,
+        "termination_reason": "stage_complete",
+        "engine_termination_reason": "stage_complete",
+        "decision_count": 1,
+        "teacher_interventions": 0,
+        "student_teacher_agreements": 0,
+        "outcome_evidence": {"final_player": {"death": 0}},
+        "decisions": [{
+            "decision": 0,
+            "teacher_action": {"discrete": 0},
+            "student_action": {"discrete": 8},
+            "executed_action": {"discrete": 8},
+            "teacher_intervened": False,
+            "student_teacher_agreement": False,
+        }],
+    }), encoding="utf-8")
+
+    assert cli.main([
+        "relabel-dagger",
+        "--demos", str(source),
+        "--dagger-report", str(report_path),
+        "--output", str(output),
+        "--manifest", str(manifest_path),
+        "--interventions-only",
+    ]) == 0
+
+    np.testing.assert_array_equal(Demonstrations.load(output).actions, ((8,),))
+    np.testing.assert_array_equal(
+        Demonstrations.load(output).supervision_mask,
+        ((False,),),
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["run_kind"] == "corrective_dagger_relabel"
+    assert manifest["replaced_labels"] == 1
+    assert manifest["action_supervision"]["mode"] == (
+        "teacher_interventions_only"
+    )
+    assert json.loads(capsys.readouterr().out) == manifest
+
+
+def test_relabel_dagger_command_reports_strict_validation_error(
+    tmp_path, capsys,
+) -> None:
+    source = tmp_path / "teacher.npz"
+    report_path = tmp_path / "failed.json"
+    demonstrations((0,), steps=1).save(source)
+    report_path.write_text(json.dumps({
+        "run_kind": "live_luastg_native_dagger",
+        "success": False,
+        "passed": False,
+    }), encoding="utf-8")
+
+    assert cli.main([
+        "relabel-dagger",
+        "--demos", str(source),
+        "--dagger-report", str(report_path),
+        "--output", str(tmp_path / "output.npz"),
+        "--manifest", str(tmp_path / "output.json"),
+    ]) == 1
+    assert "does not claim strict success" in capsys.readouterr().err
 
 
 def test_evaluate_loads_model_and_reports_each_scenario(monkeypatch, tmp_path, capsys) -> None:
@@ -404,6 +844,280 @@ def test_engine_test_runs_live_catalog_benchmark(monkeypatch, tmp_path, capsys) 
     assert json.loads(capsys.readouterr().out)["passed"] is True
 
 
+def test_engine_mpc_matrix_resolves_catalog_and_profiles(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab import engine, engine_matrix
+
+    connected = {}
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            connected["closed"] = True
+
+        def catalog(self):
+            return {"catalog": {"attacks": [], "stages": []}}
+
+    def fake_connect(host, port, *, timeout):
+        connected.update(host=host, port=port, timeout=timeout)
+        return FakeClient()
+
+    target = engine_matrix.EngineEpisodeTarget("attack", "okuu:Lunatic", 3)
+
+    def fake_select(response, **kwargs):
+        calls["catalog"] = response
+        calls["selection"] = kwargs
+        return (target,)
+
+    def fake_matrix(client, **kwargs):
+        calls["client"] = client
+        calls["matrix"] = kwargs
+        return {"schema_version": 1, "passed": True, "overall": {}}
+
+    monkeypatch.setattr(engine.EngineClient, "connect", fake_connect)
+    monkeypatch.setattr(engine_matrix, "select_catalog_targets", fake_select)
+    monkeypatch.setattr(engine_matrix, "run_engine_matrix", fake_matrix)
+    output = tmp_path / "matrix.json"
+    assert cli.main([
+        "engine-mpc-matrix",
+        "--host", "127.0.0.2",
+        "--port", "25000",
+        "--timeout", "4.5",
+        "--scenario", "okuu:Lunatic",
+        "--attack", "3",
+        "--stage", "Stage 5@Lunatic",
+        "--seed", "11",
+        "--seed", "12",
+        "--profile", "current",
+        "--profile", "general",
+        "--profile", "legacy-clearance-12-1",
+        "--max-frames", "9000",
+        "--output", str(output),
+    ]) == 0
+    assert connected == {
+        "host": "127.0.0.2",
+        "port": 25000,
+        "timeout": 4.5,
+        "closed": True,
+    }
+    assert calls["selection"] == {
+        "scenarios": ("okuu:Lunatic",),
+        "attacks": (3,),
+        "stages": ("Stage 5@Lunatic",),
+        "all_attacks": False,
+        "all_stages": False,
+    }
+    assert calls["matrix"]["targets"] == (target,)
+    assert calls["matrix"]["seeds"] == (11, 12)
+    assert calls["matrix"]["profiles"] == (
+        "current", "general", "legacy-clearance-12-1",
+    )
+    assert calls["matrix"]["config"].max_frames == 9000
+    assert json.loads(output.read_text())["passed"] is True
+    assert json.loads(capsys.readouterr().out)["passed"] is True
+
+
+def test_engine_policy_matrix_resolves_targets_and_proficiencies(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab import engine, engine_matrix
+
+    connected = {}
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            connected["closed"] = True
+
+        def catalog(self):
+            return {"catalog": {"attacks": [], "stages": []}}
+
+    def fake_connect(host, port, *, timeout):
+        connected.update(host=host, port=port, timeout=timeout)
+        return FakeClient()
+
+    target = engine_matrix.EngineEpisodeTarget("attack", "okuu:Lunatic", 3)
+
+    def fake_select(response, **kwargs):
+        calls["catalog"] = response
+        calls["selection"] = kwargs
+        return (target,)
+
+    def fake_matrix(client, **kwargs):
+        calls["client"] = client
+        calls["matrix"] = kwargs
+        return {"schema_version": 1, "passed": True, "overall": {}}
+
+    checkpoint = tmp_path / "policy.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    model = SimpleNamespace(
+        config=SimpleNamespace(inference_mode="stream"),
+        scenario_vocabulary=None,
+    )
+    monkeypatch.setattr(cli, "_load_checkpoint", lambda *_args: (model, {}))
+    monkeypatch.setattr(cli, "_checkpoint_metadata", lambda *_args: {"version": 3})
+    monkeypatch.setattr(engine.EngineClient, "connect", fake_connect)
+    monkeypatch.setattr(engine_matrix, "select_catalog_targets", fake_select)
+    monkeypatch.setattr(engine_matrix, "run_engine_policy_matrix", fake_matrix)
+    output = tmp_path / "policy-matrix.json"
+
+    assert cli.main([
+        "engine-policy-matrix",
+        "--host", "127.0.0.2",
+        "--port", "25001",
+        "--timeout", "5.5",
+        "--checkpoint", str(checkpoint),
+        "--scenario", "okuu:Lunatic",
+        "--attack", "3",
+        "--stage", "Stage 1@Normal",
+        "--seed", "21",
+        "--seed", "22",
+        "--proficiency", "expert",
+        "--proficiency", "intermediate",
+        "--max-frames", "8400",
+        "--vision-history", "1",
+        "--no-visible-safety-shield",
+        "--output", str(output),
+    ]) == 0
+
+    assert connected == {
+        "host": "127.0.0.2",
+        "port": 25001,
+        "timeout": 5.5,
+        "closed": True,
+    }
+    assert calls["selection"] == {
+        "scenarios": ("okuu:Lunatic",),
+        "attacks": (3,),
+        "stages": ("Stage 1@Normal",),
+        "all_attacks": False,
+        "all_stages": False,
+    }
+    assert calls["matrix"]["targets"] == (target,)
+    assert calls["matrix"]["seeds"] == (21, 22)
+    assert calls["matrix"]["proficiencies"] == ("expert", "intermediate")
+    assert calls["matrix"]["config"].max_frames == 8400
+    assert calls["matrix"]["config"].visible_safety_shield is False
+    assert calls["matrix"]["controller_metadata"]["kind"] == (
+        "streaming_visual_policy"
+    )
+    assert json.loads(output.read_text())["passed"] is True
+    assert json.loads(capsys.readouterr().out)["passed"] is True
+
+
+def test_engine_mpc_play_selects_general_controller_profile(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab import engine, engine_mpc_play
+
+    connected = {}
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            connected["closed"] = True
+
+    def fake_connect(host, port, *, timeout):
+        connected.update(host=host, port=port, timeout=timeout)
+        return FakeClient()
+
+    def fake_play(client, **kwargs):
+        calls.update(client=client, **kwargs)
+        return {
+            "passed": True,
+            "success": True,
+            "termination_reason": "attack_complete",
+        }
+
+    monkeypatch.setattr(engine.EngineClient, "connect", fake_connect)
+    monkeypatch.setattr(engine_mpc_play, "run_engine_mpc_play", fake_play)
+    output = tmp_path / "general.json"
+
+    assert cli.main([
+        "engine-mpc-play",
+        "--host", "127.0.0.2",
+        "--port", "25000",
+        "--timeout", "4.5",
+        "--scenario", "orin:Lunatic",
+        "--attack", "4",
+        "--seed", "20260731",
+        "--profile", "general",
+        "--horizon-frames", "60",
+        "--no-gap-prediction",
+        "--output", str(output),
+    ]) == 0
+
+    controller_config = calls["controller"].config
+    assert controller_config.minimum_direction_hold_frames == 9
+    assert controller_config.clearance_reward_cap == 36.0
+    assert controller_config.switch_margin_gain == 6.0
+    assert controller_config.safe_margin_target == 20.0
+    assert controller_config.region_safe_margin_target == 8.0
+    assert controller_config.gap_prediction_enabled is False
+    assert connected == {
+        "host": "127.0.0.2",
+        "port": 25000,
+        "timeout": 4.5,
+        "closed": True,
+    }
+    assert json.loads(output.read_text())["profile"] == "general"
+    assert json.loads(capsys.readouterr().out)["passed"] is True
+
+
+def test_engine_mpc_play_can_target_a_complete_stage(monkeypatch, tmp_path, capsys) -> None:
+    from stg_lab import engine, engine_mpc_play
+
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        engine.EngineClient,
+        "connect",
+        lambda *_args, **_kwargs: FakeClient(),
+    )
+
+    def fake_play(client, **kwargs):
+        calls.update(client=client, **kwargs)
+        return {
+            "passed": True,
+            "success": True,
+            "termination_reason": "stage_complete",
+        }
+
+    monkeypatch.setattr(engine_mpc_play, "run_engine_mpc_play", fake_play)
+    output = tmp_path / "stage.json"
+
+    assert cli.main([
+        "engine-mpc-play",
+        "--port", "25000",
+        "--stage", "Stage 1@Normal",
+        "--seed", "20260731",
+        "--profile", "general",
+        "--output", str(output),
+    ]) == 0
+
+    assert calls["scenario"] == "Stage 1@Normal"
+    assert calls["attack"] is None
+    assert calls["stage"] == "Stage 1@Normal"
+    assert json.loads(capsys.readouterr().out)["termination_reason"] == "stage_complete"
+
+
 def test_engine_play_loads_route_and_runs_strict_live_demo(monkeypatch, tmp_path, capsys) -> None:
     from stg_lab import engine, engine_play
 
@@ -484,6 +1198,70 @@ def test_engine_play_route_requires_sqlite_memory(capsys) -> None:
         "--route-artifact", "route.json",
     ]) == 2
     assert "requires --memory-database and --memory-id" in capsys.readouterr().err
+
+
+def test_engine_play_stage_routes_checkpoint_to_full_stage_runner(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab import engine, engine_play
+
+    checkpoint = tmp_path / "policy.pt"
+    checkpoint.write_bytes(b"policy")
+    selected_controller = object()
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        engine.EngineClient,
+        "connect",
+        lambda *_args, **_kwargs: FakeClient(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_checkpoint",
+        lambda *_args, **_kwargs: (object(), {"version": 3}),
+    )
+    controller_args = {}
+
+    def fake_controller(*args, **kwargs):
+        controller_args.update(args=args, kwargs=kwargs)
+        return selected_controller
+
+    monkeypatch.setattr(engine_play, "VisualPolicyController", fake_controller)
+
+    def fake_play(client, **kwargs):
+        calls.update(client=client, **kwargs)
+        return {
+            "schema_version": 1,
+            "success": True,
+            "termination_reason": "stage_complete",
+        }
+
+    monkeypatch.setattr(engine_play, "run_engine_play", fake_play)
+    assert cli.main([
+        "engine-play",
+        "--stage", "Stage 1@Normal",
+        "--checkpoint", str(checkpoint),
+        "--seed", "92",
+        "--proficiency", "intermediate",
+        "--visible-safety-shield",
+        "--visible-safety-horizon", "5",
+    ]) == 0
+
+    assert calls["controller"] is selected_controller
+    assert controller_args["kwargs"]["proficiency"] == "intermediate"
+    assert calls["config"].visible_safety_shield is True
+    assert calls["config"].visible_safety_horizon == 5
+    assert calls["scenario"] == "Stage 1@Normal"
+    assert calls["attack"] is None
+    assert calls["stage"] == "Stage 1@Normal"
+    assert json.loads(capsys.readouterr().out)["termination_reason"] == "stage_complete"
 
 
 def test_engine_train_uses_one_connection_and_explicit_seed_split(

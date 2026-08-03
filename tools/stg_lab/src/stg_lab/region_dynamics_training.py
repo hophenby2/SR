@@ -178,8 +178,14 @@ def _read_trace(path: str | Path) -> _Trace:
     recorded_prefix = raw.get("recorded_prefix")
     if isinstance(recorded_prefix, Mapping) and recorded_prefix.get("enabled") is not False:
         raise ValueError(f"action-assisted artifacts cannot train region memory: {artifact_path}")
-    if raw.get("policy_validation_eligible") is False:
-        raise ValueError(f"policy-ineligible artifacts cannot train region memory: {artifact_path}")
+    region_eligible = raw.get("region_dynamics_training_eligible")
+    legacy_policy_eligible = raw.get("policy_validation_eligible")
+    if region_eligible is False or (
+        region_eligible is None and legacy_policy_eligible is False
+    ):
+        raise ValueError(
+            f"region-training-ineligible artifact: {artifact_path}",
+        )
     config = raw.get("config")
     if not isinstance(config, Mapping):
         raise ValueError(f"engine MPC artifact has no runner config: {artifact_path}")

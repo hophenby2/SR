@@ -34,7 +34,10 @@ local DEFAULTS = {
 local TEST_MODE_STARTUP_ACCEPT_TIMEOUT = 30
 
 local ACTION_NAMES = { "move_x", "move_y", "slow", "shoot", "spell" }
-local COMMAND_NAMES = { "ping", "catalog", "reset", "step", "observe", "display", "close", "shutdown" }
+local COMMAND_NAMES = {
+    "ping", "catalog", "reset", "reset_stage", "step", "observe",
+    "display", "close", "shutdown",
+}
 local RUNTIME_SOURCE_FILES = {
     "root.lua",
     "_editor_output.lua",
@@ -281,6 +284,11 @@ function Instance:_disconnect(reason)
     self.action = nil
     self.terminated = false
     self.termination_reason = nil
+    self.episode_kind = nil
+    self.episode_scenario = nil
+    self.expected_stage = nil
+    self.expected_stage_successor = nil
+    self.expected_stage_menu = false
     if reason and reason ~= "closed" then
         self:_log("client disconnected: " .. tostring(reason))
     end
@@ -539,6 +547,59 @@ local function resolve_attack(scenario, attack, options)
     return nil, nil, "attack ordinal is out of range"
 end
 
+local function resolve_stage(stage_name)
+    if type(stage_name) ~= "string" or stage_name == "" then
+        return nil, "stage must be a registered stage name"
+    end
+    local source = rawget(_G, "SR_STAGE_TEST_CATALOG")
+    if type(source) ~= "table" or type(source.stages) ~= "table" then
+        return nil, "SR stage-test catalog is not registered"
+    end
+    for _, entry in ipairs(source.stages) do
+        if type(entry) == "table" and entry.stage == stage_name then
+            if type(stage) == "table" and type(stage.stages) == "table"
+                    and stage.stages[stage_name] then
+                return entry
+            end
+            return nil, "stage catalog entry is not registered: " .. stage_name
+        end
+    end
+    return nil, "unknown stage scenario: " .. stage_name
+end
+
+local function stage_completion_contract(stage_entry)
+    local source = rawget(_G, "SR_STAGE_TEST_CATALOG")
+    local entries = type(source) == "table" and source.stages or nil
+    local current_index = type(stage_entry) == "table"
+        and integer(stage_entry.stage_index, nil, 1) or nil
+    local difficulty = type(stage_entry) == "table"
+        and string_value(stage_entry.difficulty) or nil
+    if type(entries) ~= "table" or not current_index or not difficulty then
+        return nil, false
+    end
+
+    local maximum_index = current_index
+    local successor = nil
+    local successor_count = 0
+    for _, candidate in ipairs(entries) do
+        if type(candidate) == "table" and candidate.difficulty == difficulty then
+            local candidate_index = integer(candidate.stage_index, nil, 1)
+            local candidate_name = string_value(candidate.stage)
+            if candidate_index then
+                maximum_index = math.max(maximum_index, candidate_index)
+                if candidate_index == current_index + 1 and candidate_name then
+                    successor = candidate_name
+                    successor_count = successor_count + 1
+                end
+            end
+        end
+    end
+    if successor_count == 1 then
+        return successor, false
+    end
+    return nil, successor_count == 0 and current_index == maximum_index
+end
+
 function Instance:_reset(request)
     local options = type(request.options) == "table" and request.options or {}
     local _, card_index, err = resolve_attack(request.scenario, request.attack, options)
@@ -587,11 +648,70 @@ function Instance:_reset(request)
     self.termination_reason = nil
     self.seen_enemy = false
     self.expected_stage = "Spell Practice@Spell Practice"
+    self.expected_stage_successor = nil
+    self.expected_stage_menu = false
+    self.episode_kind = "attack"
+    self.episode_scenario = request.scenario
     self.pending_options = options
     return {
+        episode_kind = "attack",
         scenario = request.scenario,
         attack = request.attack,
         card_index = card_index,
+        seed = seed,
+        player = player_name,
+    }
+end
+
+function Instance:_reset_stage(request)
+    local options = type(request.options) == "table" and request.options or {}
+    local stage_entry, err = resolve_stage(request.stage)
+    if err then
+        return nil, err
+    end
+    local player_name = resolve_player(request.player)
+    if not player_name then
+        return nil, "unknown player: " .. tostring(request.player)
+    end
+    if type(stage) ~= "table" or type(stage.Set) ~= "function" then
+        return nil, "stage switching is unavailable"
+    end
+
+    lstg.var = lstg.var or {}
+    lstg.var.player_name = player_name
+    lstg.var.sc_index = nil
+    lstg.var.sc_pr_data = nil
+    lstg.var.is_practice = false
+    stage.IsSCpractice = false
+    if type(ext) == "table" then
+        ext.pop_pause_menu = false
+        ext.pause_menu_order = nil
+        ext.rep_over = false
+        if type(ext.pause_menu) == "table" then
+            ext.pause_menu.kill = true
+            if type(task) == "table" and type(task.Clear) == "function" then
+                pcall(task.Clear, ext.pause_menu)
+            end
+        end
+    end
+    stage.Set(request.stage, "none")
+    local seed = self:_seed(request.seed)
+
+    self.episode_frame = 0
+    self.terminated = false
+    self.termination_reason = nil
+    self.seen_enemy = false
+    self.expected_stage = request.stage
+    self.expected_stage_successor, self.expected_stage_menu =
+        stage_completion_contract(stage_entry)
+    self.episode_kind = "stage"
+    self.episode_scenario = request.stage
+    self.pending_options = options
+    return {
+        episode_kind = "stage",
+        stage = request.stage,
+        stage_index = integer(stage_entry.stage_index, nil, 1),
+        difficulty = string_value(stage_entry.difficulty),
         seed = seed,
         player = player_name,
     }
@@ -604,6 +724,7 @@ function Instance:_catalog()
     end
     local scenarios = json_array(self.cjson)
     local attacks = json_array(self.cjson)
+    local stages = json_array(self.cjson)
     for _, raw_scenario in ipairs(source.scenarios) do
         local scenario = string_value(raw_scenario.scenario)
         local raw_attacks = raw_scenario.attacks
@@ -614,10 +735,12 @@ function Instance:_catalog()
                 local card_index = integer(raw_attack.card_index, nil, 1)
                 if attack and card_index then
                     local entry = {
+                        episode_kind = "attack",
                         scenario = scenario,
                         attack = attack,
                         card_index = card_index,
                         label = string_value(raw_attack.label),
+                        completion_reason = "attack_complete",
                     }
                     scenario_attacks[#scenario_attacks + 1] = entry
                     attacks[#attacks + 1] = entry
@@ -631,12 +754,33 @@ function Instance:_catalog()
             }
         end
     end
+    local stage_source = rawget(_G, "SR_STAGE_TEST_CATALOG")
+    if type(stage_source) == "table" and type(stage_source.stages) == "table" then
+        for _, raw_stage in ipairs(stage_source.stages) do
+            local stage_name = type(raw_stage) == "table"
+                and string_value(raw_stage.stage) or nil
+            local stage_index = type(raw_stage) == "table"
+                and integer(raw_stage.stage_index, nil, 1) or nil
+            if stage_name and stage_index then
+                stages[#stages + 1] = {
+                    episode_kind = "stage",
+                    stage = stage_name,
+                    stage_index = stage_index,
+                    difficulty = string_value(raw_stage.difficulty),
+                    label = string_value(raw_stage.label),
+                    completion_reason = "stage_complete",
+                }
+            end
+        end
+    end
     return {
         schema_version = integer(source.schema_version, 1, 1),
         scenario_count = #scenarios,
         attack_count = #attacks,
+        stage_count = #stages,
         scenarios = scenarios,
         attacks = attacks,
+        stages = stages,
     }
 end
 
@@ -665,6 +809,14 @@ function Instance:_handle_request(request)
         end
     elseif command == "reset" then
         local info, err = self:_reset(request)
+        if not info then
+            self:_response(id, false, { error = err })
+            return
+        end
+        self.action = normalize_action(nil)
+        self.pending = { id = id, command = command, remaining = 1, reset = info }
+    elseif command == "reset_stage" then
+        local info, err = self:_reset_stage(request)
         if not info then
             self:_response(id, false, { error = err })
             return
@@ -887,7 +1039,9 @@ function Instance:collect_observation()
             name = current_stage and (current_stage.stage_name or current_stage.name) or nil,
             is_menu = current_stage and current_stage.is_menu == true or false,
             timer = current_stage and number_or_nil(current_stage.timer) or nil,
-            scenario = vars.sc_pr_data and vars.sc_pr_data.class_name or nil,
+            episode_kind = self.episode_kind,
+            scenario = self.episode_scenario
+                or (vars.sc_pr_data and vars.sc_pr_data.class_name or nil),
             card_index = vars.sc_pr_data and vars.sc_pr_data.scene_index or nil,
         },
         world = {},
@@ -934,6 +1088,17 @@ function Instance:_apply_pending_options()
     if protect_frames and type(player_object) == "table" then
         player_object.protect = math.max(tonumber(player_object.protect) or 0, protect_frames)
     end
+    -- Training-field capture can remove the player from collision handling so
+    -- hazards pass through without being deleted. These options exist only on
+    -- the opt-in test bridge; strict validation resets use the normal group.
+    if options.player_collidable ~= nil and type(player_object) == "table" then
+        player_object.colli = truthy(options.player_collidable)
+    end
+    if options.player_ghost ~= nil and type(player_object) == "table" then
+        player_object.group = truthy(options.player_ghost)
+            and (rawget(_G, "GROUP_GHOST") or 0)
+            or (rawget(_G, "GROUP_PLAYER") or 4)
+    end
     self.pending_options = nil
 end
 
@@ -957,13 +1122,23 @@ function Instance:_check_stop(observation)
     end
     if self.config.stop_on_stage_change and self.expected_stage
             and observation.stage.name ~= self.expected_stage then
+        if self.episode_kind == "stage" and self.seen_enemy then
+            local reached_successor = self.expected_stage_successor
+                and observation.stage.name == self.expected_stage_successor
+            local reached_final_menu = self.expected_stage_menu
+                and observation.stage.is_menu == true
+            if reached_successor or reached_final_menu then
+                return "stage_complete"
+            end
+        end
         return "stage_changed"
     end
     -- Stop state uses the authoritative object pool. Visible observations can
     -- legitimately lose a boss for a frame while it repositions off-screen.
     if self:_has_enemy_objects() then
         self.seen_enemy = true
-    elseif self.config.stop_on_no_enemies and self.seen_enemy then
+    elseif self.episode_kind ~= "stage"
+            and self.config.stop_on_no_enemies and self.seen_enemy then
         return "attack_complete"
     end
 end

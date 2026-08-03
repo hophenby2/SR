@@ -93,7 +93,7 @@ $localBridge = Join-Path $localModRoot 'compat\testing\bridge.lua'
 $venvPython = Join-Path $labRoot '.venv-win\Scripts\python.exe'
 
 if ([string]::IsNullOrWhiteSpace($RegionDynamicsMemory)) {
-    $RegionDynamicsMemory = Join-Path $labRoot 'artifacts\region-dynamics-boss3-v2.json'
+    $RegionDynamicsMemory = Join-Path $labRoot 'models\region_dynamics_boss3_v2.json'
 }
 elseif (-not [IO.Path]::IsPathRooted($RegionDynamicsMemory)) {
     $RegionDynamicsMemory = Join-Path $labRoot $RegionDynamicsMemory

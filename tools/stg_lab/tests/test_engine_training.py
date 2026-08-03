@@ -127,7 +127,10 @@ def test_live_training_selects_only_by_strict_completion_and_writes_traces(
                 "process_nonce": "one-process",
                 "runtime_identity": {"process_id": 77},
             },
-            "outcome_evidence": {"reporting_only_not_controller_input": True},
+            "outcome_evidence": {
+                "reporting_only_not_controller_input": True,
+                "final_player": {"death": 0},
+            },
         }
 
     monkeypatch.setattr(engine_training, "run_engine_play", fake_play)
@@ -183,3 +186,26 @@ def test_live_training_selects_only_by_strict_completion_and_writes_traces(
     digest = write_strategy_artifact(artifact, report)
     assert len(digest) == 64
     assert load_candidate_strategy(artifact) == mirrored
+
+
+@pytest.mark.parametrize("final_player", ({"death": 1}, {}))
+def test_training_rejects_completion_without_explicit_zero_death(
+    final_player,
+) -> None:
+    candidate = CandidateStrategy()
+    evidence = engine_training._strict_episode_evidence(
+        {
+            "success": True,
+            "terminated": True,
+            "engine_termination_reason": "attack_complete",
+            "outcome_evidence": {"final_player": final_player},
+        },
+        phase="heldout",
+        candidate_index=0,
+        candidate=candidate,
+        trace_path=None,
+    )
+
+    assert evidence["success"] is False
+    assert evidence["runner_success_matches_strict_metric"] is False
+    assert evidence["final_death"] == final_player.get("death")

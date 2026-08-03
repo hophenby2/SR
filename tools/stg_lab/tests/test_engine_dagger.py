@@ -1,0 +1,365 @@
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from stg_lab.engine import EngineProtocolError
+from stg_lab.engine_dagger import EngineDAggerConfig, run_engine_dagger_play
+from stg_lab.engine_mpc import CandidateEvaluation, MPCConfig, MPCDecision, movement_actions
+from stg_lab.engine_runtime import local_runtime_source_fingerprints
+from stg_lab.native_dataset import NativeEpisodeBuffer, NativeEpisodeIdentity
+from stg_lab.policy import resolve_proficiency
+from stg_lab.protocol import Action
+from stg_lab.vision import VisionConfig, VisionObservation
+
+
+def _observation(
+    frame: int,
+    *,
+    terminated: bool = False,
+    reason: str | None = None,
+    death: int = 0,
+) -> dict[str, Any]:
+    return {
+        "episode_frame": frame,
+        "terminated": terminated,
+        "termination_reason": reason,
+        "performance": {"native_fps": 120.0, "object_count": 1},
+        "stage": {"card_index": 4},
+        "world": {"pl": -192.0, "pr": 192.0, "pb": -224.0, "pt": 224.0},
+        "player": {
+            "x": 0.0,
+            "y": -176.0,
+            "a": 0.5,
+            "b": 0.5,
+            "hspeed": 4.0,
+            "lspeed": 2.0,
+            "death": death,
+            "protect": 0,
+            "status": "normal",
+        },
+        "enemy_bullets": [],
+        "enemies": [{
+            "id": 20,
+            "x": 0.0,
+            "y": 120.0,
+            "a": 16.0,
+            "b": 16.0,
+            "hp": 100.0,
+            "maxhp": 100.0,
+            "collidable": False,
+        }],
+        "nontjt_enemies": [],
+        "indestructibles": [],
+        "lasers": [],
+    }
+
+
+class FakeClient:
+    def __init__(self, *, death: int = 0) -> None:
+        self.frame = 0
+        self.death = death
+        self.actions: list[Action] = []
+        self.runtime_source_crc32 = local_runtime_source_fingerprints()[0]
+
+    def ping(self):
+        return {
+            "protocol": 2,
+            "session_id": "dagger-test",
+            "process_nonce": "dagger-process",
+            "runtime_identity": {
+                "process_id": 42,
+                "source_crc32": self.runtime_source_crc32,
+            },
+        }
+
+    def catalog(self):
+        return {"catalog": {"attacks": [
+            {"scenario": "okuu:Lunatic", "attack": 3, "card_index": 4},
+        ], "stages": []}}
+
+    def reset(self, scenario, attack, *, seed, player, options):
+        self.frame = 0
+        return {"observation": _observation(0)}
+
+    def set_rendering(self, enabled: bool, *, every: int = 1):
+        return {"render": enabled, "every": every}
+
+    def step(self, action: Action, *, repeat: int = 1):
+        assert repeat == 1
+        self.actions.append(action)
+        self.frame += 1
+        terminated = self.frame >= 6
+        return {"observation": _observation(
+            self.frame,
+            terminated=terminated,
+            reason="attack_complete" if terminated else None,
+            death=self.death if terminated else 0,
+        )}
+
+
+class FixedStudent:
+    inference_mode = "stream"
+    scenario_key = "test"
+    device = "cpu"
+    proficiency = resolve_proficiency("expert")
+
+    def __init__(self, action: Action) -> None:
+        self.action = action
+        self.commits: list[tuple[Action, int]] = []
+
+    def reset_for_seed(self, seed: int) -> None:
+        self.seed = seed
+
+    def select(self, visible: VisionObservation) -> Action:
+        assert visible.global_frames.shape[0] == 1
+        return self.action
+
+    def commit_executed_action(self, action: Action, *, frames: int) -> None:
+        self.commits.append((action, frames))
+
+
+class FixedTeacher:
+    def __init__(self, *, student_collides: bool) -> None:
+        self.config = MPCConfig(observation_delay=0, horizon_frames=36)
+        self.student_collides = student_collides
+
+    def reset(self) -> None:
+        return None
+
+    def select(self, observation) -> MPCDecision:
+        teacher_action = Action(move_x=1, slow=True)
+        evaluations = []
+        for action in movement_actions():
+            is_student = action.discrete == Action(move_x=-1, slow=True).discrete
+            evaluations.append(CandidateEvaluation(
+                action=action,
+                collided=self.student_collides and is_student,
+                collision_frames=int(self.student_collides and is_student),
+                earliest_collision_frame=(1 if self.student_collides and is_student else None),
+                minimum_margin=(-1.0 if self.student_collides and is_student else 30.0),
+                boundary_penalty=0.0,
+                boss_alignment=0.0,
+            ))
+        return MPCDecision(
+            action=teacher_action,
+            source_frame=int(observation["episode_frame"]),
+            recomputed=True,
+            threats=(),
+            evaluations=tuple(evaluations),
+            region_anchor=None,
+            region_crossing=False,
+            region_path_margin=None,
+            region_evacuating=False,
+            region_target_rows_ahead=0,
+            region_navigation_mode="none",
+            region_current_component=None,
+            region_target_component=None,
+            region_portal=None,
+            region_deadline_slack=None,
+            planned_actions=(teacher_action,),
+            using_committed_plan=False,
+            committed_plan_immediate_margin=None,
+            committed_plan_current_horizon_margin=None,
+            region_phase="unknown",
+            region_phase_started_frame=None,
+            region_learned_cycle_frames=None,
+            region_frames_until_expansion=None,
+            region_observed_radius=None,
+        )
+
+
+def _run(
+    *,
+    student_collides: bool,
+    death: int = 0,
+    student_action: Action = Action(move_x=-1, slow=True),
+    supervision_mode: str = "teacher",
+    intervene_on_disagreement: bool = False,
+):
+    client = FakeClient(death=death)
+    episode = NativeEpisodeBuffer(NativeEpisodeIdentity(
+        episode_kind="attack",
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+    ))
+    student = FixedStudent(student_action)
+    report = run_engine_dagger_play(
+        client,  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        student=student,  # type: ignore[arg-type]
+        teacher=FixedTeacher(student_collides=student_collides),  # type: ignore[arg-type]
+        episode=episode,
+        config=EngineDAggerConfig(
+            max_frames=12,
+            observation_delay=0,
+            teacher_probability=0.0,
+            intervention_margin=0.0,
+            intervention_regret=100.0,
+            intervene_on_disagreement=intervene_on_disagreement,
+            supervision_mode=supervision_mode,
+        ),
+        vision_config=VisionConfig(
+            global_width=12,
+            global_height=14,
+            local_width=10,
+            local_height=10,
+            history=1,
+            observation_delay=0,
+        ),
+    )
+    return client, episode, report, student
+
+
+def test_dagger_records_teacher_labels_on_student_executed_states() -> None:
+    client, episode, report, student_controller = _run(student_collides=False)
+
+    assert report["success"] is True
+    assert report["teacher_assisted_success"] is True
+    assert report["teacher_success"] is True
+    assert report["pure_policy"] is False
+    assert report["pure_policy_success"] is False
+    assert report["pure_policy_validation_eligible"] is False
+    assert report["engine"]["runtime_source_verification"]["matched"] is True
+    assert report["teacher_interventions"] == 0
+    assert report["student_teacher_agreements"] == 0
+    assert episode.decisions == report["decision_count"] == 2
+    teacher = Action(move_x=1, slow=True).discrete
+    student = Action(move_x=-1, slow=True).discrete
+    assert episode.actions == [teacher, teacher]
+    assert episode.previous_actions == [-1, student]
+    assert all(action.discrete == student for action in client.actions)
+    assert [
+        (action.discrete, frames) for action, frames in student_controller.commits
+    ] == [(student, 3), (student, 3)]
+
+
+def test_dagger_intervenes_when_student_candidate_would_collide() -> None:
+    client, episode, report, student_controller = _run(student_collides=True)
+
+    assert report["success"] is True
+    assert report["teacher_interventions"] == report["decision_count"]
+    assert report["safety_teacher_interventions"] == report["decision_count"]
+    assert all(
+        decision["intervention_reason"] == "predicted_collision"
+        for decision in report["decisions"]
+    )
+    assert all(action.move_x == 1 for action in client.actions)
+    assert episode.decisions == 2
+    assert episode.previous_actions == [-1, Action(move_x=1, slow=True).discrete]
+    assert [
+        (action.move_x, frames) for action, frames in student_controller.commits
+    ] == [(1, 3), (1, 3)]
+
+
+def test_dagger_can_collect_only_current_policy_disagreements() -> None:
+    client, episode, report, student_controller = _run(
+        student_collides=False,
+        supervision_mode="corrective",
+        intervene_on_disagreement=True,
+    )
+
+    teacher = Action(move_x=1, slow=True).discrete
+    assert report["success"] is True
+    assert report["teacher_interventions"] == report["decision_count"] == 2
+    assert report["safety_teacher_interventions"] == 0
+    assert report["policy_disagreement_interventions"] == report["decision_count"]
+    assert all(
+        decision["intervention_reason"] == "policy_disagreement"
+        for decision in report["decisions"]
+    )
+    assert episode.actions == [teacher, teacher]
+    assert all(action.discrete == teacher for action in client.actions)
+    assert [
+        (action.discrete, frames) for action, frames in student_controller.commits
+    ] == [(teacher, 3), (teacher, 3)]
+
+
+def test_corrective_dagger_supervises_the_actions_that_were_executed() -> None:
+    _client, unassisted, report, _student = _run(
+        student_collides=False,
+        supervision_mode="corrective",
+    )
+    student_action = Action(move_x=-1, slow=True).discrete
+    assert unassisted.actions == [student_action, student_action]
+    assert report["demonstration_supervision"] == {
+        "mode": "corrective",
+        "target": (
+            "executed_action: student action when unassisted, teacher action "
+            "when intervened"
+        ),
+        "teacher_correction_targets": 0,
+        "student_execution_targets": 2,
+        "teacher_only_targets": 0,
+    }
+    assert all(
+        decision["supervised_action"] == decision["executed_action"]
+        for decision in report["decisions"]
+    )
+
+    _client, corrected, report, _student = _run(
+        student_collides=True,
+        supervision_mode="corrective",
+    )
+    teacher_action = Action(move_x=1, slow=True).discrete
+    assert corrected.actions == [teacher_action, teacher_action]
+    assert report["demonstration_supervision"]["teacher_correction_targets"] == 2
+    assert report["demonstration_supervision"]["student_execution_targets"] == 0
+
+
+def test_dagger_rejects_unknown_supervision_mode() -> None:
+    with pytest.raises(ValueError, match="supervision_mode"):
+        EngineDAggerConfig(supervision_mode="mixed")
+
+
+def test_dagger_rejects_stale_runtime_lua_before_reset() -> None:
+    client = FakeClient()
+    client.runtime_source_crc32 = {
+        **client.runtime_source_crc32,
+        "compat/testing/bridge.lua": "00000000",
+    }
+    episode = NativeEpisodeBuffer(NativeEpisodeIdentity(
+        episode_kind="attack",
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+    ))
+
+    with pytest.raises(EngineProtocolError, match="changed=.*bridge.lua"):
+        run_engine_dagger_play(
+            client,  # type: ignore[arg-type]
+            scenario="okuu:Lunatic",
+            attack=3,
+            seed=42,
+            player="reimu_player",
+            student=FixedStudent(Action()),  # type: ignore[arg-type]
+            teacher=FixedTeacher(student_collides=False),  # type: ignore[arg-type]
+            episode=episode,
+            config=EngineDAggerConfig(observation_delay=0),
+            vision_config=VisionConfig(history=1, observation_delay=0),
+        )
+
+
+def test_dagger_completion_with_death_is_not_strict_success() -> None:
+    _client, _episode, report, _student = _run(student_collides=True, death=1)
+
+    assert report["termination_reason"] == "attack_complete"
+    assert report["outcome_evidence"]["final_player"]["death"] == 1
+    assert report["success"] is False
+    assert report["passed"] is False
+
+
+def test_dagger_maps_fast_stationary_policy_action_to_mpc_neutral_evaluation() -> None:
+    client, episode, report, _student = _run(
+        student_collides=False,
+        student_action=Action(slow=False),
+    )
+
+    assert report["success"] is True
+    assert episode.decisions == 2
+    assert all(action.move_x == 0 and action.move_y == 0 for action in client.actions)

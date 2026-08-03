@@ -1,0 +1,29 @@
+{
+  "attack": 3,
+  "kind": "region_dynamics_memory",
+  "model": {
+    "contraction_rate": 0.7,
+    "cycle_frames": 180.0,
+    "growth_rate": 0.7,
+    "lateral_flow": {
+      "cycle_frames": 360.0,
+      "safe_side_rule": "opposite_incoming_lateral_flow"
+    },
+    "maximum_radius": 28.0,
+    "minimum_radius": 7.0,
+    "phase_durations": {
+      "contracting": 30.0,
+      "expanding": 30.0,
+      "maximum_hold": 30.0,
+      "minimum_hold": 90.0
+    },
+    "phase_order": [
+      "expanding",
+      "maximum_hold",
+      "contracting",
+      "minimum_hold"
+    ]
+  },
+  "scenario": "okuu:Lunatic",
+  "schema_version": 2
+}

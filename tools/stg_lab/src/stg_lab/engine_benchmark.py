@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-import os
 import time
-from pathlib import Path
 import re
 from typing import Any, Mapping
-import zlib
 
 from .engine import EngineClient, EngineProtocolError
+from .engine_runtime import (
+    RUNTIME_SOURCE_FILES as _RUNTIME_SOURCE_FILES,
+    local_runtime_source_fingerprints as _local_runtime_sources,
+    resolve_mod_root as _resolve_mod_root,
+)
 from .metrics import state_hash
 from .protocol import Action
-from .provenance import file_sha256, source_tree_sha256
+from .provenance import source_tree_sha256
 
 
 _OBSERVATION_ARRAYS = (
@@ -22,74 +24,7 @@ _OBSERVATION_ARRAYS = (
     "indestructibles",
     "lasers",
 )
-_SOURCE_LAYOUT_MOD_ROOT = Path(__file__).resolve().parents[4]
-_MOD_ROOT_ENV = "STG_LAB_MOD_ROOT"
-_RUNTIME_SOURCE_FILES = (
-    "root.lua",
-    "_editor_output.lua",
-    "compat/init.lua",
-    "compat/combo.lua",
-    "compat/gameplay.lua",
-    "compat/spell_practice.lua",
-    "compat/player/marisa.lua",
-    "compat/player/reimu.lua",
-    "compat/player/sakuya.lua",
-    "compat/background/effects.lua",
-    "compat/background/stage6bg.lua",
-    "compat/background/stg2bg.lua",
-    "compat/background/stg3bg.lua",
-    "compat/background/stg4bg.lua",
-    "compat/background/stg5bg.lua",
-    "compat/background/stg6bg.lua",
-    "compat/testing/bridge.lua",
-    "compat/testing/init.lua",
-)
 _CRC32 = re.compile(r"[0-9a-f]{8}")
-
-
-def _file_crc32(path: Path) -> str:
-    checksum = 0
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            checksum = zlib.crc32(block, checksum)
-    return f"{checksum & 0xffffffff:08x}"
-
-
-def _looks_like_mod_root(path: Path) -> bool:
-    return (path / "root.lua").is_file() and (
-        path / "compat/testing/bridge.lua"
-    ).is_file()
-
-
-def _resolve_mod_root() -> Path:
-    configured = os.environ.get(_MOD_ROOT_ENV)
-    if configured:
-        root = Path(configured).expanduser().resolve()
-        if not _looks_like_mod_root(root):
-            raise FileNotFoundError(
-                f"{_MOD_ROOT_ENV} does not identify an SR mod root: {root}",
-            )
-        return root
-
-    working = Path.cwd().resolve()
-    candidates = (working, *working.parents, _SOURCE_LAYOUT_MOD_ROOT)
-    for candidate in candidates:
-        if _looks_like_mod_root(candidate):
-            return candidate
-    raise FileNotFoundError(
-        f"cannot locate the SR mod root; set {_MOD_ROOT_ENV} to its directory",
-    )
-
-
-def _local_runtime_sources() -> tuple[dict[str, str], dict[str, str]]:
-    mod_root = _resolve_mod_root()
-    crc32 = {}
-    sha256 = {}
-    for relative in _RUNTIME_SOURCE_FILES:
-        path = mod_root / relative
-        crc32[relative] = _file_crc32(path)
-        sha256[relative] = file_sha256(path)
-    return crc32, sha256
 
 
 def _runtime_identity(

@@ -16,6 +16,7 @@ from stg_lab.rollout import (
     imminent_safe_actions,
     load_demonstrations,
     planner_teacher_action,
+    scenario_memory_vector,
     shield_action_toward,
     teacher_action_agreement,
     _candidate_player_paths,
@@ -68,6 +69,83 @@ VISION = VisionConfig(
     history=2,
     observation_delay=1,
 )
+
+
+def test_zero_width_scenario_memory_leaves_phase_to_recurrent_state() -> None:
+    assert scenario_memory_vector("stage5_boss4:lunatic", 0).shape == (0,)
+    assert np.array_equal(
+        scenario_memory_vector("unseen_attack", 1),
+        np.zeros(1, dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="cannot be negative"):
+        scenario_memory_vector("anything", -1)
+
+
+def test_scenario_vocabulary_uses_one_hot_identity_and_unknown_token() -> None:
+    vocabulary = ("<unknown>", "attack:okuu:Lunatic#3")
+    np.testing.assert_array_equal(
+        scenario_memory_vector(
+            "attack:okuu:Lunatic#3", 2, vocabulary,
+        ),
+        (0.0, 1.0),
+    )
+    np.testing.assert_array_equal(
+        scenario_memory_vector("attack:new:Lunatic#1", 2, vocabulary),
+        (1.0, 0.0),
+    )
+    with pytest.raises(ValueError, match="width"):
+        scenario_memory_vector("anything", 1, vocabulary)
+
+
+def test_policy_behavior_can_defer_runtime_commit_for_native_overrides(
+    monkeypatch,
+) -> None:
+    from stg_lab import rollout
+    from stg_lab.policy import ProficiencyRuntime
+
+    class RecordingRuntime(ProficiencyRuntime):
+        def __init__(self) -> None:
+            super().__init__("expert", seed=7)
+            self.commits = []
+
+        def commit(self, action: Action, *, decision_interval: int) -> None:
+            self.commits.append((action, decision_interval))
+            super().commit(action, decision_interval=decision_interval)
+
+    logits = np.full(18, -1.0, dtype=np.float32)
+    logits[Action(move_x=1, slow=True).discrete] = 1.0
+    monkeypatch.setattr(
+        rollout,
+        "_policy_logits",
+        lambda *_args, **_options: (logits, None),
+    )
+    visible = rollout.VisionObservation(
+        global_frames=np.zeros((1, 6, 8, 8), dtype=np.float32),
+        local_frames=np.zeros((1, 6, 8, 8), dtype=np.float32),
+        source_frame=0,
+    )
+    runtime = RecordingRuntime()
+    options = {
+        "device": "cpu",
+        "memory": np.zeros(0, dtype=np.float32),
+        "hidden": None,
+        "inference_mode": "stream",
+        "config": RolloutConfig(decision_interval=3),
+        "shield": False,
+        "runtime": runtime,
+    }
+
+    deferred, _hidden = rollout._policy_behavior_action(
+        object(), None, visible, commit_runtime=False, **options,
+    )
+    assert deferred.move_x == 1
+    assert runtime.commits == []
+
+    immediate, _hidden = rollout._policy_behavior_action(
+        object(), None, visible, **options,
+    )
+    assert immediate.move_x == 1
+    assert runtime.commits == [(immediate, 3)]
 
 
 def empty_factory(seed: int) -> STGEnvironment:

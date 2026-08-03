@@ -276,6 +276,101 @@ normalized RMSE 0; its 180-frame sign inversion has 252 pairs, correlation
 1.0, and normalized RMSE 0. Shifting the entire input timeline does not change
 memory or relative sample statistics.
 
+### Parallel-wavefront gap prediction
+
+The live Engine MPC can combine its safe-region forecast with a general gap
+predictor for coherent bullet waves. Gap grouping is restricted to
+`enemy_bullets`; lasers, enemies, indestructibles, and forced-displacement
+geometry still participate in ordinary collision/path checks but can never
+define a gap. Moving bullets are clustered by velocity direction and speed,
+then split by depth along that direction into distinct wavefronts. Sorting one
+wavefront along its perpendicular axis makes each adjacent bullet pair a
+candidate corridor. This is inferred from current visible geometry and motion,
+not from an attack identifier, script phase, fixed coordinate, or recorded
+route.
+
+Corridor width is center-space clearance, not raw center spacing. It subtracts
+the two bordering bullet radii and, on both sides, the player radius, a 10-unit
+safety reserve, and displacement uncertainty induced by observation delay.
+Candidates are resampled at multiple future times through arrival and hold;
+reordered boundaries, a future closure, or insufficient lifetime rejects the
+corridor. A wavefront coverage threshold rejects isolated bullet pairs that do
+not describe a meaningful barrier. Geometry is computed for every opening, but
+only the active opening and up to eight region-compatible nearby candidates are
+entry-certified. Certification first checks an executable three-frame-block
+direct route, then uses a small diverse action beam when another threat blocks
+it. Every route is checked against every threat type and must retain at least
+the 4-unit emergency margin, raised to the 8-unit forced-region reserve while a
+region anchor is active. This permits a necessary short transit through a
+lower-risk area; the gap itself still reserves 10 units per side plus delay
+uncertainty. One group's opening therefore cannot hide an intersecting wave,
+laser, enemy, or forced-region object.
+
+Gap and region anchors coexist. The region anchor describes the globally
+preferred connected area or portal, while a selected gap supplies a local
+corridor through an approaching wavefront; candidate ordering favors gaps
+compatible with the region target. Collision prediction remains ahead of gap
+entry. In `enter`, the controller emits the certified route's first action, so
+it may deliberately accept lower ordinary clearance without accepting a hit;
+the higher region-entry reserve still applies when both anchors are active. In
+`hold`, the entire usable interval is a soft target and the controller does not
+chase its exact center. If staying put already preserves the ordinary safety
+target, gaps remain diagnostic `observe` targets. The active gap identity is
+retained across replans and progresses through `enter`, `hold`, and `exit`
+rather than switching to the newest opening every decision.
+
+`engine-mpc-play` enables this feature by default. `--gap-prediction` makes the
+setting explicit and `--no-gap-prediction` provides a deterministic ablation.
+Each JSON decision contains `gap_bullet_group_count`, `gap_corridor_count`,
+`gap_selected_center`, `gap_selected_width`,
+`gap_selected_lifetime_frames`, and `gap_navigation_mode`; the latter is one of
+`inactive`, `observe`, `enter`, `hold`, or `exit`. The report-level
+`gap_prediction` object includes `enabled`, detected/selected decision counts,
+per-mode counts, `maximum_bullet_group_count`, and
+`maximum_corridor_count`.
+
+A deterministic four-bullet wavefront regression verifies that the selected
+anchor can affect control rather than telemetry only. Starting just outside a
+natural 10-unit corridor, gap prediction changes the collision-free first move
+from straight down to left toward the opening. A separate blocked-route fixture
+requires and finds a safe multi-block detour. These remain synthetic integration
+fixtures, not native success-rate results.
+
+A local synthetic performance probe containing 299 bullets, 23 wavefronts, and
+276 corridors measures a 2.92 ms median for geometry. Complete-decision medians
+are 135.24 ms with gap prediction and 131.66 ms without it, a 3.58 ms delta.
+Only the active and up to eight ordered candidates receive entry certification,
+so dense geometry no longer runs a Python route search for every corridor.
+These figures are not a native episode A/B, real-time throughput, or
+success-rate claim.
+
+A final same-source native A/B used Okuu #3 seed `20260730`. Both reports bind
+implementation SHA-256
+`811513e348b893bd41618f9d828ef2f54bc7dd1278a86dd12ec80ba655e216f2`,
+have identical top-level run configuration, and differ in controller
+configuration only at `gap_prediction_enabled`.
+
+| Gap prediction | Strict engine outcome | Gap telemetry | Movement diagnostics | Report SHA-256 |
+| --- | --- | --- | --- | --- |
+| on | `attack_complete`; 3,815 frames; Boss HP `6000 -> 0`; death 0; unsafe shots 0 | 167 detected; 52 selected; observe/enter/hold/exit `105/52/0/10`; maxima `49/12`; 52/52 entry movements match their certified first action, 46 nonneutral | path 10782.4653; 420 direction changes (110.0917/1,000 frames); 18 exact reversals; 122 sharp turns; 10 ABA; median hold 6 frames | `5f56b184bf7116b789187e6d3b03c1c43714f24250a9f8f857363b7bad60e2bd` |
+| off | `attack_complete`; 3,815 frames; Boss HP `6000 -> 0`; death 0; unsafe shots 0 | disabled; all gap counts zero | path 10785.4956; 416 direction changes (109.0433/1,000 frames); 18 exact reversals; 139 sharp turns; 6 ABA; median hold 6 frames | `3c37da04b902332b41734cb93ead1695a582918c1fdd28037efb7ca605702db3` |
+
+Direct comparison finds 947 different emitted actions, including 930 different
+movement choices, and 1,110 different observed decision-boundary positions.
+Thus the certified entries affected native control rather than telemetry only,
+while both sides still strictly completed. The enabled run's lower sharp-turn
+count is descriptive for this episode, not a general smoothness result. Because
+it recorded no `hold` decision, this native episode evidences certified entry
+rather than sustained corridor holding; the deterministic regression covers
+`enter -> hold`. Because this is one seed and both sides already pass, it does
+not establish a success-rate improvement. These `acceptance_claim=false` live
+MPC-teacher reports are not learned-policy evidence.
+
+The predictor is a general visual teacher rule, not spell-specific memory
+inserted into the released neural checkpoint. The A/B reports have not yet been
+converted into a gap-aware DAgger or demonstration archive, and the published
+stream-v1 checkpoint has not been retrained from such an archive.
+
 ### Exact MPC prefilter equivalence and performance
 
 `experiments/benchmark_engine_mpc_beam.py` compares the conservative
@@ -302,18 +397,24 @@ samples rather than a guaranteed lower bound.
 
 ### Clearance, direction hysteresis, and grid ablation
 
-Live MPC still replans every three frames. Its ordinary clearance target is now
-20 instead of 12, and the forced-region target is 8 instead of 1. Beam search
+Live MPC still replans every three frames. Ordinary bullets use a hard 20-unit
+reserve and forced-region passages use a separately scored 8-unit reserve, so a
+narrow forced corridor cannot hide poor ordinary-bullet clearance. The 16-unit
+danger tier ranks before the 20-unit target. Ordinary clearance keeps earning a
+capped soft reward up to 48, and immediate corner clearance has a 48-unit soft
+reserve; neither 48-unit preference is an impassable boundary. Beam search
 accumulates costs of `3/9/6/0.75` for a direction switch, an additional exact
 180-degree reversal, an `A -> B -> A` oscillation, and a same-direction speed
-mode change. Clearance beyond the target receives a capped reward. A direction
-is normally held for nine frames, but the hold is released for a collision in
-the next 12 frames, incumbent clearance at most 4, a clearance gain of at least
-6, or a true deadline-driven `evacuate`. `preposition` no longer bypasses the
-hold, and a previously committed plan must pass the same gate. Collision state,
-first collision, collision-frame count, and clearance shortfall always outrank
-smoothness. A committed action cannot override a different direction that has
-already passed an emergency or clearance-gain release inside the hold window.
+mode change.
+
+A direction is normally held for 12 frames. A near collision, an 8-unit reserve
+gain late in the hold, an immediate corner escape, or a deadline-driven
+`evacuate` direction with at least three cost units of real boundary/boss-route
+progress can release it early. `evacuate` no longer bypasses hysteresis merely
+because of its mode name, and neither does `preposition`. A committed plan must
+pass the same safety gate and cannot restore a stale direction after a release.
+Collision state, first collision, collision-frame count, and the 16/20-unit
+reserve tiers always outrank smoothness.
 
 On 32 recorded `hold/preposition/evacuate/settle` samples, region targets
 `4/6/8/12` all produced 15 collision frames and all eight crossing samples
@@ -322,38 +423,42 @@ remained reachable without a collision. Median clearances were approximately
 anchor L1 error from approximately 0.87 at target 8 to 1.25, so 8 is used for
 narrow forced-region passages.
 
-Two same-seed native closed-loop runs both strictly defeated the attack. From
-the earlier strict run to the final smoothed run, adjacent decision direction
+An earlier v46 same-seed native comparison quantified the smoothing change.
+From the earlier strict run to that smoothed run, adjacent decision direction
 changes fell `835 -> 487`, exact reversals `65 -> 20`, `A -> B -> A` changes
 `154 -> 20`, and consecutive nonzero displacement angles over 90 degrees
 `236 -> 154`. Median predicted minimum clearance rose `1.43 -> 8.27`, decisions
 at or below clearance 4 fell `815 -> 215`, and predicted collision frames fell
 `2346 -> 1009`. These are 60-frame rolling predictions, not actual hits; both
-runs ended with `death=0`.
+runs ended with `death=0`. This evidence predates the current 12-frame
+hysteresis and evacuation-release fix, so it remains a historical comparison
+rather than validation of the final frozen source.
 
 `experiments/benchmark_engine_mpc_grid.py` compares 8/12/16-unit time-layered
 grids against continuous beam plans on the same recorded five-frame-delay
-observations at source frames `488/1292/2102/2801/3695`. Every output plan is
-then recomputed with Engine MPC's per-logical-frame continuous circle geometry;
-the grid's own levels are not accepted as proof of safety. The final v46 result
-is:
+observations at source frames `488/1292/2102/2801/3695`. Grid layers remain
+three frames apart, but each receives every logical-frame swept-threat occupancy
+from its interval. Within each observation all planners are truncated to one
+common shortest action horizon, then recomputed with Engine MPC's
+per-logical-frame continuous circle geometry. This compares complete planners,
+not only rasterization, and the grid's own levels never certify safety:
 
 | Planner | Predicted collision plans | Collision-frame rate | Median minimum clearance | Direction changes per 60 frames | Mean time |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Continuous beam 20/8 | 3/5 | 9.09% | -4.87 | 5.66 | 0.103 s |
-| Grid 8, center sample | 3/5 | 11.00% | -8.51 | 7.40 | 0.638 s |
-| Grid 12, center sample | 3/5 | 10.67% | -5.49 | 9.40 | 0.248 s |
-| Grid 16, center sample | 4/5 | 47.67% | -27.67 | 10.80 | 0.085 s |
+| Continuous beam 20/8 | 3/5 | 9.67% | -4.47 | 6.20 | 0.120 s |
+| Grid 8, center sample | 2/5 | 9.00% | 1.90 | 7.80 | 1.326 s |
+| Grid 12, center sample | 3/5 | 10.00% | -3.04 | 9.20 | 0.698 s |
+| Grid 16, center sample | 4/5 | 45.33% | -26.29 | 10.60 | 0.460 s |
 
 Whole-cell half-diagonal inflation also did not win: collision-frame rates for
-8/12/16-unit grids were 14.33%/17.33%/52.00%. Of the 33 collision frames in
-the 8-unit center variant, 22 occurred between sampled layers and 11 occurred
-on sampled layers, showing combined temporal, spatial-quantization, and risk
-aggregation failures. Grids remain useful for visualization, connectivity,
-and global-region hints, but they do not replace continuous beam validation.
-The final report SHA-256 is
-`a05c36395bc13c6bc829b5694d1b556bdf9be9fb720d554f0bfaa641bc6c67d9`.
-This is an open-loop plan ablation on fixed observations, not an
+8/12/16-unit grids were 11.67%/15.67%/52.33%. The 8-unit center grid's two-frame
+advantage (`27/300` versus `29/300`) is too small to establish a closed-loop
+episode win; it takes about 11 times the mean planning time and changes direction
+more often. Grids remain useful for visualization, connectivity, and global
+region hints, but final local movement keeps per-frame continuous geometry,
+hysteresis, and the committed-plan safety gate. The working report SHA-256 is
+`ffc69082eefd2501d473981689eddd4fcfb67a0152a5723b9f099a46c7bbd901`.
+This is an open-loop five-observation complete-planner ablation, not an
 `attack_complete` success rate.
 
 ### Strict native Boss #3 results
@@ -395,6 +500,20 @@ as strict live-teacher engine evidence rather than deployable-model acceptance.
 They supersede v44/v45, which predate the final region-sort and committed-action
 safety fixes.
 
+The live bridge and MPC now also cover straight and bent lasers. Straight
+tapers and bent polyline segments use a conservative 16-32 px circle cover
+whose radius includes the exact segment half-step; successive sample positions
+capture rotation and changing length rather than incorrectly reusing only the
+laser origin displacement. A native headless Okuu #2 run of implementation
+`fab98499b72c55fb92ceb5586b58be5093df9e42b9755631e008633ceaf96f95` at zero
+observation delay strictly completed at episode frame 3036 with HP `4300 -> 0`,
+`death=0`, and `unsafe_shot_frames=0`, while observing peaks of 552 bullets and
+40 lasers. Planner threat count was 302 at the median and 697 at the maximum.
+The report SHA-256 is
+`70d5afc69faa6fbae55cef0bdd678f6fe090d977608ec4d16ec281377f85dfd2`.
+This is one zero-delay MPC-teacher geometry result, not delay-5 or learned-policy
+evidence and not a success-rate claim.
+
 A separate full-engine native macOS OpenGL run kept the optimized F7 overlay
 enabled and met the same strict success definition. Report
 `engine-mpc-boss3-gpu-overlay-strict-seed20260730.json` (SHA-256
@@ -414,7 +533,7 @@ do not establish live-engine generalization.
 
 ## 7. Portable Full Engine, High-speed Test Target, and Rendering
 
-The current `/Users/happyelements/LuaSTG-Sub` source no longer has the old
+The current LuaSTG-Sub source tree no longer has the old
 complete-engine DirectX dependency. The complete executable supports Windows,
 macOS, and Linux through SDL2 window/input/audio plus an OpenGL 4.1 GPU
 sprite/FBO renderer, or null graphics/window/audio for uncapped headless runs.
@@ -435,7 +554,8 @@ The full macOS presets configure, build, run the DirectX audit, and execute the
 corresponding tests:
 
 ```bash
-cd /Users/happyelements/LuaSTG-Sub
+LUA_STG_SUB_ROOT=/path/to/LuaSTG-Sub
+cd "$LUA_STG_SUB_ROOT"
 cmake --workflow --preset macos-headless-release
 cmake --workflow --preset macos-opengl-release
 ```
@@ -447,7 +567,8 @@ collision/risk view. This target is useful for algorithm tests but is not the
 complete macOS game runtime.
 
 ```bash
-cd /Users/happyelements/LuaSTG-Sub
+LUA_STG_SUB_ROOT=/path/to/LuaSTG-Sub
+cd "$LUA_STG_SUB_ROOT"
 cmake --preset portable-native
 cmake --build --preset portable-native-release
 ctest --preset portable-native
@@ -476,27 +597,31 @@ module. It does not execute arbitrary SR Lua and cannot replace full-engine
 
 `game/plugins/SafetyZoneVisualizer` adds an in-engine F7 overlay, or it can be
 enabled at launch with `SR_SAFETY_ZONE_OVERLAY=1`. It grades safe, caution,
-danger, and collision cells from current colliders and linear projections every
-three frames from 0 through 24. A 16-unit cell is classified as a whole by
-inflating the player radius by its half diagonal. Red is signed clearance at
-most 0; orange is clearance at most 12 or at least five simultaneous nearby
-threats within 36; yellow is clearance at most 24 or at least three. Clearance
-takes the worst future layer, while density is counted in each layer before
-taking its maximum, so threats arriving at different times are not combined
-into a fictitious crowd. Circles, rotated ellipses, rectangles, and straight
-lasers are supported. Straight lasers are evaluated as tapered polygons from
-`l1`, `l2`, `l3`, and `w`, including THlib laser objects whose generic ellipse
-fields `a=b=0`; curved-laser interiors are not rasterized.
+danger, and collision cells from current colliders and linear projections at
+every logical frame from 0 through 24. A 16-unit cell is classified as a whole
+by inflating the player radius by its half diagonal. Red is signed clearance at
+most 0; orange is clearance at most 16 or at least five simultaneous nearby
+threats within 36; yellow is clearance at most 28 or at least three. Clearance
+takes the worst future frame, while density is counted per frame before taking
+its maximum, so threats arriving at different times are not combined into a
+fictitious crowd. Ellipse radii extrapolate only growth: recent rebuilds provide
+the observed growth rate, and `GROUP_INDES` ellipses use at least the Boss #3
+0.7-unit-per-frame guard. The forecast never assumes shrinkage to classify a
+cell as safe. Circles, rotated ellipses, rectangles, and straight lasers are
+supported. Straight lasers are evaluated as tapered polygons from `l1`, `l2`,
+`l3`, and `w`, including THlib laser objects whose generic ellipse fields
+`a=b=0`; curved-laser interiors are not rasterized.
 
 The conservative spatial index registers only cells inside
 classification-relevant projected bounds. The standalone test compares every
 optimized cell with the full scan, covering ellipses, rotated rectangles,
-tapered lasers, fast projections, cell-corner collisions, time-separated
+tapered lasers, a fast bullet crossing between the former three-frame layers,
+expanding forced-region colliders, cell-corner collisions, time-separated
 density, boundary cases, and a 350-bullet field; any lower risk level fails.
-It required 34,548 exact clearance calculations out of 2,116,800 (1.63%) and
+It required 94,585 exact clearance calculations out of 5,880,000 (1.61%) and
 coalesced 672 cells into 45 render rectangles (`45/672`, rectangles/cells)
 while preserving exact per-cell parity. The implementation SHA-256 is
-`a39c7a1ac49e8a6214c1af2f1df6d6ae72ea113ac7bca6bc195c83a7bcf871be`.
+`b87ff9802e43345a300bca9329572917e9454e8dda62a720ef7b3f471011c4ee`.
 The overlay reads geometry only and does not alter input, RNG, collision, or AI
 memory.
 
@@ -548,7 +673,176 @@ restarted after the file is replaced.
 
 ## 8. Model and Training
 
-The reference policy uses a dual visual encoder:
+### Native stream policy v1: strict status
+
+The retained checkpoint is
+[`policy_native_stream_v1.pt`](../tools/stg_lab/models/policy_native_stream_v1.pt),
+SHA-256
+`829eebe53c886e5ba53f577542938b904aad740f3a5bf04b49d61e73ab61557d`.
+The detailed model card is
+[`policy_native_stream_v1.md`](../tools/stg_lab/models/policy_native_stream_v1.md).
+Its 25-episode, 21,916-decision training archive has SHA-256
+`1bc03ce647d34c1fb3f77ba751d50ca7b602a9e16189025819e3cf89a423c384`.
+
+This model uses a 192-unit GRU and dual semantic visual encoders. It has no
+scenario memory or proficiency input (`memory_size=0`,
+`proficiency_size=0`). Its inputs are the latest delayed global/local semantic
+frames, the current visible player pose, and recurrent hidden state. Attack
+identity, absolute time, script phase, recorded routes, waypoints, teacher
+risk, and external memory are not model inputs.
+
+The training run uses episode-stateful TBPTT with 32-decision chunks,
+episode-balanced optimization, class-balance power 0.75, movement-onset weight
+4.0, and direction-change weight 1.5. Each complete training episode has equal
+optimizer weight regardless of length. Onsets and changes come only from
+adjacent teacher actions inside one episode. Episode IDs 11-15 remain intact
+for validation. The run uses `restore_best_validation=false`: internal
+validation loss was lowest at epoch 8 (2.3124849571), while the retained epoch
+40 loss was 2.5737202304. The retained candidate is selected by strict native
+outcomes, not by presenting epoch 40 as validation-best.
+
+DAgger has two declared archive contracts. Legacy teacher-labelled archives
+use `teacher_action` as the target for every student-visited decision.
+Direct-corrective archives preserve the student's executed actions and the
+complete recurrent context; an intervened executed label is the teacher
+correction, and `supervision_mask` can restrict action loss to only the
+intervention/correction points. Older unmasked archives remain fully supervised
+when merged with masked archives. Only a strictly completed native episode is
+admitted, but its assisted completion is training-data evidence, not evidence
+that the student policy completed the attack.
+
+`contextualize-demos` optionally attaches an identity-only one-hot token to
+each complete episode from its strict provenance manifest. The vocabulary
+contains an unknown token and registered attack/stage identities and is stored
+in the checkpoint by `--scenario-vocabulary-manifest`; it contains no phase,
+coordinate, action, waypoint, or route data. This lets network weights learn
+identity-dependent behavior instead of adding handwritten strategy branches.
+With `--previous-action-conditioning`, a separate 18-way one-hot token contains
+only the previous motor action actually executed. Direct-corrective DAgger
+preserves that executed-action stream, and live inference commits it only after
+the engine advances. It never contains a future action, teacher proposal,
+position, frame, phase, waypoint, or route; it is motor feedback for learned
+temporal dynamics.
+The experiment did not pass release gates: a recurrent-256 candidate cleared
+Koishi #1 at 915 frames but failed Okuu #3 at 522; 20 more epochs reached 642.
+One strictly completed Okuu #3 DAgger episode required 1100/1272 teacher
+interventions; a subsequent 10-epoch continuation failed its pure Okuu #3 run
+at 514 frames. The shipped checkpoint therefore remains `memory_size=0`.
+
+New corrective collections at Okuu #3 seeds 20260813 and 20260815 reached
+`attack_complete` at frame 3,815 with death 0, but required 489/1,272 (38.44%)
+and 467/1,272 (36.71%) teacher interventions. Their reports explicitly set
+`pure_policy=false`, `pure_policy_success=false`, and
+`pure_policy_validation_eligible=false`. The v13 all-label aggregate contains
+35 episodes and 33,866 recurrent decisions. The critical-intervention aggregate
+preserves the same 33,866 decisions, has 30,376 supervised labels overall, and
+retains all recurrent context for six Okuu #3 corrective episodes while
+supervising only their 4,142 intervention points.
+
+The latest pure, unshielded Okuu #3 candidates produced these strict results:
+
+| Candidate | Seed | Frames | HP observed | Reason / death | Result |
+| --- | ---: | ---: | --- | --- | --- |
+| v10 unweighted | 20260812 | 392 | `6000 -> 5524.5` | `player_hit` / 100 | fail |
+| v11 corrected unique | 20260812 | 764 | `6000 -> 4924.5` | `player_hit` / 100 | fail |
+| v11 corrections repeated x4 | 20260812 | 431 | `6000 -> 5453` | `player_hit` / 100 | fail |
+| v12 Okuu specialist, final epoch 80 | 20260812 | 726 | `6000 -> 5086` | `player_hit` / 100 | fail |
+| v12 general, final epoch 30 | 20260812 | 414 | `6000 -> 5478` | `player_hit` / 100 | fail |
+| v13 all-label, validation-best epoch 3 | 20260816 | 413 | `6000 -> 5481` | `player_hit` / 100 | fail |
+
+The v13 all-label checkpoint selected epoch 3 at validation loss
+1.9728760589. Neither that offline improvement nor either assisted clear passes
+the pure native release gate, so no v10-v13 candidate is publishable.
+
+These result classes are intentionally disjoint:
+
+| Class | Controller authority | Evidence boundary |
+| --- | --- | --- |
+| pure GRU | delayed visual stream and GRU hidden state | eligible learned-policy result |
+| visible safety | separate visible-only local forecast may override GRU | diagnostic hybrid; intervention count must be disclosed |
+| DAgger teacher | exact-state MPC labels all student-visited states and may execute | training only; not student success |
+| Engine MPC | exact object state and optional teacher-only region memory | planner/teacher result; not checkpoint output |
+
+For an attack, strict success is
+`terminated=true`, `termination_reason=attack_complete`, and an explicit
+finite numeric, non-Boolean `final_player.death=0`. For a complete stage, the
+reason must instead be `stage_complete`. Frame/time limits, partial damage,
+long survival, completion after death, ghost/protected state, and missing or
+non-numeric death evidence fail. The final matrix used history 1, five-frame
+observation delay, expert execution, and no visible-safety shield:
+
+| Target | Seed | Frames | HP observed | Reason / death | Strict result |
+| --- | ---: | ---: | --- | --- | --- |
+| Koishi #1 | 20260738 | 906 | `700 -> 0` | `attack_complete` / 0 | pass |
+| Koishi #1 | 20260739 | 906 | `700 -> 0` | `attack_complete` / 0 | pass |
+| Koishi #1 | 20260740 | 906 | `700 -> 0` | `attack_complete` / 0 | pass |
+| Yamame #3 | 20260738 | 491 | `1800 -> 1306.25` | `player_hit` / 100 | fail |
+| Satori #5 | 20260738 | 384 | `3200 -> 2883` | `player_hit` / 100 | fail |
+| Okuu #3 | 20260740 | 754 | `6000 -> 5046` | `player_hit` / 100 | fail |
+| Okuu #4 | 20260740 | 1065 | `3500 -> 2629.5` | `player_hit` / 100 | fail |
+| Okuu EX #2 | 20260740 | 446 | `3333 -> 2834` | `player_hit` / 100 | fail |
+| Orin #4 | 20260740 | 261 | `4500 -> 4407` | `player_hit` / 100 | fail |
+| Stage 1 Normal | 20260740 | 543 | across-wave HP is not comparable | `player_hit` / 100 | fail |
+
+The retained checkpoint was then replayed against the final source fingerprint
+`fa891752547e10f478fbec6b4f85349e4c43061fb3788bea9014ac1f9337ac56`,
+with checkpoint path/SHA-256 verification and the same pure-policy settings:
+
+| Current-source target | Seed | Frames | HP observed | Reason / death | Strict result |
+| --- | ---: | ---: | --- | --- | --- |
+| Koishi #1 | 20260738 | 906 | `700 -> 0` | `attack_complete` / 0 | pass |
+| Koishi #1 | 20260739 | 906 | `700 -> 0` | `attack_complete` / 0 | pass |
+| Koishi #1 | 20260740 | 906 | `700 -> 0` | `attack_complete` / 0 | pass |
+| Koishi #1, held out | 314159265 | 906 | `700 -> 0` | `attack_complete` / 0 | pass |
+| Yamame #3, held out | 314159265 | 493 | `1800 -> 1300.25` | `player_hit` / 100 | fail |
+| Okuu #4, held out | 314159265 | 1065 | `3500 -> 2629.5` | `player_hit` / 100 | fail |
+| Stage 1 Normal, held out | 314159265 | 543 | across-wave HP is not comparable | `player_hit` / 100 | fail |
+
+The current release therefore proves strict pure completion only for Koishi
+#1: all three known seeds and one independently selected held-out seed passed,
+while every current-source cross-target probe failed. The three original runs
+made 105.96-107.06 direction changes per 1,000 frames,
+10-11 exact reversals, 7 ABA changes, and had a 6-frame median hold. Three
+near-deterministic known-seed runs plus one held-out run on the same card do not
+establish a general success rate or human equivalence. The strict Koishi DAgger
+teacher reference made 97.46
+changes per 1,000 frames, no ABA changes, and had a 9-frame median hold; the
+checkpoint is still more restless. Later Yamame #1 and Satori #1 DAgger
+episodes have no pure checkpoint run and are not claimed as model successes.
+Human-like general play remains unmet, as do cross-card reliability and
+full-stage completion.
+
+Proficiency is a seeded runtime transform, not network conditioning. Expert
+uses 0 added delay, a 3-frame minimum hold, and 0% suboptimal choices;
+intermediate uses 3/6/1%; novice uses 6/9/4%. With visible safety disabled,
+intermediate Koishi #1 seed 20260741 failed at 593 frames (`700 -> 291.5`,
+death 100), and novice failed at 478 (`700 -> 342.5`, death 100). The expert
+result is 3/3 on different seeds; this is not a controlled proficiency study.
+
+Offline validation-best and specialist selection did not replace the strict
+gate. Yamame #3 specialist v1 validation-best epoch 1 failed at 598 frames;
+its final epoch 40 failed at 495. Recurrent-size-256 specialist v2
+validation-best epoch 19 failed at 530 and 502 frames on seeds 20260740 and
+20260743. All four ended in `player_hit`, death 100. A 29-episode,
+26,234-decision v5 candidate trained from scratch for 60 epochs lowered its
+validation loss to 2.2334204706, yet failed Koishi #1 at frame 391 on seeds
+20260742 and 20260744 (`700 -> 592.5`, death 100). Fifteen more low-rate epochs
+reached only frame 436. Its Okuu #3 visible-safety hybrid died at frame 902
+after 66 interventions, shorter than the scratch model's 1,146-frame pure run.
+Specialist, validation-best, expanded-scratch, and hybrid candidates were
+therefore rejected as deployment evidence.
+
+Full-stage status is also negative for the learned policy. The final pure GRU
+remained stationary and failed Stage 1 Normal at 543 frames. Separately, an
+MPC-teacher Stage 1 attempt at seed 20260731 failed at a 7,199-frame time
+limit with death 0; a seed-20260732 teacher rerun reached `stage_complete` at
+12,453 frames with death 0. The latter is teacher evidence, not model success,
+and the long episode was excluded from the spell pool after it over-weighted
+stationary decisions.
+
+### Legacy standalone visible-v2 model
+
+The legacy standalone reference policy uses a dual visual encoder:
 
 - a global CNN processes the entire playfield;
 - a local CNN processes the player crop;
@@ -647,13 +941,16 @@ neither original-card defeats nor live-engine AI results.
 
 ### Live Engine MPC outcome criterion
 
-A live Engine MPC attempt is successful only when the final report has both
-`terminated=true` and `termination_reason=attack_complete`. Engine-confirmed
-boss defeat or full attack endurance may satisfy that condition. Reaching
-`max_frames`, surviving longer, or reducing boss HP without attack completion
-does not count as success. Every action keeps `spell=false`; shooting is enabled
-only when predicted safety margin meets the configured threshold and is
-disabled during danger. The current command has no recorded-action prefix
+A live Engine MPC attack attempt is successful only when the final report has
+`terminated=true`, exactly `termination_reason=attack_complete`, and an
+explicit finite numeric, non-Boolean `final_player.death=0`. Engine-confirmed
+boss defeat or full attack endurance may satisfy that condition. A complete
+stage instead requires `termination_reason=stage_complete` with the same
+zero-death evidence. Reaching `max_frames`, surviving longer, reducing boss HP
+without attack completion, completing after death, or omitting valid death
+evidence does not count as success. Every action keeps `spell=false`; shooting
+is enabled only when predicted safety margin meets the configured threshold and
+is disabled during danger. The current command has no recorded-action prefix
 loader; externally prefix-assisted evidence would be ineligible.
 
 ### Engine acceptance

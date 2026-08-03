@@ -74,6 +74,24 @@ class EngineClient:
             options=dict(options or {}),
         )
 
+    def reset_stage(
+        self,
+        stage: str,
+        *,
+        seed: int,
+        player: str = "reimu_player",
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(stage, str) or not stage:
+            raise ValueError("stage must be a nonempty string")
+        return self.request(
+            "reset_stage",
+            stage=stage,
+            seed=seed,
+            player=player,
+            options=dict(options or {}),
+        )
+
     def ping(self) -> dict[str, Any]:
         return self.request("ping")
 

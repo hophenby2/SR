@@ -15,6 +15,7 @@ from typing import Any, Iterable, Mapping
 
 from .benchmark import summarize_episodes
 from .metrics import EpisodeMetrics
+from .policy import PlayerProficiencyProfile, resolve_proficiency
 from .rollout import RolloutConfig, evaluate_policy
 from .scenarios import make_environment
 from .sim import SimulationConfig
@@ -73,6 +74,7 @@ class PolicyBenchmarkWorkerJob:
     rollout_config: RolloutConfig
     simulation_config: SimulationConfig
     shield: bool
+    proficiency: PlayerProficiencyProfile = resolve_proficiency("expert")
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +124,7 @@ def evaluate_policy_worker(job: PolicyBenchmarkWorkerJob) -> PolicyBenchmarkWork
             vision_config=job.vision_config,
             config=job.rollout_config,
             shield=job.shield,
+            proficiency=job.proficiency,
             device="cpu",
         )
         chunks.append(PolicyScenarioChunkResult(
@@ -215,6 +218,7 @@ def run_policy_benchmark(
     simulation_config: SimulationConfig = SimulationConfig(),
     shield: bool = True,
     workers: int = 1,
+    proficiency: str | PlayerProficiencyProfile = "expert",
 ) -> dict[str, Any]:
     """Evaluate one checkpoint on CPU while loading it once per worker."""
 
@@ -229,6 +233,7 @@ def run_policy_benchmark(
         raise ValueError("at least one policy benchmark seed is required")
 
     effective_workers = min(int(workers), len(seed_values))
+    profile = resolve_proficiency(proficiency)
     seed_chunks = _split_seeds(seed_values, effective_workers)
     jobs = tuple(
         PolicyBenchmarkWorkerJob(
@@ -242,6 +247,7 @@ def run_policy_benchmark(
             rollout_config=rollout_config,
             simulation_config=simulation_config,
             shield=bool(shield),
+            proficiency=profile,
         )
         for worker_index in range(effective_workers)
     )
@@ -286,6 +292,7 @@ def run_policy_benchmark(
             "vision_config": asdict(vision_config),
             "rollout_config": asdict(rollout_config),
             "simulation_config": asdict(simulation_config),
+            "proficiency": asdict(profile),
         },
         "checkpoint_metadata": checkpoint_metadata,
         "shield": bool(shield),

@@ -20,6 +20,7 @@ _OBJECT_ARRAYS = (
     "nontjt_enemies",
     "indestructibles",
 )
+_LASER_KINDS = frozenset(("straight_laser", "bent_laser"))
 _SQRT_HALF = math.sqrt(0.5)
 
 
@@ -49,6 +50,144 @@ def _radius(record: Mapping[str, Any], default: float = 2.0) -> float:
         if (value := _number(record.get(name))) is not None
     ]
     return max(0.1, *(values or [default]))
+
+
+def _laser_width(record: Mapping[str, Any]) -> float:
+    value = _number(record.get("w"), _number(record.get("w0"), 2.0))
+    return max(0.5, abs(value or 2.0))
+
+
+def _segment_circle_records(
+    *,
+    key: str,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    start_half_width: float,
+    end_half_width: float,
+) -> list[dict[str, Any]]:
+    """Conservatively cover a tapered segment with trackable circles."""
+
+    length = math.hypot(x2 - x1, y2 - y1)
+    if length <= 1e-6:
+        return []
+    maximum_half_width = max(0.25, start_half_width, end_half_width)
+    # The circle radius below uses the exact segment half-step, so wider
+    # spacing remains a complete cover. A 16-32 px target avoids turning a
+    # screen-length laser into hundreds of planner threats. For an 8 px laser
+    # it adds about 12.5 px of conservative side clearance, intentionally
+    # keeping the controller away from grazing trajectories.
+    spacing = max(16.0, min(32.0, maximum_half_width * 8.0))
+    count = max(1, math.ceil(length / spacing))
+    half_step = 0.5 * length / count
+    result: list[dict[str, Any]] = []
+    for index in range(count):
+        start_t = index / count
+        end_t = (index + 1) / count
+        middle_t = 0.5 * (start_t + end_t)
+        local_width = max(
+            start_half_width + (end_half_width - start_half_width) * start_t,
+            start_half_width + (end_half_width - start_half_width) * end_t,
+        )
+        # The diagonal covers both the strip half-width and the along-segment
+        # half step. This never certifies a gap between adjacent samples.
+        radius = math.hypot(max(0.0, local_width), half_step)
+        sample: dict[str, Any] = {
+            "id": f"{key}:{index}",
+            "x": x1 + (x2 - x1) * middle_t,
+            "y": y1 + (y2 - y1) * middle_t,
+            "a": radius,
+            "b": radius,
+            "collidable": True,
+        }
+        result.append(sample)
+    return result
+
+
+def _laser_circle_records(
+    record: Mapping[str, Any],
+    ordinal: int,
+) -> list[dict[str, Any]]:
+    """Convert visible straight/bent laser geometry to a circle cover."""
+
+    kind = record.get("kind")
+    if kind not in _LASER_KINDS:
+        return []
+    laser_id = record.get("id", ordinal)
+    width = _laser_width(record)
+    half_width = 0.5 * width
+    if kind == "bent_laser":
+        points = record.get("points")
+        if not isinstance(points, Sequence) or isinstance(points, (str, bytes)):
+            return []
+        valid_points = [
+            (
+                _number(point.get("x")),
+                _number(point.get("y")),
+            )
+            for point in points
+            if isinstance(point, Mapping)
+        ]
+        valid_points = [
+            (float(x), float(y))
+            for x, y in valid_points
+            if x is not None and y is not None
+        ]
+        result: list[dict[str, Any]] = []
+        for segment, (first, second) in enumerate(zip(valid_points, valid_points[1:])):
+            result.extend(_segment_circle_records(
+                key=f"{laser_id}:bent:{segment}",
+                x1=first[0],
+                y1=first[1],
+                x2=second[0],
+                y2=second[1],
+                start_half_width=half_width,
+                end_half_width=half_width,
+            ))
+        return result
+
+    x = _number(record.get("x"))
+    y = _number(record.get("y"))
+    if x is None or y is None:
+        return []
+    rotation = math.radians(_number(record.get("rot"), 0.0) or 0.0)
+    l1 = max(0.0, _number(record.get("l1"), 0.0) or 0.0)
+    l2 = max(0.0, _number(record.get("l2"), 0.0) or 0.0)
+    l3 = max(0.0, _number(record.get("l3"), 0.0) or 0.0)
+    total = l1 + l2 + l3
+    if total <= 1e-6:
+        total = max(0.0, abs(_number(record.get("l"), 0.0) or 0.0))
+        l1, l2, l3 = 0.0, total, 0.0
+    if total <= 1e-6:
+        return []
+
+    direction_x = math.cos(rotation)
+    direction_y = math.sin(rotation)
+    sections = (
+        (0.0, l1, 0.0 if l1 > 0.0 else half_width, half_width),
+        (l1, l1 + l2, half_width, half_width),
+        (
+            l1 + l2,
+            total,
+            half_width,
+            0.0 if l3 > 0.0 else half_width,
+        ),
+    )
+    result = []
+    for section, (start, stop, start_width, stop_width) in enumerate(sections):
+        if stop - start <= 1e-6:
+            continue
+        result.extend(_segment_circle_records(
+            key=f"{laser_id}:straight:{section}",
+            x1=x + direction_x * start,
+            y1=y + direction_y * start,
+            x2=x + direction_x * stop,
+            y2=y + direction_y * stop,
+            start_half_width=start_width,
+            end_half_width=stop_width,
+        ))
+    return result
 
 
 _REGION_PHASE_ORDER = (
@@ -237,13 +376,17 @@ class MPCConfig:
     beam_width: int = 128
     region_beam_width: int = 512
     radius_rate_horizon: int = 6
+    danger_margin_target: float = 16.0
     safe_margin_target: float = 20.0
-    clearance_reward_cap: float = 36.0
+    clearance_reward_cap: float = 48.0
     clearance_reward_weight: float = 0.35
-    minimum_direction_hold_frames: int = 9
+    corner_reserve_target: float = 48.0
+    corner_reserve_weight: float = 0.25
+    minimum_direction_hold_frames: int = 12
+    collision_priority_frames: int = 36
     emergency_collision_frames: int = 12
     emergency_margin: float = 4.0
-    switch_margin_gain: float = 6.0
+    switch_margin_gain: float = 8.0
     direction_switch_penalty: float = 3.0
     direction_reverse_penalty: float = 9.0
     direction_aba_penalty: float = 6.0
@@ -262,6 +405,25 @@ class MPCConfig:
     region_radius_step: float = 0.7
     region_dynamics_memory: RegionDynamicsMemory | None = None
     track_displacement_tolerance: float = 1.0
+    gap_prediction_enabled: bool = True
+    gap_direction_tolerance_degrees: float = 12.0
+    gap_speed_relative_tolerance: float = 0.20
+    gap_speed_absolute_tolerance: float = 0.35
+    gap_minimum_speed: float = 0.75
+    gap_minimum_group_size: int = 3
+    gap_wavefront_depth: float = 24.0
+    gap_maximum_lateral_spacing: float = 112.0
+    gap_safety_margin: float = 10.0
+    gap_minimum_usable_width: float = 4.0
+    gap_sample_interval: int = 6
+    gap_minimum_lifetime_frames: int = 12
+    gap_entry_guard_frames: int = 6
+    gap_hold_frames: int = 6
+    gap_path_minimum_margin: float = 4.0
+    gap_group_coverage_fraction: float = 0.45
+    gap_anchor_weight: float = 1.5
+    gap_entry_candidate_limit: int = 8
+    gap_detour_beam_width: int = 48
 
     def __post_init__(self) -> None:
         if self.horizon_frames < 36:
@@ -278,14 +440,25 @@ class MPCConfig:
             raise ValueError("region_beam_width must be positive")
         if self.radius_rate_horizon < 0:
             raise ValueError("radius_rate_horizon cannot be negative")
-        if not math.isfinite(self.safe_margin_target) or self.safe_margin_target < 0.0:
-            raise ValueError("safe_margin_target must be finite and nonnegative")
+        margin_targets = (
+            self.danger_margin_target,
+            self.safe_margin_target,
+            self.corner_reserve_target,
+        )
+        if not all(
+            math.isfinite(value) and value >= 0.0 for value in margin_targets
+        ):
+            raise ValueError("safety margin targets must be finite and nonnegative")
+        if self.danger_margin_target > self.safe_margin_target:
+            raise ValueError("danger_margin_target cannot exceed safe_margin_target")
         if self.minimum_direction_hold_frames < 0:
             raise ValueError("minimum_direction_hold_frames cannot be negative")
         if self.minimum_direction_hold_frames % self.decision_interval != 0:
             raise ValueError(
                 "minimum_direction_hold_frames must align to the decision interval"
             )
+        if not 1 <= self.collision_priority_frames <= self.horizon_frames:
+            raise ValueError("collision_priority_frames must be within the horizon")
         if not 0 <= self.emergency_collision_frames <= self.horizon_frames:
             raise ValueError("emergency_collision_frames must be within the horizon")
         temporal_values = (
@@ -296,6 +469,7 @@ class MPCConfig:
             raise ValueError("clearance and hysteresis thresholds must be finite and positive")
         nonnegative_temporal_values = (
             self.clearance_reward_weight,
+            self.corner_reserve_weight,
             self.emergency_margin,
             self.direction_switch_penalty,
             self.direction_reverse_penalty,
@@ -333,6 +507,59 @@ class MPCConfig:
             raise ValueError("learned maximum radius must exceed the minimum")
         if not math.isfinite(self.region_path_weight) or self.region_path_weight < 0.0:
             raise ValueError("region_path_weight must be finite and nonnegative")
+        if not isinstance(self.gap_prediction_enabled, bool):
+            raise ValueError("gap_prediction_enabled must be boolean")
+        gap_positive_values = (
+            self.gap_direction_tolerance_degrees,
+            self.gap_speed_absolute_tolerance,
+            self.gap_minimum_speed,
+            self.gap_wavefront_depth,
+            self.gap_maximum_lateral_spacing,
+            self.gap_minimum_usable_width,
+        )
+        if not all(
+            math.isfinite(value) and value > 0.0 for value in gap_positive_values
+        ):
+            raise ValueError("gap geometry values must be finite and positive")
+        if not 0.0 < self.gap_direction_tolerance_degrees < 90.0:
+            raise ValueError("gap direction tolerance must be below 90 degrees")
+        if (
+            not math.isfinite(self.gap_speed_relative_tolerance)
+            or not 0.0 <= self.gap_speed_relative_tolerance < 1.0
+        ):
+            raise ValueError("gap relative speed tolerance must be in [0, 1)")
+        if self.gap_minimum_group_size < 2:
+            raise ValueError("gap groups require at least two bullets")
+        gap_frame_values = (
+            self.gap_sample_interval,
+            self.gap_minimum_lifetime_frames,
+            self.gap_entry_guard_frames,
+            self.gap_hold_frames,
+            self.gap_entry_candidate_limit,
+            self.gap_detour_beam_width,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in gap_frame_values
+        ):
+            raise ValueError("gap frame and beam values must be positive integers")
+        gap_nonnegative_values = (
+            self.gap_safety_margin,
+            self.gap_path_minimum_margin,
+            self.gap_anchor_weight,
+        )
+        if not all(
+            math.isfinite(value) and value >= 0.0
+            for value in gap_nonnegative_values
+        ):
+            raise ValueError("gap safety and preference values must be nonnegative")
+        if self.gap_path_minimum_margin < self.emergency_margin:
+            raise ValueError("gap path margin cannot be below the emergency margin")
+        if (
+            not math.isfinite(self.gap_group_coverage_fraction)
+            or not 0.0 <= self.gap_group_coverage_fraction <= 1.0
+        ):
+            raise ValueError("gap group coverage fraction must be in [0, 1]")
         weights = (self.boundary_weight, self.boss_alignment_weight)
         if not all(math.isfinite(value) and value >= 0.0 for value in weights):
             raise ValueError("MPC weights must be finite and nonnegative")
@@ -378,6 +605,9 @@ class CandidateEvaluation:
     boundary_penalty: float
     boss_alignment: float
     motion_penalty: float = 0.0
+    minimum_nonregion_margin: float = math.inf
+    minimum_region_margin: float = math.inf
+    immediate_corner_clearance: float = math.inf
 
     @property
     def selection_key(self) -> tuple[float, ...]:
@@ -424,6 +654,12 @@ class MPCDecision:
     region_learned_cycle_frames: float | None
     region_frames_until_expansion: float | None
     region_observed_radius: float | None
+    gap_bullet_group_count: int = 0
+    gap_corridor_count: int = 0
+    gap_selected_center: tuple[float, float] | None = None
+    gap_selected_width: float | None = None
+    gap_selected_lifetime_frames: int | None = None
+    gap_navigation_mode: str = "inactive"
 
 
 @dataclass(slots=True)
@@ -459,6 +695,40 @@ class _RegionAnchor:
             self.target_component,
             self.portal,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _GapBulletGroup:
+    key: str
+    members: tuple[PredictedThreat, ...]
+    direction_x: float
+    direction_y: float
+    speed: float
+    coverage_fraction: float
+
+
+@dataclass(frozen=True, slots=True)
+class _GapCorridor:
+    key: str
+    group_key: str
+    center_x: float
+    center_y: float
+    usable_width: float
+    lifetime_frames: int
+    arrival_frames: float
+    path_margin: float
+    normal_x: float
+    normal_y: float
+    member_count: int
+    entry_plan: tuple[Action, ...] = ()
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return self.center_x, self.center_y
+
+    @property
+    def entry_action(self) -> Action | None:
+        return self.entry_plan[0] if self.entry_plan else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1031,12 +1301,47 @@ class VisibleTrackEstimator:
         seen: set[str] = set()
         delay = self.config.observation_delay
 
+        source_records: list[tuple[str, Sequence[Any]]] = []
+        fallback_lasers: list[Mapping[str, Any]] = []
         for source in _OBJECT_ARRAYS:
             records = observation.get(source)
             if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
                 continue
+            ordinary: list[Any] = []
+            for record in records:
+                if isinstance(record, Mapping) and record.get("kind") in _LASER_KINDS:
+                    fallback_lasers.append(record)
+                else:
+                    ordinary.append(record)
+            source_records.append((source, ordinary))
+
+        laser_records = observation.get("lasers")
+        if not isinstance(laser_records, Sequence) or isinstance(laser_records, (str, bytes)):
+            laser_records = fallback_lasers
+        sampled_lasers: list[dict[str, Any]] = []
+        laser_identities: set[tuple[Any, Any]] = set()
+        for ordinal, record in enumerate(laser_records):
+            if not isinstance(record, Mapping):
+                continue
+            identity = (record.get("kind"), record.get("id", ordinal))
+            if identity in laser_identities:
+                continue
+            laser_identities.add(identity)
+            sampled_lasers.extend(_laser_circle_records(record, ordinal))
+        source_records.append(("lasers", sampled_lasers))
+
+        for source, records in source_records:
             for ordinal, record in enumerate(records):
-                if not isinstance(record, Mapping) or record.get("collidable", True) is not True:
+                if not isinstance(record, Mapping):
+                    continue
+                # Enemy bullets and laser warnings may become collidable inside
+                # the observation-delay window. Humans can already see them,
+                # and dropping them here makes the teacher less informed than
+                # the semantic policy input.
+                if (
+                    record.get("collidable", True) is not True
+                    and source not in {"enemy_bullets", "lasers"}
+                ):
                     continue
                 x = _number(record.get("x"))
                 y = _number(record.get("y"))
@@ -1064,6 +1369,7 @@ class VisibleTrackEstimator:
                     continuous
                     and elapsed > 0
                     and displacement_available
+                    and source != "lasers"
                     and math.hypot(
                         estimated_vx - visible_vx,
                         estimated_vy - visible_vy,
@@ -1071,8 +1377,10 @@ class VisibleTrackEstimator:
                 ):
                     continuous = False
                     elapsed = 0
-                # Once two visible samples exist, derive motion from them.
-                # Per-frame visible displacement also rejects immediately reused IDs.
+                # Once two visible samples exist, derive motion from them. Laser
+                # sample displacement includes rotation and length changes that
+                # the parent object's dx/dy cannot represent. Other per-frame
+                # displacement still rejects immediately reused IDs.
                 vx = estimated_vx if continuous and elapsed > 0 else visible_vx
                 vy = estimated_vy if continuous and elapsed > 0 else visible_vy
                 radius_rate = (
@@ -1084,13 +1392,16 @@ class VisibleTrackEstimator:
                 seen.add(key)
                 motion_horizon = (
                     self.config.nonbullet_motion_horizon
-                    if source in {"enemies", "nontjt_enemies"} else
+                    if source in {"enemies", "nontjt_enemies", "lasers"} else
                     self.config.horizon_frames
                 )
                 predicted_radius_rate = radius_rate
                 radius_rate_horizon = self.config.radius_rate_horizon
                 predicted_radius = radius
-                if source == "indestructibles":
+                if (
+                    source == "indestructibles"
+                    and self.config.region_dynamics_memory is not None
+                ):
                     minimum = self.config.region_learned_min_radius
                     maximum = self.config.region_learned_max_radius
                     step = self.config.region_radius_step
@@ -1160,11 +1471,21 @@ class EngineMPC:
         self._last_source_frame: int | None = None
         self._last_decision_frame: int | None = None
         self._decision: MPCDecision | None = None
+        dynamics_memory = self.config.region_dynamics_memory
         self._region_phase = _RegionPhaseMemory(
-            minimum_hint=self.config.region_learned_min_radius,
-            maximum_hint=self.config.region_learned_max_radius,
-            rate_hint=self.config.region_radius_step,
-            dynamics_memory=self.config.region_dynamics_memory,
+            minimum_hint=(
+                self.config.region_learned_min_radius
+                if dynamics_memory is not None else None
+            ),
+            maximum_hint=(
+                self.config.region_learned_max_radius
+                if dynamics_memory is not None else None
+            ),
+            rate_hint=(
+                self.config.region_radius_step
+                if dynamics_memory is not None else None
+            ),
+            dynamics_memory=dynamics_memory,
         )
         self._region_topology = _RegionTopologyMemory()
         self._committed_plan: tuple[Action, ...] = ()
@@ -1174,6 +1495,7 @@ class EngineMPC:
         self._last_action: Action | None = None
         self._previous_action: Action | None = None
         self._direction_started_frame: int | None = None
+        self._active_gap_key: str | None = None
 
     @staticmethod
     def _player(observation: Mapping[str, Any], delay: int) -> tuple[float, float, float, float, float]:
@@ -1224,6 +1546,23 @@ class EngineMPC:
         return bottom + (top - bottom) * self.config.preferred_y_fraction
 
     @staticmethod
+    def _corner_clearance(
+        x: float,
+        y: float,
+        bounds: tuple[float, float, float, float],
+    ) -> float:
+        left, right, bottom, top = bounds
+        horizontal = max(0.0, min(x - left, right - x))
+        vertical = max(0.0, min(y - bottom, top - y))
+        return math.hypot(horizontal, vertical)
+
+    def _corner_shortfall(self, clearance: float) -> float:
+        return self.config.corner_reserve_weight * max(
+            0.0,
+            self.config.corner_reserve_target - clearance,
+        )
+
+    @staticmethod
     def _direction(action: Action | None) -> tuple[int, int] | None:
         if action is None:
             return None
@@ -1258,15 +1597,32 @@ class EngineMPC:
             penalty += self.config.speed_switch_penalty
         return penalty
 
-    def _clearance_reward(self, margin: float, *, region: bool = False) -> float:
+    def _clearance_reward(
+        self,
+        margin: float,
+        *,
+        region: bool = False,
+        nonregion_margin: float = math.inf,
+        region_margin: float = math.inf,
+    ) -> float:
         if math.isnan(margin):
             return 0.0
-        cap = (
-            max(self.config.region_safe_margin_target, self.config.portal_clearance)
-            if region else
-            self.config.clearance_reward_cap
+        if not region:
+            clearance = min(max(0.0, margin), self.config.clearance_reward_cap)
+            return self.config.clearance_reward_weight * clearance
+
+        # A narrow forced-movement portal must not cap the reward for staying
+        # away from ordinary bullets. Preserve a separate reserve for the
+        # indestructible region geometry and reward both independently.
+        ordinary_clearance = min(
+            max(0.0, nonregion_margin),
+            self.config.clearance_reward_cap,
         )
-        clearance = min(max(0.0, margin), cap)
+        forced_region_clearance = min(
+            max(0.0, region_margin),
+            max(self.config.region_safe_margin_target, self.config.portal_clearance),
+        )
+        clearance = ordinary_clearance + forced_region_clearance
         return self.config.clearance_reward_weight * clearance
 
     def _remember_action(self, action: Action, source_frame: int) -> None:
@@ -1291,6 +1647,7 @@ class EngineMPC:
             for record in records
             if isinstance(record, Mapping)
             and record.get("collidable", True) is True
+            and record.get("kind") not in _LASER_KINDS
         ]
         self._region_phase.update(source_frame, radii)
 
@@ -1461,6 +1818,962 @@ class EngineMPC:
                     candidates.append((max_hp, x + dx * delay))
         return max(candidates, default=(0.0, None), key=lambda item: item[0])[1]
 
+    def _gap_bullet_groups(
+        self,
+        bounds: tuple[float, float, float, float],
+        threats: Sequence[PredictedThreat],
+    ) -> tuple[_GapBulletGroup, ...]:
+        """Cluster visible bullets by velocity and moving wavefront."""
+
+        if not self.config.gap_prediction_enabled:
+            return ()
+        eligible = [
+            value
+            for value in threats
+            if value.source == "enemy_bullets"
+            and math.hypot(value.vx, value.vy) >= self.config.gap_minimum_speed
+        ]
+        if len(eligible) < self.config.gap_minimum_group_size:
+            return ()
+
+        direction_cosine = math.cos(math.radians(
+            self.config.gap_direction_tolerance_degrees,
+        ))
+        velocity_clusters: list[dict[str, Any]] = []
+        for value in sorted(
+            eligible,
+            key=lambda item: (
+                math.atan2(item.vy, item.vx),
+                math.hypot(item.vx, item.vy),
+                item.key,
+            ),
+        ):
+            speed = math.hypot(value.vx, value.vy)
+            unit_x, unit_y = value.vx / speed, value.vy / speed
+            selected: dict[str, Any] | None = None
+            for cluster in velocity_clusters:
+                mean_speed = float(cluster["speed_sum"]) / len(cluster["members"])
+                speed_tolerance = max(
+                    self.config.gap_speed_absolute_tolerance,
+                    self.config.gap_speed_relative_tolerance
+                    * max(speed, mean_speed),
+                )
+                if (
+                    unit_x * float(cluster["direction_x"])
+                    + unit_y * float(cluster["direction_y"])
+                    >= direction_cosine
+                    and abs(speed - mean_speed) <= speed_tolerance
+                ):
+                    selected = cluster
+                    break
+            if selected is None:
+                velocity_clusters.append({
+                    "members": [value],
+                    "velocity_x": value.vx,
+                    "velocity_y": value.vy,
+                    "speed_sum": speed,
+                    "direction_x": unit_x,
+                    "direction_y": unit_y,
+                })
+                continue
+            selected["members"].append(value)
+            selected["velocity_x"] += value.vx
+            selected["velocity_y"] += value.vy
+            selected["speed_sum"] += speed
+            magnitude = math.hypot(
+                float(selected["velocity_x"]),
+                float(selected["velocity_y"]),
+            )
+            if magnitude > 1e-9:
+                selected["direction_x"] = float(selected["velocity_x"]) / magnitude
+                selected["direction_y"] = float(selected["velocity_y"]) / magnitude
+
+        left, right, bottom, top = bounds
+        groups: list[_GapBulletGroup] = []
+        for cluster in velocity_clusters:
+            members = list(cluster["members"])
+            if len(members) < self.config.gap_minimum_group_size:
+                continue
+            direction_x = float(cluster["direction_x"])
+            direction_y = float(cluster["direction_y"])
+            normal_x, normal_y = -direction_y, direction_x
+            projected = sorted(
+                (
+                    value.x * direction_x + value.y * direction_y,
+                    value.key,
+                    value,
+                )
+                for value in members
+            )
+            wavefronts: list[list[PredictedThreat]] = []
+            wavefront_centers: list[float] = []
+            for longitudinal, _, value in projected:
+                if (
+                    not wavefronts
+                    or abs(longitudinal - wavefront_centers[-1])
+                    > self.config.gap_wavefront_depth
+                ):
+                    wavefronts.append([value])
+                    wavefront_centers.append(longitudinal)
+                else:
+                    wavefronts[-1].append(value)
+                    wavefront_centers[-1] = sum(
+                        item.x * direction_x + item.y * direction_y
+                        for item in wavefronts[-1]
+                    ) / len(wavefronts[-1])
+
+            bound_projection = [
+                x * normal_x + y * normal_y
+                for x, y in (
+                    (left, bottom),
+                    (left, top),
+                    (right, bottom),
+                    (right, top),
+                )
+            ]
+            cross_span = max(bound_projection) - min(bound_projection)
+            for wavefront in wavefronts:
+                if len(wavefront) < self.config.gap_minimum_group_size:
+                    continue
+                ordered = tuple(sorted(
+                    wavefront,
+                    key=lambda item: (
+                        item.x * normal_x + item.y * normal_y,
+                        item.key,
+                    ),
+                ))
+                lower = min(
+                    item.x * normal_x + item.y * normal_y - item.radius
+                    for item in ordered
+                )
+                upper = max(
+                    item.x * normal_x + item.y * normal_y + item.radius
+                    for item in ordered
+                )
+                member_keys = ",".join(sorted(item.key for item in ordered))
+                groups.append(_GapBulletGroup(
+                    key=f"wavefront:{member_keys}",
+                    members=ordered,
+                    direction_x=direction_x,
+                    direction_y=direction_y,
+                    speed=sum(
+                        item.vx * direction_x + item.vy * direction_y
+                        for item in ordered
+                    ) / len(ordered),
+                    coverage_fraction=(
+                        0.0 if cross_span <= 1e-9 else
+                        min(1.0, max(0.0, (upper - lower) / cross_span))
+                    ),
+                ))
+        return tuple(sorted(groups, key=lambda value: value.key))
+
+    def _gap_entry_path(
+        self,
+        player: tuple[float, float, float, float, float],
+        bounds: tuple[float, float, float, float],
+        target: tuple[float, float],
+        normal: tuple[float, float],
+        usable_width: float,
+        arrival_frames: float,
+        end_frame: int,
+    ) -> tuple[np.ndarray, np.ndarray, float, bool, tuple[Action, ...]]:
+        """Build a legal three-frame-block route into a center-space corridor."""
+
+        px, py, _player_radius, speed, focus_speed = player
+        normal_x, normal_y = normal
+        center_u = target[0] * normal_x + target[1] * normal_y
+        half_width = 0.5 * max(0.0, usable_width)
+        lower_u, upper_u = center_u - half_width, center_u + half_width
+        entry_deadline = max(0.0, arrival_frames - self.config.gap_entry_guard_frames)
+        deadline_frame = max(0, int(math.floor(entry_deadline + 1e-9)))
+        left, right, bottom, top = bounds
+
+        def outside_distance(x: float, y: float) -> float:
+            value = x * normal_x + y * normal_y
+            if value < lower_u:
+                return lower_u - value
+            if value > upper_u:
+                return value - upper_u
+            return 0.0
+
+        path_x = np.empty(end_frame, dtype=np.float64)
+        path_y = np.empty(end_frame, dtype=np.float64)
+        current_x, current_y = px, py
+        travel_frames = 0.0 if outside_distance(px, py) <= 1e-6 else math.inf
+        plan: list[Action] = []
+        for block_start in range(0, end_frame, self.config.decision_interval):
+            block_length = min(
+                self.config.decision_interval,
+                end_frame - block_start,
+            )
+            best: tuple[
+                tuple[float, float, float, int],
+                tuple[tuple[float, float], ...],
+                Action,
+            ] | None = None
+            for action_index, action in enumerate(self.actions):
+                magnitude = focus_speed if action.slow else speed
+                diagonal = action.move_x != 0 and action.move_y != 0
+                scale = magnitude * (_SQRT_HALF if diagonal else 1.0)
+                velocity_x = action.move_x * scale
+                velocity_y = action.move_y * scale
+                candidate: list[tuple[float, float]] = []
+                x, y = current_x, current_y
+                for _ in range(block_length):
+                    x = min(max(x + velocity_x, left), right)
+                    y = min(max(y + velocity_y, bottom), top)
+                    candidate.append((x, y))
+                endpoint_u = x * normal_x + y * normal_y
+                movement = math.hypot(x - current_x, y - current_y)
+                score = (
+                    outside_distance(x, y),
+                    movement,
+                    abs(endpoint_u - center_u),
+                    action_index,
+                )
+                if best is None or score < best[0]:
+                    best = score, tuple(candidate), action
+            assert best is not None
+            plan.append(best[2])
+            for offset, (current_x, current_y) in enumerate(best[1]):
+                frame_index = block_start + offset
+                path_x[frame_index] = current_x
+                path_y[frame_index] = current_y
+                if (
+                    not math.isfinite(travel_frames)
+                    and outside_distance(current_x, current_y) <= 1e-6
+                ):
+                    travel_frames = float(frame_index + 1)
+
+        settled = outside_distance(px, py) <= 1e-6 if deadline_frame == 0 else True
+        if deadline_frame > 0:
+            settled = all(
+                outside_distance(float(path_x[index]), float(path_y[index])) <= 1e-6
+                for index in range(deadline_frame - 1, end_frame)
+            )
+        elif settled:
+            settled = all(
+                outside_distance(float(path_x[index]), float(path_y[index])) <= 1e-6
+                for index in range(end_frame)
+            )
+        return path_x, path_y, travel_frames, settled, tuple(plan)
+
+    def _gap_detour_entry_path(
+        self,
+        player: tuple[float, float, float, float, float],
+        bounds: tuple[float, float, float, float],
+        target: tuple[float, float],
+        normal: tuple[float, float],
+        usable_width: float,
+        arrival_frames: float,
+        end_frame: int,
+        threat_forecast: tuple[np.ndarray, np.ndarray, np.ndarray],
+        minimum_margin: float,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        float,
+        float,
+        bool,
+        tuple[Action, ...],
+    ]:
+        """Search a small diverse beam when the direct gap route is obstructed."""
+
+        px, py, player_radius, speed, focus_speed = player
+        normal_x, normal_y = normal
+        center_u = target[0] * normal_x + target[1] * normal_y
+        half_width = 0.5 * max(0.0, usable_width)
+        lower_u, upper_u = center_u - half_width, center_u + half_width
+        entry_deadline = max(0.0, arrival_frames - self.config.gap_entry_guard_frames)
+        deadline_frame = max(0, int(math.floor(entry_deadline + 1e-9)))
+        initial_u = px * normal_x + py * normal_y
+        initially_inside = lower_u - 1e-6 <= initial_u <= upper_u + 1e-6
+        if deadline_frame == 0 and not initially_inside:
+            empty = np.empty(0, dtype=np.float64)
+            return empty, empty, -math.inf, math.inf, False, ()
+
+        action_count = len(self.actions)
+        action_speed = np.asarray([
+            focus_speed if action.slow else speed for action in self.actions
+        ], dtype=np.float64)
+        diagonal = np.asarray([
+            action.move_x != 0 and action.move_y != 0
+            for action in self.actions
+        ], dtype=np.bool_)
+        action_speed[diagonal] *= _SQRT_HALF
+        velocity_x = action_speed * np.asarray([
+            action.move_x for action in self.actions
+        ], dtype=np.float64)
+        velocity_y = action_speed * np.asarray([
+            action.move_y for action in self.actions
+        ], dtype=np.float64)
+        left, right, bottom, top = bounds
+        future_x, future_y, future_radius = threat_forecast
+
+        state_x = np.asarray([px], dtype=np.float64)
+        state_y = np.asarray([py], dtype=np.float64)
+        state_margin = np.asarray([math.inf], dtype=np.float64)
+        state_travel = np.asarray([
+            0.0 if initially_inside else math.inf
+        ], dtype=np.float64)
+        state_plans = np.empty((1, 0), dtype=np.int16)
+        state_path_x = np.empty((1, 0), dtype=np.float64)
+        state_path_y = np.empty((1, 0), dtype=np.float64)
+
+        for block_start in range(0, end_frame, self.config.decision_interval):
+            block_length = min(
+                self.config.decision_interval,
+                end_frame - block_start,
+            )
+            parent = np.repeat(np.arange(len(state_x), dtype=np.int64), action_count)
+            action_index = np.tile(
+                np.arange(action_count, dtype=np.int64),
+                len(state_x),
+            )
+            current_x = state_x[parent].copy()
+            current_y = state_y[parent].copy()
+            expanded_margin = state_margin[parent].copy()
+            expanded_travel = state_travel[parent].copy()
+            block_path_x = np.empty((len(parent), block_length), dtype=np.float64)
+            block_path_y = np.empty((len(parent), block_length), dtype=np.float64)
+            valid = np.ones(len(parent), dtype=np.bool_)
+            outside = np.full(len(parent), math.inf, dtype=np.float64)
+            for offset in range(block_length):
+                current_x = np.clip(
+                    current_x + velocity_x[action_index],
+                    left,
+                    right,
+                )
+                current_y = np.clip(
+                    current_y + velocity_y[action_index],
+                    bottom,
+                    top,
+                )
+                block_path_x[:, offset] = current_x
+                block_path_y[:, offset] = current_y
+                future_index = block_start + offset
+                if future_x.shape[1]:
+                    frame_margin = np.min(
+                        np.hypot(
+                            current_x[:, None] - future_x[future_index][None, :],
+                            current_y[:, None] - future_y[future_index][None, :],
+                        )
+                        - player_radius
+                        - future_radius[future_index][None, :],
+                        axis=1,
+                    )
+                    expanded_margin = np.minimum(expanded_margin, frame_margin)
+                projected = current_x * normal_x + current_y * normal_y
+                outside = np.maximum(
+                    np.maximum(lower_u - projected, projected - upper_u),
+                    0.0,
+                )
+                reached = np.isinf(expanded_travel) & (outside <= 1e-6)
+                expanded_travel[reached] = float(future_index + 1)
+                absolute_frame = future_index + 1
+                if deadline_frame == 0 or absolute_frame >= deadline_frame:
+                    valid &= outside <= 1e-6
+
+            valid &= expanded_margin >= minimum_margin
+            remaining_frames = max(
+                0,
+                deadline_frame - (block_start + block_length),
+            )
+            if remaining_frames:
+                valid &= outside <= speed * remaining_frames + 1e-6
+            keepable = np.flatnonzero(valid)
+            if not len(keepable):
+                empty = np.empty(0, dtype=np.float64)
+                return empty, empty, -math.inf, math.inf, False, ()
+
+            expanded_plans = np.concatenate((
+                state_plans[parent],
+                action_index[:, None].astype(np.int16),
+            ), axis=1)
+            expanded_path_x = np.concatenate((
+                state_path_x[parent],
+                block_path_x,
+            ), axis=1)
+            expanded_path_y = np.concatenate((
+                state_path_y[parent],
+                block_path_y,
+            ), axis=1)
+            endpoint_distance = np.hypot(
+                current_x - target[0],
+                current_y - target[1],
+            )
+            order = keepable[np.lexsort((
+                action_index[keepable],
+                endpoint_distance[keepable],
+                -expanded_margin[keepable],
+                outside[keepable],
+            ))]
+
+            selected: list[int] = []
+            seen: set[tuple[int, int, int]] = set()
+            per_first_action = np.zeros(action_count, dtype=np.int32)
+            quota = max(1, self.config.gap_detour_beam_width // action_count)
+            for raw_index in order:
+                index = int(raw_index)
+                first_action = int(expanded_plans[index, 0])
+                cell = (
+                    first_action,
+                    int(round(float(current_x[index]) / self.config.beam_cell_size)),
+                    int(round(float(current_y[index]) / self.config.beam_cell_size)),
+                )
+                if cell in seen or per_first_action[first_action] >= quota:
+                    continue
+                seen.add(cell)
+                per_first_action[first_action] += 1
+                selected.append(index)
+                if len(selected) >= self.config.gap_detour_beam_width:
+                    break
+            if len(selected) < self.config.gap_detour_beam_width:
+                chosen = set(selected)
+                for raw_index in order:
+                    index = int(raw_index)
+                    first_action = int(expanded_plans[index, 0])
+                    cell = (
+                        first_action,
+                        int(round(float(current_x[index]) / self.config.beam_cell_size)),
+                        int(round(float(current_y[index]) / self.config.beam_cell_size)),
+                    )
+                    if index in chosen or cell in seen:
+                        continue
+                    seen.add(cell)
+                    selected.append(index)
+                    if len(selected) >= self.config.gap_detour_beam_width:
+                        break
+            selected_array = np.asarray(selected, dtype=np.int64)
+            state_x = current_x[selected_array]
+            state_y = current_y[selected_array]
+            state_margin = expanded_margin[selected_array]
+            state_travel = expanded_travel[selected_array]
+            state_plans = expanded_plans[selected_array]
+            state_path_x = expanded_path_x[selected_array]
+            state_path_y = expanded_path_y[selected_array]
+
+        final_distance = np.hypot(state_x - target[0], state_y - target[1])
+        selected = int(np.lexsort((final_distance, -state_margin))[0])
+        plan = tuple(
+            self.actions[int(value)] for value in state_plans[selected]
+        )
+        return (
+            state_path_x[selected],
+            state_path_y[selected],
+            float(state_margin[selected]),
+            float(state_travel[selected]),
+            True,
+            plan,
+        )
+
+    def _gap_path_margin(
+        self,
+        player: tuple[float, float, float, float, float],
+        bounds: tuple[float, float, float, float],
+        target: tuple[float, float],
+        normal: tuple[float, float],
+        usable_width: float,
+        arrival_frames: float,
+        threats: Sequence[PredictedThreat],
+        threat_forecast: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+        *,
+        minimum_margin: float | None = None,
+    ) -> tuple[float, float, tuple[Action, ...]]:
+        end_frame = min(
+            self.config.horizon_frames,
+            max(
+                self.config.gap_minimum_lifetime_frames,
+                int(math.ceil(max(0.0, arrival_frames)))
+                + self.config.gap_hold_frames,
+            ),
+        )
+        path_x, path_y, travel_frames, settled, plan = self._gap_entry_path(
+            player,
+            bounds,
+            target,
+            normal,
+            usable_width,
+            arrival_frames,
+            end_frame,
+        )
+        if not settled:
+            return -math.inf, travel_frames, ()
+        if not threats:
+            return math.inf, travel_frames, plan
+        if threat_forecast is None:
+            threat_forecast = self._gap_threat_forecast(threats)
+        player_radius = player[2]
+        future_threat_x, future_threat_y, future_threat_radius = threat_forecast
+        margins = np.hypot(
+            path_x[:, None] - future_threat_x[:end_frame],
+            path_y[:, None] - future_threat_y[:end_frame],
+        ) - player_radius - future_threat_radius[:end_frame]
+        path_margin = float(np.min(margins))
+        required_margin = (
+            self.config.gap_path_minimum_margin
+            if minimum_margin is None else
+            minimum_margin
+        )
+        if path_margin >= required_margin:
+            return path_margin, travel_frames, plan
+        (
+            _detour_x,
+            _detour_y,
+            detour_margin,
+            detour_travel,
+            detour_settled,
+            detour_plan,
+        ) = self._gap_detour_entry_path(
+            player,
+            bounds,
+            target,
+            normal,
+            usable_width,
+            arrival_frames,
+            end_frame,
+            threat_forecast,
+            required_margin,
+        )
+        if detour_settled:
+            return detour_margin, detour_travel, detour_plan
+        return path_margin, travel_frames, plan
+
+    def _gap_threat_forecast(
+        self,
+        threats: Sequence[PredictedThreat],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        horizon = self.config.horizon_frames
+        if not threats:
+            empty = np.empty((horizon, 0), dtype=np.float64)
+            return empty, empty.copy(), empty.copy()
+        frames = np.arange(1, horizon + 1, dtype=np.float64)[:, None]
+        motion_horizon = np.asarray([
+            value.motion_horizon for value in threats
+        ], dtype=np.float64)[None, :]
+        radius_horizon = np.asarray([
+            value.radius_rate_horizon for value in threats
+        ], dtype=np.float64)[None, :]
+        motion_frames = np.minimum(frames, motion_horizon)
+        radius_frames = np.minimum(frames, radius_horizon)
+        future_x = (
+            np.asarray([value.x for value in threats], dtype=np.float64)[None, :]
+            + motion_frames
+            * np.asarray([value.vx for value in threats], dtype=np.float64)[None, :]
+        )
+        future_y = (
+            np.asarray([value.y for value in threats], dtype=np.float64)[None, :]
+            + motion_frames
+            * np.asarray([value.vy for value in threats], dtype=np.float64)[None, :]
+        )
+        future_radius = np.maximum(
+            0.1,
+            np.asarray([
+                value.radius for value in threats
+            ], dtype=np.float64)[None, :]
+            + radius_frames
+            * np.asarray([
+                value.radius_rate for value in threats
+            ], dtype=np.float64)[None, :],
+        )
+        region_indices = np.asarray([
+            index for index, value in enumerate(threats)
+            if value.source == "indestructibles"
+        ], dtype=np.int64)
+        if len(region_indices):
+            for frame_index in range(horizon):
+                phase_radius = self._region_phase.radius_after(
+                    self.config.observation_delay + frame_index + 1,
+                )
+                if phase_radius is not None:
+                    future_radius[frame_index, region_indices] = np.maximum(
+                        future_radius[frame_index, region_indices],
+                        phase_radius,
+                    )
+        return future_x, future_y, future_radius
+
+    def _gap_corridors(
+        self,
+        player: tuple[float, float, float, float, float],
+        bounds: tuple[float, float, float, float],
+        threats: Sequence[PredictedThreat],
+    ) -> tuple[tuple[_GapBulletGroup, ...], tuple[_GapCorridor, ...]]:
+        """Forecast stable center-space corridors through parallel wavefronts."""
+
+        groups = self._gap_bullet_groups(bounds, threats)
+        if not groups:
+            return (), ()
+        px, py, player_radius = player[:3]
+        left, right, bottom, top = bounds
+        delay_uncertainty = (
+            self.config.track_displacement_tolerance
+            * min(
+                float(self.config.observation_delay),
+                float(self.config.gap_sample_interval),
+            )
+        )
+        center_clearance = (
+            player_radius + self.config.gap_safety_margin + delay_uncertainty
+        )
+        corridors: list[_GapCorridor] = []
+        for group in groups:
+            direction_x, direction_y = group.direction_x, group.direction_y
+            normal_x, normal_y = -direction_y, direction_x
+            player_longitudinal = px * direction_x + py * direction_y
+            mean_longitudinal = sum(
+                value.x * direction_x + value.y * direction_y
+                for value in group.members
+            ) / len(group.members)
+            if group.speed <= 0.1:
+                continue
+            arrival_frames = (
+                player_longitudinal - mean_longitudinal
+            ) / group.speed
+            if (
+                arrival_frames < -self.config.gap_hold_frames
+                or arrival_frames > self.config.horizon_frames
+            ):
+                continue
+
+            initial = sorted(
+                group.members,
+                key=lambda value: (
+                    value.x * normal_x + value.y * normal_y,
+                    value.key,
+                ),
+            )
+            required_end = min(
+                self.config.horizon_frames,
+                max(
+                    self.config.gap_minimum_lifetime_frames,
+                    int(math.ceil(max(0.0, arrival_frames)))
+                    + self.config.gap_hold_frames,
+                ),
+            )
+            arrival_samples = {
+                min(
+                    self.config.horizon_frames,
+                    max(0, int(math.floor(arrival_frames))),
+                ),
+                min(
+                    self.config.horizon_frames,
+                    max(0, int(math.ceil(arrival_frames))),
+                ),
+            }
+            sample_frames = set(range(
+                0,
+                self.config.horizon_frames + 1,
+                self.config.gap_sample_interval,
+            ))
+            sample_frames.update(arrival_samples)
+            sample_frames.add(required_end)
+            snapshots: dict[
+                int,
+                tuple[
+                    list[tuple[PredictedThreat, float, float]],
+                    dict[str, int],
+                ],
+            ] = {}
+            for future_frame in sorted(sample_frames):
+                projected = sorted(
+                    (
+                        (
+                            value,
+                            (position := self._threat_at(value, future_frame))[0]
+                            * normal_x + position[1] * normal_y,
+                            position[2],
+                        )
+                        for value in group.members
+                    ),
+                    key=lambda item: (item[1], item[0].key),
+                )
+                snapshots[future_frame] = (
+                    projected,
+                    {
+                        value.key: index
+                        for index, (value, _, _) in enumerate(projected)
+                    },
+                )
+            for lower, upper in zip(initial, initial[1:]):
+                initial_spacing = (
+                    (upper.x - lower.x) * normal_x
+                    + (upper.y - lower.y) * normal_y
+                )
+                if initial_spacing > self.config.gap_maximum_lateral_spacing:
+                    continue
+                minimum_usable_width = math.inf
+                lifetime_frames = self.config.horizon_frames
+                valid_through_required_end = True
+                center_at_arrival: float | None = None
+                for future_frame in sorted(sample_frames):
+                    projected, indices = snapshots[future_frame]
+                    lower_index = indices[lower.key]
+                    upper_index = indices[upper.key]
+                    adjacent = upper_index == lower_index + 1
+                    if adjacent:
+                        _, lower_u, lower_radius = projected[lower_index]
+                        _, upper_u, upper_radius = projected[upper_index]
+                        raw_width = upper_u - upper_radius - lower_u - lower_radius
+                        usable_width = raw_width - 2.0 * center_clearance
+                    else:
+                        usable_width = -math.inf
+                        lower_u = upper_u = lower_radius = upper_radius = 0.0
+                    if usable_width < self.config.gap_minimum_usable_width:
+                        lifetime_frames = min(lifetime_frames, future_frame)
+                        if future_frame <= required_end:
+                            valid_through_required_end = False
+                    else:
+                        minimum_usable_width = min(
+                            minimum_usable_width,
+                            usable_width,
+                        )
+                    if future_frame in arrival_samples and adjacent:
+                        center_at_arrival = 0.5 * (
+                            lower_u + lower_radius + upper_u - upper_radius
+                        )
+                if (
+                    not valid_through_required_end
+                    or lifetime_frames < self.config.gap_minimum_lifetime_frames
+                    or not math.isfinite(minimum_usable_width)
+                    or center_at_arrival is None
+                ):
+                    continue
+
+                anchor_x = (
+                    direction_x * player_longitudinal
+                    + normal_x * center_at_arrival
+                )
+                anchor_y = (
+                    direction_y * player_longitudinal
+                    + normal_y * center_at_arrival
+                )
+                clamped_x = min(max(anchor_x, left), right)
+                clamped_y = min(max(anchor_y, bottom), top)
+                clamped_u = clamped_x * normal_x + clamped_y * normal_y
+                if abs(clamped_u - center_at_arrival) > 0.5 * minimum_usable_width:
+                    continue
+                corridors.append(_GapCorridor(
+                    key=f"{group.key}:gap:{lower.key}>{upper.key}",
+                    group_key=group.key,
+                    center_x=clamped_x,
+                    center_y=clamped_y,
+                    usable_width=minimum_usable_width,
+                    lifetime_frames=lifetime_frames,
+                    arrival_frames=arrival_frames,
+                    path_margin=math.nan,
+                    normal_x=normal_x,
+                    normal_y=normal_y,
+                    member_count=len(group.members),
+                ))
+        return groups, tuple(sorted(
+            corridors,
+            key=lambda value: (
+                value.arrival_frames,
+                -value.usable_width,
+                value.key,
+            ),
+        ))
+
+    def _stationary_nonregion_margin(
+        self,
+        player: tuple[float, float, float, float, float],
+        threats: Sequence[PredictedThreat],
+        threat_forecast: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    ) -> float:
+        px, py, player_radius = player[:3]
+        bullet_indices = np.asarray([
+            index for index, value in enumerate(threats)
+            if value.source == "enemy_bullets"
+        ], dtype=np.int64)
+        if not len(bullet_indices):
+            return math.inf
+        if threat_forecast is None:
+            threat_forecast = self._gap_threat_forecast(threats)
+        future_x, future_y, future_radius = threat_forecast
+        return float(np.min(
+            np.hypot(
+                px - future_x[:, bullet_indices],
+                py - future_y[:, bullet_indices],
+            )
+            - player_radius
+            - future_radius[:, bullet_indices]
+        ))
+
+    def _gap_navigation(
+        self,
+        player: tuple[float, float, float, float, float],
+        bounds: tuple[float, float, float, float],
+        threats: Sequence[PredictedThreat],
+        region_anchor: _RegionAnchor | None,
+    ) -> tuple[
+        tuple[_GapBulletGroup, ...],
+        tuple[_GapCorridor, ...],
+        _GapCorridor | None,
+        str,
+    ]:
+        if not self.config.gap_prediction_enabled:
+            self._active_gap_key = None
+            return (), (), None, "inactive"
+        groups, corridors = self._gap_corridors(player, bounds, threats)
+        px, py = player[:2]
+        coverage = {
+            group.key: group.coverage_fraction for group in groups
+        }
+        candidates = [
+            value for value in corridors
+            if coverage.get(value.group_key, 0.0)
+            >= self.config.gap_group_coverage_fraction
+        ]
+        previous_active_key = self._active_gap_key
+
+        def normal_distance(value: _GapCorridor) -> float:
+            return abs(
+                (px - value.center_x) * value.normal_x
+                + (py - value.center_y) * value.normal_y
+            )
+
+        def entry_width(value: _GapCorridor) -> float:
+            if (
+                value.key == previous_active_key
+                or normal_distance(value) <= 0.5 * value.usable_width
+            ):
+                return value.usable_width
+            return min(
+                value.usable_width,
+                self.config.decision_interval * player[4],
+            )
+
+        def coarse_reachable(value: _GapCorridor) -> bool:
+            outside = max(
+                0.0,
+                normal_distance(value) - 0.5 * entry_width(value),
+            )
+            deadline = max(
+                0,
+                int(math.floor(
+                    max(
+                        0.0,
+                        value.arrival_frames - self.config.gap_entry_guard_frames,
+                    ) + 1e-9
+                )),
+            )
+            return outside <= player[3] * deadline + 1e-6
+
+        def corridor_key(value: _GapCorridor) -> tuple[float | str, ...]:
+            region_distance = (
+                0.0
+                if region_anchor is None else
+                math.hypot(
+                    value.center_x - region_anchor.x,
+                    value.center_y - region_anchor.y,
+                )
+            )
+            outside = max(
+                0.0,
+                normal_distance(value) - 0.5 * entry_width(value),
+            )
+            return (
+                region_distance,
+                outside,
+                value.arrival_frames,
+                -value.usable_width,
+                value.key,
+            )
+
+        threat_forecast: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        certified: dict[str, _GapCorridor] = {}
+        required_margin = max(
+            self.config.gap_path_minimum_margin,
+            (
+                self.config.region_safe_margin_target
+                if region_anchor is not None else
+                self.config.gap_path_minimum_margin
+            ),
+        )
+
+        def certify(value: _GapCorridor) -> _GapCorridor:
+            nonlocal threat_forecast
+            existing = certified.get(value.key)
+            if existing is not None:
+                return existing
+            if threat_forecast is None:
+                threat_forecast = self._gap_threat_forecast(threats)
+            path_margin, _travel, entry_plan = self._gap_path_margin(
+                player,
+                bounds,
+                value.center,
+                (value.normal_x, value.normal_y),
+                entry_width(value),
+                max(0.0, value.arrival_frames),
+                threats,
+                threat_forecast,
+                minimum_margin=required_margin,
+            )
+            result = replace(
+                value,
+                path_margin=path_margin,
+                entry_plan=(entry_plan if path_margin >= required_margin else ()),
+            )
+            certified[value.key] = result
+            return result
+
+        active_geometry = next(
+            (
+                value for value in candidates
+                if value.key == previous_active_key and coarse_reachable(value)
+            ),
+            None,
+        )
+        active = certify(active_geometry) if active_geometry is not None else None
+        if active is not None and active.path_margin < required_margin:
+            active = None
+
+        needs_gap = active is not None
+        if not needs_gap and candidates:
+            if threat_forecast is None:
+                threat_forecast = self._gap_threat_forecast(threats)
+            needs_gap = (
+                self._stationary_nonregion_margin(
+                    player,
+                    threats,
+                    threat_forecast,
+                )
+                < self.config.safe_margin_target
+            )
+        if needs_gap and active is None:
+            attempts = 0
+            for value in sorted(candidates, key=corridor_key):
+                if not coarse_reachable(value):
+                    continue
+                attempts += 1
+                candidate = certify(value)
+                if candidate.path_margin >= required_margin:
+                    active = candidate
+                    break
+                if attempts >= self.config.gap_entry_candidate_limit:
+                    break
+
+        corridors = tuple(
+            certified.get(value.key, value) for value in corridors
+        )
+        if not needs_gap or active is None:
+            leaving = previous_active_key is not None
+            self._active_gap_key = None
+            return (
+                groups,
+                corridors,
+                None,
+                "exit" if leaving else "observe" if corridors else "inactive",
+            )
+
+        self._active_gap_key = active.key
+        mode = (
+            "hold"
+            if normal_distance(active) <= max(1.0, 0.5 * active.usable_width) else
+            "enter"
+        )
+        return groups, corridors, active, mode
+
     def _region_anchor(
         self,
         player: tuple[float, float, float, float, float],
@@ -1584,14 +2897,23 @@ class EngineMPC:
 
         maximum_radius = (
             self._region_phase.maximum_plateau_radius
-            or self.config.region_learned_max_radius
+            or (
+                self._region_phase.dynamics_memory.maximum_radius
+                if self._region_phase.dynamics_memory is not None else None
+            )
+            or self._region_phase.maximum_radius
+            or max(item.radius for row in rows for item in row)
         )
         expansion_duration = (
-            self._region_phase._phase_duration("expanding") or 30.0
+            self._region_phase._phase_duration("expanding")
+            or float(self.config.horizon_frames)
         )
         if self._region_phase.phase == "expanding":
             observed_radius = self._region_phase.observed_radius or maximum_radius
-            growth_rate = self._region_phase.growth_rate or self.config.region_radius_step
+            growth_rate = (
+                self._region_phase.growth_rate
+                or max(self._region_phase.observed_rate, 0.1)
+            )
             maximum_lead = max(
                 0.0,
                 (maximum_radius - observed_radius) / max(0.1, growth_rate),
@@ -2212,12 +3534,11 @@ class EngineMPC:
         y: np.ndarray,
         first_action: np.ndarray,
         region_anchor: _RegionAnchor | None,
+        gap_anchor: _GapCorridor | None,
     ) -> np.ndarray:
-        configured_limit = (
-            self.config.beam_width
-            if region_anchor is None else
-            max(self.config.beam_width, self.config.region_beam_width)
-        )
+        configured_limit = self.config.beam_width
+        if region_anchor is not None:
+            configured_limit = max(configured_limit, self.config.region_beam_width)
         limit = min(configured_limit, len(order))
         if region_anchor is None:
             return np.asarray(order[:limit], dtype=np.int64)
@@ -2269,6 +3590,20 @@ class EngineMPC:
                     break
         return np.asarray(selected, dtype=np.int64)
 
+    @staticmethod
+    def _gap_center_space_distance(
+        x: float,
+        y: float,
+        gap: _GapCorridor,
+    ) -> float:
+        return max(
+            0.0,
+            abs(
+                (x - gap.center_x) * gap.normal_x
+                + (y - gap.center_y) * gap.normal_y
+            ) - 0.5 * gap.usable_width,
+        )
+
     def _beam_evaluations(
         self,
         player: tuple[float, float, float, float, float],
@@ -2276,6 +3611,7 @@ class EngineMPC:
         threats: Sequence[PredictedThreat],
         boss_x: float | None,
         region_anchor: _RegionAnchor | None = None,
+        gap_anchor: _GapCorridor | None = None,
         *,
         _prefilter_threats: bool = True,
     ) -> tuple[
@@ -2396,6 +3732,9 @@ class EngineMPC:
         collision_frames = np.zeros(1, dtype=np.int32)
         earliest_collision = np.full(1, self.config.horizon_frames + 1, dtype=np.int32)
         minimum_margin = np.full(1, math.inf, dtype=np.float64)
+        minimum_nonregion_margin = np.full(1, math.inf, dtype=np.float64)
+        minimum_region_margin = np.full(1, math.inf, dtype=np.float64)
+        immediate_corner_clearance = np.full(1, math.inf, dtype=np.float64)
         boundary_penalty = np.zeros(1, dtype=np.float64)
         motion_penalty = np.zeros(1, dtype=np.float64)
         plans = np.empty((1, 0), dtype=np.int8)
@@ -2412,6 +3751,9 @@ class EngineMPC:
             collision_frames = collision_frames[parents]
             earliest_collision = earliest_collision[parents]
             minimum_margin = minimum_margin[parents]
+            minimum_nonregion_margin = minimum_nonregion_margin[parents]
+            minimum_region_margin = minimum_region_margin[parents]
+            immediate_corner_clearance = immediate_corner_clearance[parents]
             boundary_penalty = boundary_penalty[parents]
             motion_penalty = motion_penalty[parents]
             plans = plans[parents]
@@ -2498,43 +3840,81 @@ class EngineMPC:
                         # threat outside this expanded candidate AABB cannot
                         # improve that margin or collide this frame. Bounds are
                         # rounded outward so filtering remains conservative.
-                        threshold = max(0.0, float(np.max(minimum_margin)))
-                        if math.isfinite(threshold):
-                            reach = radius + player_radius + threshold
-                            candidate_left = np.nextafter(
-                                float(np.min(x)) - reach,
-                                -math.inf,
-                            )
-                            candidate_right = np.nextafter(
-                                float(np.max(x)) + reach,
-                                math.inf,
-                            )
-                            candidate_bottom = np.nextafter(
-                                float(np.min(y)) - reach,
-                                -math.inf,
-                            )
-                            candidate_top = np.nextafter(
-                                float(np.max(y)) + reach,
-                                math.inf,
-                            )
-                            active_threats = (
-                                (tx >= candidate_left)
-                                & (tx <= candidate_right)
-                                & (ty >= candidate_bottom)
-                                & (ty <= candidate_top)
-                            )
+                        ordinary_threshold = max(
+                            self.config.safe_margin_target,
+                            self.config.clearance_reward_cap,
+                            float(np.max(minimum_nonregion_margin)),
+                        )
+                        region_threshold = max(
+                            self.config.region_safe_margin_target,
+                            self.config.portal_clearance,
+                            float(np.max(minimum_region_margin)),
+                        )
+                        class_threshold = np.where(
+                            threat_is_region,
+                            region_threshold,
+                            ordinary_threshold,
+                        )
+                        reach = radius + player_radius + class_threshold
+                        candidate_left = np.nextafter(
+                            float(np.min(x)) - reach,
+                            -math.inf,
+                        )
+                        candidate_right = np.nextafter(
+                            float(np.max(x)) + reach,
+                            math.inf,
+                        )
+                        candidate_bottom = np.nextafter(
+                            float(np.min(y)) - reach,
+                            -math.inf,
+                        )
+                        candidate_top = np.nextafter(
+                            float(np.max(y)) + reach,
+                            math.inf,
+                        )
+                        active_threats = (
+                            (tx >= candidate_left)
+                            & (tx <= candidate_right)
+                            & (ty >= candidate_bottom)
+                            & (ty <= candidate_top)
+                        )
                     active_tx = tx[active_threats]
                     active_ty = ty[active_threats]
                     active_radius = radius[active_threats]
+                    active_is_region = threat_is_region[active_threats]
                     if not len(active_tx):
                         frame_margin = np.full(len(x), math.inf, dtype=np.float64)
+                        frame_nonregion_margin = np.full(
+                            len(x), math.inf, dtype=np.float64,
+                        )
+                        frame_region_margin = np.full(
+                            len(x), math.inf, dtype=np.float64,
+                        )
                     else:
                         margins = np.hypot(
                             x[:, None] - active_tx[None, :],
                             y[:, None] - active_ty[None, :],
                         ) - player_radius - active_radius[None, :]
                         frame_margin = margins.min(axis=1)
+                        frame_nonregion_margin = (
+                            margins[:, ~active_is_region].min(axis=1)
+                            if np.any(~active_is_region) else
+                            np.full(len(x), math.inf, dtype=np.float64)
+                        )
+                        frame_region_margin = (
+                            margins[:, active_is_region].min(axis=1)
+                            if np.any(active_is_region) else
+                            np.full(len(x), math.inf, dtype=np.float64)
+                        )
                     minimum_margin = np.minimum(minimum_margin, frame_margin)
+                    minimum_nonregion_margin = np.minimum(
+                        minimum_nonregion_margin,
+                        frame_nonregion_margin,
+                    )
+                    minimum_region_margin = np.minimum(
+                        minimum_region_margin,
+                        frame_region_margin,
+                    )
                     collided_now = frame_margin <= 0.0
                     collision_frames += collided_now.astype(np.int32)
                     first_hit = collided_now & (
@@ -2553,7 +3933,11 @@ class EngineMPC:
                     boundary_penalty += self.config.region_path_weight * (
                         np.abs(x - region_anchor.x) + np.abs(y - region_anchor.y)
                     )
-
+            if segment_start == 0:
+                immediate_corner_clearance = np.hypot(
+                    np.minimum(x - left, right - x),
+                    np.minimum(y - bottom, top - y),
+                )
             collided = collision_frames > 0
             collision_order = -earliest_collision
             if region_anchor is None:
@@ -2569,27 +3953,57 @@ class EngineMPC:
                 alignment = self.config.region_anchor_weight * (
                     np.abs(x - region_anchor.x) + np.abs(y - region_anchor.y)
                 )
-            margin_target = (
-                self.config.safe_margin_target
-                if region_anchor is None else
-                self.config.region_safe_margin_target
-            )
-            margin_shortfall = np.maximum(
-                0.0, margin_target - minimum_margin,
-            )
-            clearance_cap = (
-                self.config.clearance_reward_cap
-                if region_anchor is None else
-                max(
-                    self.config.region_safe_margin_target,
-                    self.config.portal_clearance,
+            if region_anchor is None:
+                margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.safe_margin_target - minimum_margin,
                 )
-            )
-            clearance_reward = self.config.clearance_reward_weight * np.clip(
-                minimum_margin,
-                0.0,
-                clearance_cap,
-            )
+                danger_margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.danger_margin_target - minimum_margin,
+                )
+                corner_clearance = np.hypot(
+                    np.minimum(x - left, right - x),
+                    np.minimum(y - bottom, top - y),
+                )
+                margin_shortfall += self.config.corner_reserve_weight * np.maximum(
+                    0.0,
+                    self.config.corner_reserve_target - corner_clearance,
+                )
+                region_margin_shortfall = np.zeros_like(margin_shortfall)
+                clearance_reward = self.config.clearance_reward_weight * np.clip(
+                    minimum_margin,
+                    0.0,
+                    self.config.clearance_reward_cap,
+                )
+            else:
+                margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.safe_margin_target - minimum_nonregion_margin,
+                )
+                danger_margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.danger_margin_target - minimum_nonregion_margin,
+                )
+                region_margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.region_safe_margin_target - minimum_region_margin,
+                )
+                clearance_reward = self.config.clearance_reward_weight * (
+                    np.clip(
+                        minimum_nonregion_margin,
+                        0.0,
+                        self.config.clearance_reward_cap,
+                    )
+                    + np.clip(
+                        minimum_region_margin,
+                        0.0,
+                        max(
+                            self.config.region_safe_margin_target,
+                            self.config.portal_clearance,
+                        ),
+                    )
+                )
             preference = (
                 boundary_penalty + alignment + motion_penalty - clearance_reward
             )
@@ -2597,9 +4011,12 @@ class EngineMPC:
                 collided,
                 earliest_collision,
                 collision_frames,
+                danger_margin_shortfall,
                 margin_shortfall,
+                region_margin_shortfall,
                 preference,
                 minimum_margin,
+                collision_priority_frames=self.config.collision_priority_frames,
                 tie_breaker=first_action,
             )
             keep = self._diverse_keep(
@@ -2608,12 +4025,16 @@ class EngineMPC:
                 y,
                 first_action,
                 region_anchor,
+                gap_anchor,
             )
             x, y = x[keep], y[keep]
             first_action = first_action[keep]
             collision_frames = collision_frames[keep]
             earliest_collision = earliest_collision[keep]
             minimum_margin = minimum_margin[keep]
+            minimum_nonregion_margin = minimum_nonregion_margin[keep]
+            minimum_region_margin = minimum_region_margin[keep]
+            immediate_corner_clearance = immediate_corner_clearance[keep]
             boundary_penalty = boundary_penalty[keep]
             motion_penalty = motion_penalty[keep]
             plans = plans[keep]
@@ -2630,6 +4051,7 @@ class EngineMPC:
                     threats,
                     boss_x,
                     region_anchor,
+                    gap_anchor,
                 ))
                 action_plans.append((action,))
                 continue
@@ -2648,27 +4070,57 @@ class EngineMPC:
                     + np.abs(y[matches] - region_anchor.y)
                 )
             collided = collision_frames[matches] > 0
-            margin_target = (
-                self.config.safe_margin_target
-                if region_anchor is None else
-                self.config.region_safe_margin_target
-            )
-            margin_shortfall = np.maximum(
-                0.0, margin_target - minimum_margin[matches],
-            )
-            clearance_cap = (
-                self.config.clearance_reward_cap
-                if region_anchor is None else
-                max(
-                    self.config.region_safe_margin_target,
-                    self.config.portal_clearance,
+            if region_anchor is None:
+                margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.safe_margin_target - minimum_margin[matches],
                 )
-            )
-            clearance_reward = self.config.clearance_reward_weight * np.clip(
-                minimum_margin[matches],
-                0.0,
-                clearance_cap,
-            )
+                danger_margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.danger_margin_target - minimum_margin[matches],
+                )
+                margin_shortfall += self.config.corner_reserve_weight * np.maximum(
+                    0.0,
+                    self.config.corner_reserve_target
+                    - immediate_corner_clearance[matches],
+                )
+                region_margin_shortfall = np.zeros_like(margin_shortfall)
+                clearance_reward = self.config.clearance_reward_weight * np.clip(
+                    minimum_margin[matches],
+                    0.0,
+                    self.config.clearance_reward_cap,
+                )
+            else:
+                margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.safe_margin_target
+                    - minimum_nonregion_margin[matches],
+                )
+                danger_margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.danger_margin_target
+                    - minimum_nonregion_margin[matches],
+                )
+                region_margin_shortfall = np.maximum(
+                    0.0,
+                    self.config.region_safe_margin_target
+                    - minimum_region_margin[matches],
+                )
+                clearance_reward = self.config.clearance_reward_weight * (
+                    np.clip(
+                        minimum_nonregion_margin[matches],
+                        0.0,
+                        self.config.clearance_reward_cap,
+                    )
+                    + np.clip(
+                        minimum_region_margin[matches],
+                        0.0,
+                        max(
+                            self.config.region_safe_margin_target,
+                            self.config.portal_clearance,
+                        ),
+                    )
+                )
             preference = (
                 boundary_penalty[matches]
                 + alignment
@@ -2679,12 +4131,34 @@ class EngineMPC:
                 collided,
                 earliest_collision[matches],
                 collision_frames[matches],
+                danger_margin_shortfall,
                 margin_shortfall,
+                region_margin_shortfall,
                 preference,
                 minimum_margin[matches],
+                collision_priority_frames=self.config.collision_priority_frames,
             )
             selected = matches[int(order[0])]
             earliest = int(earliest_collision[selected])
+            selected_alignment = float(alignment[int(order[0])])
+            if gap_anchor is not None:
+                immediate_path = self._path(
+                    action,
+                    player[:2],
+                    player[3],
+                    player[4],
+                    bounds,
+                    self.config.decision_interval,
+                    self.config.decision_interval,
+                )
+                immediate_x, immediate_y, _ = immediate_path[-1]
+                selected_alignment += self.config.gap_anchor_weight * (
+                    self._gap_center_space_distance(
+                        immediate_x,
+                        immediate_y,
+                        gap_anchor,
+                    )
+                )
             evaluations.append(CandidateEvaluation(
                 action=replace(action, spell=False),
                 collided=bool(collision_frames[selected] > 0),
@@ -2694,8 +4168,15 @@ class EngineMPC:
                 ),
                 minimum_margin=float(minimum_margin[selected]),
                 boundary_penalty=float(boundary_penalty[selected]),
-                boss_alignment=float(alignment[int(order[0])]),
+                boss_alignment=selected_alignment,
                 motion_penalty=float(motion_penalty[selected]),
+                minimum_nonregion_margin=float(
+                    minimum_nonregion_margin[selected]
+                ),
+                minimum_region_margin=float(minimum_region_margin[selected]),
+                immediate_corner_clearance=float(
+                    immediate_corner_clearance[selected]
+                ),
             ))
             action_plans.append(tuple(
                 self.actions[int(value)] for value in plans[selected]
@@ -2707,20 +4188,30 @@ class EngineMPC:
         collided: np.ndarray,
         earliest_collision: np.ndarray,
         collision_frames: np.ndarray,
+        danger_margin_shortfall: np.ndarray,
         margin_shortfall: np.ndarray,
+        region_margin_shortfall: np.ndarray,
         preference: np.ndarray,
         minimum_margin: np.ndarray,
         *,
+        collision_priority_frames: int = 36,
         tie_breaker: np.ndarray | None = None,
     ) -> np.ndarray:
         """Order beam candidates with safety ahead of motion preferences."""
 
+        priority_earliest = np.minimum(
+            earliest_collision,
+            collision_priority_frames,
+        )
         keys: tuple[np.ndarray, ...] = (
             -minimum_margin,
-            preference,
-            margin_shortfall,
-            collision_frames,
             -earliest_collision,
+            preference,
+            collision_frames,
+            margin_shortfall,
+            region_margin_shortfall,
+            danger_margin_shortfall,
+            -priority_earliest,
             collided.astype(np.int8),
         )
         if tie_breaker is not None:
@@ -2762,6 +4253,7 @@ class EngineMPC:
         threats: Sequence[PredictedThreat],
         boss_x: float | None,
         region_anchor: _RegionAnchor | None = None,
+        gap_anchor: _GapCorridor | None = None,
     ) -> CandidateEvaluation:
         px, py, player_radius, speed, focus_speed = player
         path = self._path(
@@ -2774,6 +4266,8 @@ class EngineMPC:
             self.config.decision_interval,
         )
         minimum_margin = math.inf
+        minimum_nonregion_margin = math.inf
+        minimum_region_margin = math.inf
         collision_frames = 0
         earliest_collision = None
         boundary_penalty = 0.0
@@ -2785,6 +4279,13 @@ class EngineMPC:
                 tx, ty, threat_radius = self._threat_at(threat, future_frame)
                 margin = math.hypot(x - tx, y - ty) - player_radius - threat_radius
                 minimum_margin = min(minimum_margin, margin)
+                if threat.source == "indestructibles":
+                    minimum_region_margin = min(minimum_region_margin, margin)
+                else:
+                    minimum_nonregion_margin = min(
+                        minimum_nonregion_margin,
+                        margin,
+                    )
                 if margin <= 0.0:
                     frame_collision = True
             if frame_collision:
@@ -2813,6 +4314,14 @@ class EngineMPC:
             alignment = self.config.region_anchor_weight * (
                 abs(final_x - region_anchor.x) + abs(final_y - region_anchor.y)
             )
+        if gap_anchor is not None:
+            alignment += self.config.gap_anchor_weight * (
+                self._gap_center_space_distance(
+                    final_x,
+                    final_y,
+                    gap_anchor,
+                )
+            )
         return CandidateEvaluation(
             action=replace(action, spell=False),
             collided=collision_frames > 0,
@@ -2826,6 +4335,13 @@ class EngineMPC:
                 self._last_action,
                 self._previous_action,
             ),
+            minimum_nonregion_margin=minimum_nonregion_margin,
+            minimum_region_margin=minimum_region_margin,
+            immediate_corner_clearance=self._corner_clearance(
+                path[self.config.decision_interval][0],
+                path[self.config.decision_interval][1],
+                bounds,
+            ),
         )
 
     def _apply_direction_hold(
@@ -2834,6 +4350,7 @@ class EngineMPC:
         evaluations: Sequence[CandidateEvaluation],
         region_anchor: _RegionAnchor | None,
         source_frame: int,
+        gap_anchor: _GapCorridor | None = None,
     ) -> int:
         """Keep a safe direction briefly, while never masking urgent avoidance."""
 
@@ -2841,11 +4358,6 @@ class EngineMPC:
             return selected_index
         selected = evaluations[selected_index]
         if self._direction(selected.action) == self._direction(self._last_action):
-            return selected_index
-        if (
-            region_anchor is not None
-            and region_anchor.navigation_mode == "evacuate"
-        ):
             return selected_index
 
         held_frames = max(0, source_frame - self._direction_started_frame)
@@ -2862,39 +4374,126 @@ class EngineMPC:
         if incumbent_index is None:
             return selected_index
         incumbent = evaluations[incumbent_index]
-        imminent_collision = (
+        remaining_hold_frames = max(
+            0,
+            self.config.minimum_direction_hold_frames - held_frames,
+        )
+        evacuation_progress_release = (
+            region_anchor is not None
+            and region_anchor.navigation_mode == "evacuate"
+            and region_anchor.deadline_slack <= remaining_hold_frames
+            and math.isfinite(
+                selected.boundary_penalty + selected.boss_alignment
+            )
+            and math.isfinite(
+                incumbent.boundary_penalty + incumbent.boss_alignment
+            )
+            and (
+                incumbent.boundary_penalty + incumbent.boss_alignment
+                - selected.boundary_penalty - selected.boss_alignment
+            )
+            >= self.config.direction_switch_penalty
+        )
+        gap_entry_release = (
+            gap_anchor is not None
+            and (
+                (
+                    gap_anchor.entry_action is not None
+                    and selected.action.discrete
+                    == gap_anchor.entry_action.discrete
+                    and incumbent.action.discrete
+                    != gap_anchor.entry_action.discrete
+                )
+                or (
+                    gap_anchor.arrival_frames
+                    <= remaining_hold_frames + self.config.gap_entry_guard_frames
+                    and math.isfinite(
+                        selected.boundary_penalty + selected.boss_alignment
+                    )
+                    and math.isfinite(
+                        incumbent.boundary_penalty + incumbent.boss_alignment
+                    )
+                    and (
+                        incumbent.boundary_penalty + incumbent.boss_alignment
+                        - selected.boundary_penalty - selected.boss_alignment
+                    ) >= self.config.direction_switch_penalty
+                )
+            )
+        )
+        collision_release_horizon = min(
+            self.config.horizon_frames,
+            self.config.emergency_collision_frames + remaining_hold_frames,
+        )
+        time_critical_collision = (
             incumbent.collided
             and incumbent.earliest_collision_frame is not None
             and incumbent.earliest_collision_frame
-            <= self.config.emergency_collision_frames
+            <= collision_release_horizon
         )
         dangerously_close = incumbent.minimum_margin <= self.config.emergency_margin
-        avoids_predicted_collision = incumbent.collided and not selected.collided
+        avoids_predicted_collision = time_critical_collision and not selected.collided
         delays_collision = (
-            incumbent.collided
+            time_critical_collision
             and selected.collided
             and incumbent.earliest_collision_frame is not None
             and selected.earliest_collision_frame is not None
             and selected.earliest_collision_frame
             >= incumbent.earliest_collision_frame + self.config.decision_interval
         )
-        margin_gain = selected.minimum_margin - incumbent.minimum_margin
-        margin_target = (
-            self.config.region_safe_margin_target
-            if region_anchor is not None else
-            self.config.safe_margin_target
+        if region_anchor is None:
+            margin_gain = selected.minimum_margin - incumbent.minimum_margin
+            reaches_safe_reserve = (
+                incumbent.minimum_margin < self.config.safe_margin_target
+                <= selected.minimum_margin
+            )
+            material_margin_gain = margin_gain >= self.config.switch_margin_gain
+            corner_escape = (
+                incumbent.immediate_corner_clearance
+                < self.config.corner_reserve_target
+                and selected.immediate_corner_clearance
+                - incumbent.immediate_corner_clearance
+                >= self.config.switch_margin_gain
+            )
+        else:
+            ordinary_margin_gain = (
+                selected.minimum_nonregion_margin
+                - incumbent.minimum_nonregion_margin
+            )
+            forced_region_margin_gain = (
+                selected.minimum_region_margin - incumbent.minimum_region_margin
+            )
+            reaches_safe_reserve = (
+                incumbent.minimum_nonregion_margin
+                < self.config.safe_margin_target
+                <= selected.minimum_nonregion_margin
+            ) or (
+                incumbent.minimum_region_margin
+                < self.config.region_safe_margin_target
+                <= selected.minimum_region_margin
+            )
+            material_margin_gain = (
+                ordinary_margin_gain >= self.config.switch_margin_gain
+                or forced_region_margin_gain >= self.config.switch_margin_gain
+            )
+            corner_escape = False
+        reserve_release_allowed = held_frames >= max(
+            0,
+            self.config.minimum_direction_hold_frames
+            - self.config.decision_interval,
         )
-        reaches_safe_reserve = (
-            incumbent.minimum_margin < margin_target <= selected.minimum_margin
-        )
-        material_margin_gain = margin_gain >= self.config.switch_margin_gain
         if (
-            imminent_collision
-            or dangerously_close
+            time_critical_collision
             or avoids_predicted_collision
             or delays_collision
-            or reaches_safe_reserve
-            or material_margin_gain
+            or corner_escape
+            or evacuation_progress_release
+            or gap_entry_release
+            or reserve_release_allowed
+            and (
+                dangerously_close
+                or reaches_safe_reserve
+                or material_margin_gain
+            )
         ):
             return selected_index
         return incumbent_index
@@ -2929,19 +4528,36 @@ class EngineMPC:
         bounds = self._bounds(observation, player[2])
         boss_x = self._boss_x(observation, self.config.observation_delay)
         region_anchor = self._region_anchor(player, bounds, threats, source_frame)
+        gap_groups, gap_corridors, gap_anchor, gap_mode = self._gap_navigation(
+            player,
+            bounds,
+            threats,
+            region_anchor,
+        )
         evaluations, action_plans = self._beam_evaluations(
             player,
             bounds,
             threats,
             boss_x,
             region_anchor,
+            gap_anchor,
         )
+        gap_entry_action = (
+            gap_anchor.entry_action
+            if gap_anchor is not None and gap_mode == "enter" else
+            None
+        )
+
         def key(index: int) -> tuple[float, ...]:
             value = evaluations[index]
             earliest = (
                 math.inf
                 if value.earliest_collision_frame is None else
                 float(value.earliest_collision_frame)
+            )
+            priority_earliest = min(
+                earliest,
+                float(self.config.collision_priority_frames),
             )
             preference = (
                 value.boundary_penalty
@@ -2950,27 +4566,59 @@ class EngineMPC:
                 - self._clearance_reward(
                     value.minimum_margin,
                     region=region_anchor is not None,
+                    nonregion_margin=value.minimum_nonregion_margin,
+                    region_margin=value.minimum_region_margin,
                 )
+            )
+            gap_entry_mismatch = float(
+                gap_entry_action is not None
+                and value.action.discrete != gap_entry_action.discrete
             )
             if region_anchor is None:
                 return (
                     float(value.collided),
-                    -earliest,
+                    -priority_earliest,
+                    gap_entry_mismatch,
+                    max(
+                        0.0,
+                        self.config.danger_margin_target - value.minimum_margin,
+                    ),
+                    max(
+                        0.0,
+                        self.config.safe_margin_target - value.minimum_margin,
+                    ) + self._corner_shortfall(
+                        value.immediate_corner_clearance,
+                    ),
                     float(value.collision_frames),
-                    max(0.0, self.config.safe_margin_target - value.minimum_margin),
                     preference,
+                    -earliest,
                     -value.minimum_margin,
                     float(index),
                 )
             return (
                 float(value.collided),
-                -earliest,
-                float(value.collision_frames),
+                -priority_earliest,
+                gap_entry_mismatch,
                 max(
                     0.0,
-                    self.config.region_safe_margin_target - value.minimum_margin,
+                    self.config.danger_margin_target
+                    - value.minimum_nonregion_margin,
                 ),
+                max(
+                    0.0,
+                    self.config.region_safe_margin_target
+                    - value.minimum_region_margin,
+                ),
+                max(
+                    0.0,
+                    self.config.safe_margin_target
+                    - value.minimum_nonregion_margin,
+                ),
+                float(value.collision_frames),
                 preference,
+                -earliest,
+                -value.minimum_nonregion_margin,
+                -value.minimum_region_margin,
                 -value.minimum_margin,
                 float(index),
             )
@@ -2983,8 +4631,18 @@ class EngineMPC:
             evaluations,
             region_anchor,
             source_frame,
+            gap_anchor,
         )
-        selected_plan = action_plans[selected_index]
+        selected_plan = (
+            gap_anchor.entry_plan
+            if (
+                gap_entry_action is not None
+                and evaluations[selected_index].action.discrete
+                == gap_entry_action.discrete
+                and gap_anchor is not None
+            ) else
+            action_plans[selected_index]
+        )
         return MPCDecision(
             action=replace(evaluations[selected_index].action, spell=False),
             source_frame=source_frame,
@@ -3035,6 +4693,18 @@ class EngineMPC:
                 self._frames_until_region_expansion()
             ),
             region_observed_radius=self._region_phase.observed_radius,
+            gap_bullet_group_count=len(gap_groups),
+            gap_corridor_count=len(gap_corridors),
+            gap_selected_center=(
+                None if gap_anchor is None else gap_anchor.center
+            ),
+            gap_selected_width=(
+                None if gap_anchor is None else gap_anchor.usable_width
+            ),
+            gap_selected_lifetime_frames=(
+                None if gap_anchor is None else gap_anchor.lifetime_frames
+            ),
+            gap_navigation_mode=gap_mode,
         )
 
     def _immediate_action_margin(
@@ -3090,6 +4760,8 @@ class EngineMPC:
                 proposed.region_current_component,
                 proposed.region_target_component,
                 proposed.region_portal,
+                proposed.gap_navigation_mode,
+                proposed.gap_selected_center,
             )
             committed_action = (
                 self._committed_plan[0]
@@ -3130,10 +4802,12 @@ class EngineMPC:
                 and committed_margin is not None
                 and committed_margin >= self.config.region_safe_margin_target
                 and committed_evaluation is not None
+                and committed_evaluation.minimum_nonregion_margin
+                >= self.config.safe_margin_target
                 and (
                     (
                         not committed_evaluation.collided
-                        and committed_evaluation.minimum_margin
+                        and committed_evaluation.minimum_region_margin
                         >= self.config.region_safe_margin_target
                     )
                     or (

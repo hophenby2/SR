@@ -20,6 +20,7 @@ from stg_lab.engine_mpc import (
 )
 from stg_lab.planning import PlannerConfig, RiskConfig, SpatioTemporalPlanner
 from stg_lab.protocol import Action
+from stg_lab.provenance import source_tree_sha256
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,10 +30,18 @@ DEFAULT_REPORT = (
 DEFAULT_SOURCE_FRAMES = (488, 995, 1292, 1532, 2102, 2672, 2801, 3242, 3695)
 GRID_COLLISION_RISK = 1_000_000.0
 GRID_SAFETY_THRESHOLDS = (0.2, 2.5, 20.0, 500_000.0)
-CURRENT_CONTROLLER_OVERRIDES = {
-    "safe_margin_target": 20.0,
-    "region_safe_margin_target": 8.0,
-}
+CURRENT_CONTROLLER_FIELDS = (
+    "danger_margin_target",
+    "safe_margin_target",
+    "region_safe_margin_target",
+    "clearance_reward_cap",
+    "clearance_reward_weight",
+    "corner_reserve_target",
+    "corner_reserve_weight",
+    "collision_priority_frames",
+    "minimum_direction_hold_frames",
+    "switch_margin_gain",
+)
 
 
 def _controller_config(
@@ -41,7 +50,8 @@ def _controller_config(
 ) -> MPCConfig:
     values = dict(report["controller"]["config"])
     if controller_profile == "current":
-        values.update(CURRENT_CONTROLLER_OVERRIDES)
+        defaults = asdict(MPCConfig())
+        values.update({name: defaults[name] for name in CURRENT_CONTROLLER_FIELDS})
     elif controller_profile != "recorded":
         raise ValueError(f"unknown controller profile: {controller_profile}")
     memory = values.get("region_dynamics_memory")
@@ -65,6 +75,7 @@ def _threat_record(
     x, y, radius = controller._threat_at(threat, future_frame)
     return {
         "id": threat.key,
+        "source": threat.source,
         "x": x,
         "y": y,
         "vx": threat.vx,
@@ -90,9 +101,7 @@ class _GridSource:
         horizon_frames: int,
         sample_every: int,
     ) -> tuple[tuple[dict[str, Any], ...], ...]:
-        offsets = list(range(sample_every, horizon_frames + 1, sample_every))
-        if not offsets or offsets[-1] != horizon_frames:
-            offsets.append(horizon_frames)
+        offsets = self._offsets(horizon_frames, sample_every)
         return tuple(
             tuple(
                 _threat_record(self.controller, threat, future_frame)
@@ -100,6 +109,31 @@ class _GridSource:
             )
             for future_frame in offsets
         )
+
+    def forecast_swept_threats(
+        self,
+        horizon_frames: int,
+        sample_every: int,
+    ) -> tuple[tuple[int, tuple[dict[str, Any], ...]], ...]:
+        """Expose every logical-frame occupancy inside each grid time layer."""
+
+        result = []
+        previous = 0
+        for offset in self._offsets(horizon_frames, sample_every):
+            result.append((offset, tuple(
+                _threat_record(self.controller, threat, future_frame)
+                for threat in self.threats
+                for future_frame in range(previous, offset + 1)
+            )))
+            previous = offset
+        return tuple(result)
+
+    @staticmethod
+    def _offsets(horizon_frames: int, sample_every: int) -> tuple[int, ...]:
+        offsets = list(range(sample_every, horizon_frames + 1, sample_every))
+        if not offsets or offsets[-1] != horizon_frames:
+            offsets.append(horizon_frames)
+        return tuple(offsets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,14 +394,7 @@ def _sample(
 ) -> dict[str, Any]:
     player = controller._player(observation, controller.config.observation_delay)
     bounds = controller._bounds(observation, player[2])
-    beam_metrics = _evaluate_plan(
-        controller,
-        player,
-        bounds,
-        decision.threats,
-        decision.planned_actions,
-    )
-    grids: list[dict[str, Any]] = []
+    planned_grids: list[tuple[float, bool, Any, float, tuple[float, float]]] = []
     for cell_size in cell_sizes:
         for conservative in (False, True):
             result, duration, intended_goal = _grid_plan(
@@ -378,40 +405,65 @@ def _sample(
                 conservative=conservative,
                 goal_policy=grid_goal_policy,
             )
-            metrics = _evaluate_plan(
-                controller,
-                player,
-                bounds,
-                decision.threats,
-                result.actions,
-            )
-            terminal_position = (
-                result.steps[-1].position
-                if result.steps else
-                (player[0], player[1])
-            )
-            grids.append({
-                "cell_size": cell_size,
-                "conservative_whole_cell": conservative,
-                "goal_policy": grid_goal_policy,
-                "seconds": duration,
-                "grid_shape": list(result.field.risk.shape),
-                "peak_level": result.peak_level,
-                "total_risk": result.total_risk,
-                "reached_goal": result.reached_goal,
-                "intended_goal": list(intended_goal),
-                "terminal_position": list(terminal_position),
-                "terminal_goal_distance": math.hypot(
-                    terminal_position[0] - intended_goal[0],
-                    terminal_position[1] - intended_goal[1],
-                ),
-                "first_action": result.first_action.to_dict(),
-                "metrics": asdict(metrics),
-            })
+            planned_grids.append((
+                cell_size,
+                conservative,
+                result,
+                duration,
+                intended_goal,
+            ))
+    comparison_action_count = min(
+        len(decision.planned_actions),
+        *(len(value[2].actions) for value in planned_grids),
+    )
+    beam_metrics = _evaluate_plan(
+        controller,
+        player,
+        bounds,
+        decision.threats,
+        decision.planned_actions[:comparison_action_count],
+    )
+    grids: list[dict[str, Any]] = []
+    for cell_size, conservative, result, duration, intended_goal in planned_grids:
+        metrics = _evaluate_plan(
+            controller,
+            player,
+            bounds,
+            decision.threats,
+            result.actions[:comparison_action_count],
+        )
+        terminal_position = (
+            result.steps[
+                min(comparison_action_count, len(result.steps) - 1)
+            ].position
+            if result.steps else
+            (player[0], player[1])
+        )
+        grids.append({
+            "cell_size": cell_size,
+            "conservative_whole_cell": conservative,
+            "goal_policy": grid_goal_policy,
+            "comparison_action_count": comparison_action_count,
+            "planner_action_count": len(result.actions),
+            "seconds": duration,
+            "grid_shape": list(result.field.risk.shape),
+            "peak_level": result.peak_level,
+            "total_risk": result.total_risk,
+            "reached_goal": result.reached_goal,
+            "intended_goal": list(intended_goal),
+            "terminal_position": list(terminal_position),
+            "terminal_goal_distance": math.hypot(
+                terminal_position[0] - intended_goal[0],
+                terminal_position[1] - intended_goal[1],
+            ),
+            "first_action": result.first_action.to_dict(),
+            "metrics": asdict(metrics),
+        })
     return {
         "source_frame": int(record["source_frame"]),
         "threat_count": len(decision.threats),
         "region_navigation_mode": decision.region_navigation_mode,
+        "comparison_action_count": comparison_action_count,
         "beam": {
             "seconds": beam_seconds,
             "first_action": decision.action.to_dict(),
@@ -613,6 +665,7 @@ def benchmark(
         sample["beam"]["metrics"]["aba_changes"] for sample in samples
     )
     return {
+        "implementation_sha256": source_tree_sha256(),
         "report": _report_label(report_path),
         "controller_profile": controller_profile,
         "grid_goal_policy": grid_goal_policy,
@@ -622,20 +675,27 @@ def benchmark(
         "beam_replay_first_action_changes": beam_first_action_changes,
         "method": {
             "comparison_scope": (
-                "Open-loop plans recomputed from identical recorded delayed "
-                "observations; this is not an episode survival result."
+                "Open-loop complete planner variants recomputed from identical "
+                "recorded delayed observations; this is not an isolated "
+                "rasterization experiment or an episode survival result."
             ),
             "controller_profile": (
-                "Current overrides the recorded clearance targets with 20/8; "
-                "recorded retains the legacy report values 12/1."
+                "Current overrides the recorded clearance and direction-hold "
+                "settings with the active MPCConfig defaults; recorded retains "
+                "the values embedded in the source report."
             ),
             "continuous_validation": (
                 "Every logical frame uses EngineMPC threat motion/radius and "
                 "continuous Euclidean circle clearance."
             ),
             "grid_temporal_sampling": (
-                "Threat centers are sampled every three frames. Candidate "
-                "plans are therefore not treated as collision proofs."
+                "Grid layers remain three frames apart, but each layer receives "
+                "all logical-frame threat occupancy from the preceding interval."
+            ),
+            "common_horizon_validation": (
+                "Within each observation, beam and every grid plan are truncated "
+                "to the shortest available action sequence before continuous "
+                "metrics and terminal distance are compared."
             ),
             "grid_collision_level": (
                 f"Collision adds {GRID_COLLISION_RISK:g} risk and is separated "
@@ -754,7 +814,7 @@ def main() -> int:
         "--controller-profile",
         choices=("current", "recorded"),
         default="current",
-        help="current applies the new 20/8 clearance targets",
+        help="current applies the active MPCConfig clearance/hold defaults",
     )
     parser.add_argument(
         "--grid-goal-policy",

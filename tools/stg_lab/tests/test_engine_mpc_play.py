@@ -12,7 +12,9 @@ from stg_lab.engine_mpc_play import (
     _controller_observation,
     run_engine_mpc_play,
 )
+from stg_lab.engine_runtime import local_runtime_source_fingerprints
 from stg_lab.protocol import Action
+from stg_lab.vision import VisionConfig
 
 
 def observation(
@@ -20,6 +22,7 @@ def observation(
     *,
     terminated: bool = False,
     reason: str | None = None,
+    death: int = 0,
 ) -> dict[str, Any]:
     return {
         "episode_frame": frame,
@@ -40,6 +43,9 @@ def observation(
             "b": 0.5,
             "hspeed": 4.0,
             "lspeed": 2.0,
+            "death": death,
+            "protect": 0,
+            "status": "normal",
         },
         "enemy_bullets": [],
         "enemies": [{
@@ -65,27 +71,42 @@ class FakeEngineClient:
         terminate_at: int = 6,
         initial_frame: int = 0,
         frame_step: int = 1,
+        completion_reason: str = "attack_complete",
+        final_death: int = 0,
     ) -> None:
         self.terminate_at = terminate_at
         self.initial_frame = initial_frame
         self.frame_step = frame_step
+        self.completion_reason = completion_reason
+        self.final_death = final_death
         self.frame = initial_frame
         self.actions: list[Action] = []
+        self.runtime_source_crc32 = local_runtime_source_fingerprints()[0]
 
     def ping(self):
         return {
             "protocol": 2,
             "session_id": "fake-mpc-prefix",
             "process_nonce": "fake-process",
-            "runtime_identity": {"process_id": 42},
+            "runtime_identity": {
+                "process_id": 42,
+                "source_crc32": self.runtime_source_crc32,
+            },
         }
 
     def catalog(self):
         return {"catalog": {"attacks": [
             {"scenario": "okuu:Lunatic", "attack": 3, "card_index": 4},
+        ], "stages": [
+            {"stage": "Stage 5@Lunatic", "stage_index": 5},
         ]}}
 
     def reset(self, scenario, attack, *, seed, player, options):
+        self.frame = self.initial_frame
+        return {"observation": observation(self.frame)}
+
+    def reset_stage(self, stage, *, seed, player, options):
+        assert stage == "Stage 5@Lunatic"
         self.frame = self.initial_frame
         return {"observation": observation(self.frame)}
 
@@ -100,7 +121,8 @@ class FakeEngineClient:
         return {"observation": observation(
             self.frame,
             terminated=terminated,
-            reason="attack_complete" if terminated else None,
+            reason=self.completion_reason if terminated else None,
+            death=self.final_death if terminated else 0,
         )}
 
 
@@ -136,14 +158,97 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
 
     assert report["success"] is True
     assert report["episode_completed"] is True
-    assert report["policy_validation_eligible"] is True
+    assert report["teacher_success"] is True
+    assert report["pure_policy"] is False
+    assert report["pure_policy_success"] is False
+    assert report["pure_policy_validation_eligible"] is False
+    assert report["region_dynamics_training_eligible"] is True
     assert report["passed"] is True
+    assert report["engine"]["runtime_source_verification"]["matched"] is True
+    assert report["engine"]["runtime_source_verification"]["source_count"] == 18
     assert "recorded_prefix" not in report
     assert report["unsafe_shot_frames_excludes_recorded_actions"] is False
     assert all(item["control_source"] == "live_mpc" for item in report["decisions"])
     assert all(action.spell is False for action in client.actions)
     assert all(item["predicted_collision"] is False for item in report["decisions"])
+    assert all(
+        "predicted_minimum_nonregion_margin" in item
+        and "predicted_minimum_region_margin" in item
+        and "predicted_immediate_corner_clearance" in item
+        and item["gap_bullet_group_count"] == 0
+        and item["gap_corridor_count"] == 0
+        and item["gap_selected_center"] is None
+        and item["gap_selected_width"] is None
+        and item["gap_selected_lifetime_frames"] is None
+        and item["gap_navigation_mode"] == "inactive"
+        for item in report["decisions"]
+    )
+    assert report["gap_prediction"] == {
+        "enabled": True,
+        "detected_decision_count": 0,
+        "selected_decision_count": 0,
+        "observe_decision_count": 0,
+        "enter_decision_count": 0,
+        "hold_decision_count": 0,
+        "exit_decision_count": 0,
+        "maximum_bullet_group_count": 0,
+        "maximum_corridor_count": 0,
+    }
     assert report["render_performance"]["dense_frames"]["median"] == 59.5
+
+
+def test_engine_mpc_rejects_stale_runtime_lua_before_reset() -> None:
+    client = FakeEngineClient()
+    client.runtime_source_crc32 = {
+        **client.runtime_source_crc32,
+        "root.lua": "00000000",
+    }
+
+    with pytest.raises(EngineProtocolError, match="changed=.*root.lua"):
+        run_engine_mpc_play(
+            client,  # type: ignore[arg-type]
+            scenario="okuu:Lunatic",
+            attack=3,
+            seed=42,
+            player="reimu_player",
+            controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+            config=EngineMPCPlayConfig(max_frames=12, observation_delay=0),
+        )
+
+
+def test_disabled_gap_prediction_reports_only_inactive_diagnostics() -> None:
+    report = run_engine_mpc_play(
+        FakeEngineClient(),  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        controller=EngineMPC(MPCConfig(
+            observation_delay=0,
+            horizon_frames=36,
+            gap_prediction_enabled=False,
+        )),
+        config=EngineMPCPlayConfig(max_frames=12, observation_delay=0),
+    )
+
+    assert report["gap_prediction"] == {
+        "enabled": False,
+        "detected_decision_count": 0,
+        "selected_decision_count": 0,
+        "observe_decision_count": 0,
+        "enter_decision_count": 0,
+        "hold_decision_count": 0,
+        "exit_decision_count": 0,
+        "maximum_bullet_group_count": 0,
+        "maximum_corridor_count": 0,
+    }
+    assert all(
+        item["gap_navigation_mode"] == "inactive"
+        and item["gap_bullet_group_count"] == 0
+        and item["gap_corridor_count"] == 0
+        and item["gap_selected_center"] is None
+        for item in report["decisions"]
+    )
 
 
 def test_action_artifact_replay_is_not_part_of_current_mpc_api() -> None:
@@ -173,6 +278,55 @@ def test_max_frames_is_not_success() -> None:
     assert report["termination_reason"] == "max_frames"
 
 
+def test_completion_with_a_recorded_death_is_not_success() -> None:
+    report = run_engine_mpc_play(
+        FakeEngineClient(final_death=1),  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+        config=EngineMPCPlayConfig(max_frames=12, observation_delay=0),
+    )
+
+    assert report["terminated"] is True
+    assert report["termination_reason"] == "attack_complete"
+    assert report["outcome_evidence"]["final_player"]["death"] == 1
+    assert report["success"] is False
+    assert report["passed"] is False
+    assert "death=0" in report["success_criterion"]
+
+
+def test_full_stage_requires_stage_complete() -> None:
+    success = run_engine_mpc_play(
+        FakeEngineClient(completion_reason="stage_complete"),  # type: ignore[arg-type]
+        scenario="Stage 5@Lunatic",
+        attack=None,
+        stage="Stage 5@Lunatic",
+        seed=42,
+        player="reimu_player",
+        controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+        config=EngineMPCPlayConfig(max_frames=12, observation_delay=0),
+    )
+    assert success["success"] is True
+    assert success["episode_kind"] == "stage"
+    assert success["stage"] == "Stage 5@Lunatic"
+    assert success["attack"] is None
+    assert success["termination_reason"] == "stage_complete"
+
+    wrong_reason = run_engine_mpc_play(
+        FakeEngineClient(completion_reason="attack_complete"),  # type: ignore[arg-type]
+        scenario="Stage 5@Lunatic",
+        attack=None,
+        stage="Stage 5@Lunatic",
+        seed=42,
+        player="reimu_player",
+        controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+        config=EngineMPCPlayConfig(max_frames=12, observation_delay=0),
+    )
+    assert wrong_reason["success"] is False
+
+
 def test_engine_episode_frame_must_advance_one_per_step() -> None:
 
     with pytest.raises(EngineProtocolError, match="advance by exactly one"):
@@ -185,3 +339,33 @@ def test_engine_episode_frame_must_advance_one_per_step() -> None:
             controller=EngineMPC(MPCConfig(observation_delay=0)),
             config=EngineMPCPlayConfig(observation_delay=0),
         )
+
+
+def test_native_decision_observer_receives_latest_stream_frames() -> None:
+    samples = []
+    report = run_engine_mpc_play(
+        FakeEngineClient(),  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        controller=EngineMPC(MPCConfig(observation_delay=0, horizon_frames=36)),
+        config=EngineMPCPlayConfig(max_frames=12, observation_delay=0),
+        decision_observer=lambda visible, action, risk: samples.append(
+            (visible, action, risk)
+        ),
+        vision_config=VisionConfig(
+            global_width=12,
+            global_height=14,
+            local_width=10,
+            local_height=10,
+            history=1,
+            observation_delay=0,
+        ),
+    )
+
+    assert report["success"] is True
+    assert len(samples) == report["decision_count"]
+    assert all(value[0].global_frames.shape == (1, 6, 14, 12) for value in samples)
+    assert all(value[0].local_frames.shape == (1, 6, 10, 10) for value in samples)
+    assert all(0.0 <= value[2] <= 1.0 for value in samples)

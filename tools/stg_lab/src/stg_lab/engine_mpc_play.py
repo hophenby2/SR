@@ -5,14 +5,21 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict, dataclass
 import math
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .engine import EngineClient, EngineProtocolError
+from .engine_runtime import verify_runtime_source_fingerprints
 from .engine_mpc import EngineMPC, MPCDecision
 from .engine_play import _OutcomeTrace, _catalog_entry, _observation
+from .engine_vision import EngineStreamVision, controller_observation
+from .native_dataset import risk_from_clearance
 from .protocol import Action
 from .provenance import source_tree_sha256
 from .render_performance import RenderPerformanceTrace
+from .vision import VisionConfig, VisionObservation
+
+
+DecisionObserver = Callable[[VisionObservation, Action, float], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +76,21 @@ def _episode_frame(observation: Mapping[str, Any]) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _catalog_stage(response: Mapping[str, Any], stage: str) -> dict[str, Any]:
+    catalog = response.get("catalog")
+    if not isinstance(catalog, Mapping) or not isinstance(catalog.get("stages"), list):
+        raise EngineProtocolError("engine response has no live stage catalog")
+    matches = [
+        item for item in catalog["stages"]
+        if isinstance(item, Mapping) and item.get("stage") == stage
+    ]
+    if len(matches) != 1:
+        raise EngineProtocolError(
+            f"live catalog does not contain exactly one stage {stage}",
+        )
+    return dict(matches[0])
 
 
 def _player_position(observation: Mapping[str, Any]) -> dict[str, float] | None:
@@ -170,16 +192,9 @@ def _controller_observation(
     delayed: Mapping[str, Any],
     current: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Keep hazards delayed while exposing the player's current visible state."""
+    """Backward-compatible alias for the shared live-vision contract."""
 
-    result = dict(delayed)
-    result.pop("performance", None)
-    player = current.get("player")
-    if isinstance(player, Mapping):
-        result["player"] = dict(player)
-        result["own_player_observation_delay"] = 0
-        result["own_player_observation_frame"] = _episode_frame(current)
-    return result
+    return controller_observation(delayed, current)
 
 
 def _effective_action(decision: MPCDecision, config: EngineMPCPlayConfig) -> Action:
@@ -201,33 +216,69 @@ def run_engine_mpc_play(
     client: EngineClient,
     *,
     scenario: str,
-    attack: int,
+    attack: int | None,
     seed: int,
     player: str,
     controller: EngineMPC,
     config: EngineMPCPlayConfig = EngineMPCPlayConfig(),
+    stage: str | None = None,
+    decision_observer: DecisionObserver | None = None,
+    vision_config: VisionConfig | None = None,
 ) -> dict[str, Any]:
-    """Run one strict real-engine episode using delayed visible geometry."""
+    """Run one strict attack or full-stage episode using delayed geometry."""
 
-    if attack <= 0:
-        raise ValueError("attack must be positive")
+    if stage is None:
+        if attack is None or attack <= 0:
+            raise ValueError("attack must be positive")
+        episode_kind = "attack"
+        completion_reason = "attack_complete"
+    else:
+        if not stage:
+            raise ValueError("stage must be a nonempty string")
+        if attack is not None:
+            raise ValueError("attack must be None for a stage episode")
+        episode_kind = "stage"
+        completion_reason = "stage_complete"
     if controller.config.decision_interval != config.decision_interval:
         raise ValueError("controller and runner decision intervals differ")
     if controller.config.observation_delay != config.observation_delay:
         raise ValueError("controller and runner observation delays differ")
 
     ping = client.ping()
-    catalog_entry = _catalog_entry(client.catalog(), scenario, attack)
-    response = client.reset(
-        scenario,
-        attack,
-        seed=int(seed),
-        player=player,
-        options={},
-    )
+    runtime_source_verification = verify_runtime_source_fingerprints(ping)
+    catalog_response = client.catalog()
+    if stage is None:
+        assert attack is not None
+        catalog_entry = _catalog_entry(catalog_response, scenario, attack)
+        response = client.reset(
+            scenario,
+            attack,
+            seed=int(seed),
+            player=player,
+            options={},
+        )
+    else:
+        catalog_entry = _catalog_stage(catalog_response, stage)
+        response = client.reset_stage(
+            stage,
+            seed=int(seed),
+            player=player,
+            options={},
+        )
     raw = _observation(response)
     initial_episode_frame = _episode_frame(raw)
     controller.reset()
+    stream_vision = None
+    if decision_observer is not None:
+        stream_vision = EngineStreamVision(
+            vision_config or VisionConfig(
+                history=1,
+                observation_delay=config.observation_delay,
+            ),
+        )
+        if stream_vision.config.observation_delay != config.observation_delay:
+            raise ValueError("demonstration and MPC observation delays differ")
+        stream_vision.reset(raw)
     delayed_observations: deque[Mapping[str, Any]] = deque(
         [raw] * (config.observation_delay + 1),
         maxlen=config.observation_delay + 1,
@@ -254,6 +305,13 @@ def run_engine_mpc_play(
         decision = controller.select(controller_observation)
         evaluation = _selected_evaluation(decision)
         action = _effective_action(decision, config)
+        if decision_observer is not None:
+            assert stream_vision is not None
+            decision_observer(
+                stream_vision.observe(),
+                action,
+                risk_from_clearance(evaluation.minimum_margin),
+            )
         source_frame = decision.source_frame
         requested = min(config.decision_interval, config.max_frames - logical_frames)
         advanced = 0
@@ -262,6 +320,8 @@ def run_engine_mpc_play(
             before_frame = _episode_frame(before)
             response = client.step(action, repeat=1)
             raw = _observation(response)
+            if stream_vision is not None:
+                stream_vision.push(raw)
             after_frame = _episode_frame(raw)
             if (
                 before_frame is None
@@ -298,6 +358,21 @@ def run_engine_mpc_play(
             "predicted_collision_frames": evaluation.collision_frames,
             "predicted_earliest_collision_frame": evaluation.earliest_collision_frame,
             "predicted_minimum_margin": evaluation.minimum_margin,
+            "predicted_minimum_nonregion_margin": (
+                evaluation.minimum_nonregion_margin
+                if math.isfinite(evaluation.minimum_nonregion_margin) else
+                None
+            ),
+            "predicted_minimum_region_margin": (
+                evaluation.minimum_region_margin
+                if math.isfinite(evaluation.minimum_region_margin) else
+                None
+            ),
+            "predicted_immediate_corner_clearance": (
+                evaluation.immediate_corner_clearance
+                if math.isfinite(evaluation.immediate_corner_clearance) else
+                None
+            ),
             "region_anchor": (
                 None if decision.region_anchor is None else
                 {"x": decision.region_anchor[0], "y": decision.region_anchor[1]}
@@ -316,6 +391,20 @@ def run_engine_mpc_play(
             "region_learned_cycle_frames": decision.region_learned_cycle_frames,
             "region_frames_until_expansion": decision.region_frames_until_expansion,
             "region_observed_radius": decision.region_observed_radius,
+            "gap_bullet_group_count": decision.gap_bullet_group_count,
+            "gap_corridor_count": decision.gap_corridor_count,
+            "gap_selected_center": (
+                None if decision.gap_selected_center is None else
+                {
+                    "x": decision.gap_selected_center[0],
+                    "y": decision.gap_selected_center[1],
+                }
+            ),
+            "gap_selected_width": decision.gap_selected_width,
+            "gap_selected_lifetime_frames": (
+                decision.gap_selected_lifetime_frames
+            ),
+            "gap_navigation_mode": decision.gap_navigation_mode,
             "using_committed_plan": decision.using_committed_plan,
             "committed_plan_immediate_margin": decision.committed_plan_immediate_margin,
             "committed_plan_current_horizon_margin": (
@@ -337,25 +426,80 @@ def run_engine_mpc_play(
     engine_terminated = raw.get("terminated") is True
     engine_reason = raw.get("termination_reason") if engine_terminated else None
     termination_reason = engine_reason if engine_terminated else "max_frames"
-    success = engine_terminated and engine_reason == "attack_complete"
+    outcome_evidence = trace.report(raw)
+    final_player = outcome_evidence.get("final_player")
+    death_value = (
+        final_player.get("death") if isinstance(final_player, Mapping) else None
+    )
+    zero_death_evidence = (
+        not isinstance(death_value, bool)
+        and isinstance(death_value, (int, float))
+        and math.isfinite(float(death_value))
+        and float(death_value) == 0.0
+    )
+    success = (
+        engine_terminated
+        and engine_reason == completion_reason
+        and zero_death_evidence
+    )
     final_episode_frame = _episode_frame(raw)
     engine_advanced = None
     if initial_episode_frame is not None and final_episode_frame is not None:
         engine_advanced = max(0, final_episode_frame - initial_episode_frame)
     runtime_identity = ping.get("runtime_identity")
+    gap_diagnostics = {
+        "enabled": controller.config.gap_prediction_enabled,
+        "detected_decision_count": sum(
+            item["gap_corridor_count"] > 0 for item in decisions
+        ),
+        "selected_decision_count": sum(
+            item["gap_selected_center"] is not None for item in decisions
+        ),
+        "observe_decision_count": sum(
+            item["gap_navigation_mode"] == "observe" for item in decisions
+        ),
+        "enter_decision_count": sum(
+            item["gap_navigation_mode"] == "enter" for item in decisions
+        ),
+        "hold_decision_count": sum(
+            item["gap_navigation_mode"] == "hold" for item in decisions
+        ),
+        "exit_decision_count": sum(
+            item["gap_navigation_mode"] == "exit" for item in decisions
+        ),
+        "maximum_bullet_group_count": max(
+            (item["gap_bullet_group_count"] for item in decisions),
+            default=0,
+        ),
+        "maximum_corridor_count": max(
+            (item["gap_corridor_count"] for item in decisions),
+            default=0,
+        ),
+    }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_kind": "live_luastg_delayed_visible_mpc_teacher",
         "acceptance_claim": False,
         "implementation_sha256": source_tree_sha256(),
         "success": success,
         "passed": success,
         "episode_completed": success,
-        "policy_validation_eligible": True,
-        "success_criterion": "terminated with termination_reason=attack_complete",
-        "policy_validation_criterion": "attack_complete from reset under live MPC",
+        "teacher_success": success,
+        "pure_policy": False,
+        "pure_policy_success": False,
+        "pure_policy_validation_eligible": False,
+        "region_dynamics_training_eligible": True,
+        "success_criterion": (
+            f"terminated with termination_reason={completion_reason} and "
+            "outcome_evidence.final_player.death=0"
+        ),
+        "policy_validation_criterion": (
+            f"{completion_reason} with zero deaths from reset under live MPC"
+        ),
+        "episode_kind": episode_kind,
         "scenario": scenario,
-        "attack": int(attack),
+        "attack": None if attack is None else int(attack),
+        "stage": stage,
         "seed": int(seed),
         "player": player,
         "terminated": engine_terminated,
@@ -377,10 +521,12 @@ def run_engine_mpc_play(
             "runtime_identity": (
                 dict(runtime_identity) if isinstance(runtime_identity, Mapping) else {}
             ),
+            "runtime_source_verification": runtime_source_verification,
             "catalog_entry": catalog_entry,
         },
-        "outcome_evidence": trace.report(raw),
+        "outcome_evidence": outcome_evidence,
         "render_performance": render_performance.report(),
+        "gap_prediction": gap_diagnostics,
         "terminal_transition_evidence": (
             None if terminal_before is None else {
                 "reporting_only_not_controller_input": True,

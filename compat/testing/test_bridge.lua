@@ -10,6 +10,7 @@ end
 
 GROUP_ENEMY_BULLET = 1
 GROUP_ENEMY = 2
+GROUP_GHOST = 0
 GROUP_PLAYER = 4
 GROUP_INDES = 5
 GROUP_NONTJT = 7
@@ -22,7 +23,8 @@ laser = { is_class = true }
 local laser_child = { is_class = true, base = laser }
 local player_object = {
     x = 0, y = -100, vx = 0, vy = 0, a = 2, b = 2,
-    colli = true, status = "normal", death = 0, protect = 0,
+    colli = true, group = GROUP_PLAYER,
+    status = "normal", death = 0, protect = 0,
 }
 local visible_bullet = {
     x = 10, y = 20, vx = 1, vy = -2, a = 3, b = 3,
@@ -108,8 +110,16 @@ lstg = {
 }
 
 local spell_stage = { stage_name = "Spell Practice@Spell Practice", is_menu = false, timer = 0 }
+local stage4 = { stage_name = "Stage 4@Lunatic", is_menu = false, timer = 0 }
+local full_stage = { stage_name = "Stage 5@Lunatic", is_menu = false, timer = 0 }
+local menu_stage = { stage_name = "menu", is_menu = true, timer = 0 }
 stage = {
-    stages = { ["Spell Practice@Spell Practice"] = spell_stage },
+    stages = {
+        ["Spell Practice@Spell Practice"] = spell_stage,
+        ["Stage 4@Lunatic"] = stage4,
+        ["Stage 5@Lunatic"] = full_stage,
+        ["menu"] = menu_stage,
+    },
     current_stage = { stage_name = "menu", is_menu = true, timer = 0 },
 }
 function stage.Set(name)
@@ -140,6 +150,23 @@ SR_SPELL_PRACTICE_CATALOG = {
                 { attack = 1, card_index = 2, label = "Lunatic 5 Boss #1" },
                 { attack = 2, card_index = 4, label = "Lunatic 5 Boss #2" },
             },
+        },
+    },
+}
+SR_STAGE_TEST_CATALOG = {
+    schema_version = 1,
+    stages = {
+        {
+            stage = "Stage 4@Lunatic",
+            difficulty = "Lunatic",
+            stage_index = 4,
+            label = "Lunatic Stage 4",
+        },
+        {
+            stage = "Stage 5@Lunatic",
+            difficulty = "Lunatic",
+            stage_index = 5,
+            label = "Lunatic Stage 5",
         },
     },
 }
@@ -194,7 +221,12 @@ end
 requests.RESET = {
     id = 1, command = "reset", scenario = "okuu:Lunatic", attack = 2,
     seed = 42, player = "reimu_player",
-    options = { lifeleft = 5, player_protect_frames = 500 },
+    options = {
+        lifeleft = 5,
+        player_protect_frames = 500,
+        player_collidable = false,
+        player_ghost = true,
+    },
 }
 client.input[#client.input + 1] = "RESET"
 
@@ -230,6 +262,9 @@ instance:_handle_request({ id = 0, command = "catalog" })
 check(encoded_values[#encoded_values].id == 0 and encoded_values[#encoded_values].ok, "missing catalog response")
 check(encoded_values[#encoded_values].catalog.attack_count == 2, "catalog attack count mismatch")
 check(encoded_values[#encoded_values].catalog.attacks[2].card_index == 4, "catalog card index mismatch")
+check(encoded_values[#encoded_values].catalog.stage_count == 2, "catalog stage count mismatch")
+check(encoded_values[#encoded_values].catalog.stages[2].completion_reason == "stage_complete",
+    "catalog stage completion contract mismatch")
 encoded_values = {}
 
 FrameFunc()
@@ -239,6 +274,8 @@ check(lstg.var.sc_pr_data.scene_index == 4, "attack ordinal did not resolve to c
 check(lstg.var.sc_index == nil, "direct spell-practice reset must not leave a zero menu index")
 check(lstg.var.lifeleft == 5, "reset resource override was not applied")
 check(player_object.protect == 500, "player protection override was not applied")
+check(player_object.colli == false, "player collision override was not applied")
+check(player_object.group == GROUP_GHOST, "player ghost-group override was not applied")
 check(encoded_values[#encoded_values].id == 1 and encoded_values[#encoded_values].ok, "missing reset response")
 check(encoded_values[#encoded_values].observation.counts.enemy_bullets == 1, "visibility filter failed")
 check(encoded_values[#encoded_values].observation.counts.lasers == 1, "laser classification failed")
@@ -264,6 +301,77 @@ check(old_frame_count == 4, "repeat did not advance three frames")
 check(player_object.x == 3 and player_object.y == -103, "action was not held across repeat")
 check(encoded_values[#encoded_values].id == 2, "step response id mismatch")
 check(encoded_values[#encoded_values].observation.episode_frame == 4, "episode frame mismatch")
+
+instance:_handle_request({
+    id = 20, command = "reset_stage", stage = "Stage 4@Lunatic",
+    seed = 77, player = "reimu_player",
+    options = {
+        lifeleft = 4,
+        player_collidable = true,
+        player_ghost = false,
+    },
+})
+FrameFunc()
+check(instance.episode_kind == "stage", "stage reset did not set episode kind")
+check(instance.expected_stage == "Stage 4@Lunatic", "stage reset expected-stage mismatch")
+check(instance.expected_stage_successor == "Stage 5@Lunatic",
+    "stage reset successor mismatch")
+check(instance.expected_stage_menu == false, "nonfinal stage unexpectedly accepts a menu")
+check(encoded_values[#encoded_values].reset.episode_kind == "stage",
+    "stage reset response metadata mismatch")
+check(encoded_values[#encoded_values].observation.stage.scenario == "Stage 4@Lunatic",
+    "stage observation scenario mismatch")
+check(lstg.var.lifeleft == 4, "stage reset resource override was not applied")
+check(player_object.colli == true, "stage reset did not restore player collision")
+check(player_object.group == GROUP_PLAYER, "stage reset did not restore player group")
+instance.seen_enemy = true
+groups[GROUP_ENEMY] = {}
+check(instance:_check_stop(instance:collect_observation()) == nil,
+    "empty gap between stage waves prematurely completed the stage")
+stage.current_stage = menu_stage
+check(instance:_check_stop(instance:collect_observation()) == "stage_changed",
+    "a nonfinal stage accepted a menu transition")
+stage.current_stage = { stage_name = "Stage 6@Lunatic", is_menu = false, timer = 0 }
+check(instance:_check_stop(instance:collect_observation()) == "stage_changed",
+    "a noncatalog stage transition was accepted")
+stage.current_stage = full_stage
+check(instance:_check_stop(instance:collect_observation()) == "stage_complete",
+    "natural stage transition did not prove stage completion")
+
+instance:_handle_request({
+    id = 21, command = "reset_stage", stage = "Stage 5@Lunatic",
+    seed = 78, player = "reimu_player",
+})
+FrameFunc()
+instance.seen_enemy = true
+groups[GROUP_ENEMY] = {}
+check(instance.expected_stage_successor == nil, "final stage has an unexpected successor")
+check(instance.expected_stage_menu == true, "final stage does not accept its menu target")
+stage.current_stage = { stage_name = "Stage 6@Lunatic", is_menu = false, timer = 0 }
+check(instance:_check_stop(instance:collect_observation()) == "stage_changed",
+    "final stage accepted an arbitrary stage transition")
+stage.current_stage = menu_stage
+check(instance:_check_stop(instance:collect_observation()) == "stage_complete",
+    "final stage did not accept its normal menu transition")
+
+stage.current_stage = full_stage
+instance.terminated = false
+instance.termination_reason = nil
+local saved_original_frame = instance.original_frame
+instance.original_frame = function() return true end
+instance.pending = { id = 22, command = "step", remaining = 1 }
+instance.action = {}
+instance:_frame()
+check(instance.termination_reason == "engine_exit",
+    "engine exit was incorrectly accepted as full-stage completion")
+instance.original_frame = saved_original_frame
+stage.current_stage = spell_stage
+instance.terminated = false
+instance.termination_reason = nil
+instance.episode_kind = "attack"
+instance.episode_scenario = "okuu:Lunatic"
+instance.expected_stage = "Spell Practice@Spell Practice"
+groups[GROUP_ENEMY] = { enemy_object }
 
 RenderFunc()
 check(old_render_count == 0, "headless mode did not suppress rendering while connected")

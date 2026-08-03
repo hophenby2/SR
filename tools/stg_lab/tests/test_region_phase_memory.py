@@ -320,6 +320,26 @@ def test_region_memory_v2_accepts_only_relative_lateral_flow_rule(
         load_region_dynamics_memory(path)
 
 
+def test_bundled_boss3_region_memory_is_loadable() -> None:
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "models"
+        / "region_dynamics_boss3_v2.json"
+    )
+
+    loaded = load_region_dynamics_memory(
+        path,
+        scenario="okuu:Lunatic",
+        attack=3,
+    )
+
+    assert loaded.minimum_radius == 7.0
+    assert loaded.maximum_radius == 28.0
+    assert loaded.cycle_frames == 180.0
+    assert loaded.lateral_flow_cycle_frames == 360.0
+    assert loaded.safe_side_rule == "opposite_incoming_lateral_flow"
+
+
 def test_region_memory_rejects_inconsistent_cycle() -> None:
     with pytest.raises(ValueError, match="durations must sum"):
         RegionDynamicsMemory(

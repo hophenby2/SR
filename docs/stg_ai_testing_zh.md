@@ -104,6 +104,80 @@ uv run stg-lab train-region-dynamics \
 
 正式 v2 记忆 SHA-256 为 `dcdcddeeed840d733e144477934f217b21f6795ab9a83790d7f3813d273546f7`，训练报告 SHA-256 为 `95f4b3e45952f476f430158416d6f13b7617a4a5d25dbe07e522fc0107ac8e99`。输入 v37 报告 SHA-256 为 `60c1dd6bb0cfdece73d7170b3c968736479470ba87fed6e96fa68e42290134f5`，提供 357 个半径样本和 303 个横向流样本。拟合结果为半径 `7/28`、变化率 `0.7/0.7`、四相 `30/30/30/90`、半径周期 `180` 和横向流周期 `360`；360 帧重复的 201 对样本相关系数为 1、归一化 RMSE 为 0，180 帧反号的 252 对样本同样为 1 和 0。整体平移输入时间轴不会改变 memory 或相对样本统计。
 
+### 平行弹组空隙预测
+
+live Engine MPC 现在可以把安全区预测与通用弹幕空隙预测结合使用。只有
+`enemy_bullets` 能参与空隙分组；激光、敌人、不可摧毁物和强制位移体仍会
+进入常规碰撞与入口路径检查，但不能定义空隙。实现先按速度方向和速度大小
+聚类近似平行的运动子弹，再沿运动方向按纵深拆成独立波前。对每个波前在
+垂直运动方向的轴上排序，相邻两弹之间才构成候选走廊。整个过程只使用当前
+可见几何与运动估计，不读取攻击专用帧号、脚本相位、固定坐标或录制路线。
+
+走廊宽度表示自机中心真正可用的净宽，而不是两弹中心距。计算会扣除两侧
+子弹半径，并在两边分别扣除自机半径、10 单位安全余量和观察延迟造成的位移
+误差。候选走廊必须在到达与保持阶段的多个未来采样时刻持续开放；边界弹
+次序交换、未来闭合或存续时间不足都会使其失效。波前覆盖率阈值会排除无法
+代表整体弹幕屏障的孤立弹对。实现先为全部孔洞计算几何，但只对活动孔洞及
+最多 8 个与 region 相容且距离较近的候选执行入口认证。认证先检查可执行的
+三帧动作块直达路线，若被其他威胁阻挡，再用小型多样化 action beam 搜索
+绕行。完整路线对全部威胁的最低余量必须达到 4 单位；region anchor 活动时
+提高到 8 单位强制区域余量。这允许必要时短暂穿越较低等级危险区；选中空隙
+内部仍保留每侧 10 单位加观察延迟误差的安全带。因此某一平行弹组的孔洞不
+能掩盖横穿入口的另一组子弹、激光、敌人或强制位移体。
+
+空隙 anchor 与 region anchor 同时存在：region anchor 指向全局安全连通域或
+portal，空隙 anchor 为迎面波前提供局部走廊，候选选择会优先考虑与区域目标
+相容的走廊。碰撞预测仍严格早于 gap 入口；在 `enter` 状态，控制器会输出
+已认证路线的第一个动作，因此可以有意接受较低的普通弹净空，但不会接受碰
+撞；两个 anchor 同时活动时仍执行更高的 region 入口余量。进入 `hold` 后，
+整个可用区间都是软目标，不会追逐精确中心。当原地停留仍满足普通安全余量
+时，检测到的空隙只进入 `observe`。活动 gap 跨重规划保持身份并延续
+`enter -> hold -> exit`，而不是每个决策切换到最新孔洞。
+
+`engine-mpc-play` 默认启用这项逻辑；`--gap-prediction` 可显式开启，
+`--no-gap-prediction` 可用于确定性消融。每个 JSON 决策记录
+`gap_bullet_group_count`、`gap_corridor_count`、`gap_selected_center`、
+`gap_selected_width`、`gap_selected_lifetime_frames` 和
+`gap_navigation_mode`；最后一项取 `inactive`、`observe`、`enter`、`hold`
+或 `exit`。报告顶层的 `gap_prediction` 汇总还记录 `enabled`、检测/选中
+决策数、各模式决策数、`maximum_bullet_group_count` 与
+`maximum_corridor_count`。
+
+确定性的四弹波前回归还验证了 gap anchor 不只是遥测：自机位于自然形成的
+10 单位走廊外侧时，开启预测会把无碰撞首动作从直下改为朝空隙的向左，关闭
+预测则保持直下；另一组探针在直线路径上加入静止障碍，并验证控制器能找到
+由多个三帧动作块组成的安全绕行。这些都是合成集成探针，不是原生符卡成功
+率证据。
+
+本地合成性能探针包含 299 发子弹、23 个波前和 276 条走廊：几何阶段中位
+2.92 ms，开启/关闭空隙预测的完整决策中位分别为 135.24/131.66 ms，差值
+3.58 ms。几何完成后只会认证活动走廊及最多 8 个排序后的候选，不再对全部
+276 条走廊逐一执行 Python 路径搜索。这些数字不是原生闭环 A/B、实时吞吐
+或符卡成功率结果。
+
+最终同源码原生 A/B 使用 Okuu #3 seed `20260730`。两份报告均绑定实现
+SHA-256
+`811513e348b893bd41618f9d828ef2f54bc7dd1278a86dd12ec80ba655e216f2`，
+顶层运行配置完全相同，控制器配置的唯一差异是
+`gap_prediction_enabled`。
+
+| 空隙预测 | 严格引擎终态 | 空隙遥测 | 移动诊断 | 报告 SHA-256 |
+| --- | --- | --- | --- | --- |
+| 开启 | `attack_complete`；3,815 帧；Boss HP `6000 -> 0`；death 0；unsafe shots 0 | 检测 167 次、选中 52 次；observe/enter/hold/exit 为 `105/52/0/10`；最大弹组/走廊数 `49/12`；52 次入口移动全部匹配认证首动作，其中 46 次非静止 | 路径 10782.4653；变向 420 次（每千帧 110.0917）；精确反向 18 次；大于 90 度急转 122 次；ABA 10 次；保持中位数 6 帧 | `5f56b184bf7116b789187e6d3b03c1c43714f24250a9f8f857363b7bad60e2bd` |
+| 关闭 | `attack_complete`；3,815 帧；Boss HP `6000 -> 0`；death 0；unsafe shots 0 | 已禁用，所有 gap 计数均为 0 | 路径 10785.4956；变向 416 次（每千帧 109.0433）；精确反向 18 次；大于 90 度急转 139 次；ABA 6 次；保持中位数 6 帧 | `3c37da04b902332b41734cb93ead1695a582918c1fdd28037efb7ca605702db3` |
+
+逐项比较有 947 个输出动作不同，其中 930 个移动选择不同，1,110 个决策边界
+自机位置不同；因此认证入口确实改变了原生控制，而不只是增加遥测。开启组
+急转较少只描述本局，不是普遍平滑性结论。由于没有记录到 `hold`，所以原生
+证据只覆盖认证入口，不覆盖持续驻留；确定性
+回归测试覆盖了 `enter -> hold`。由于这里只运行一个 seed，且两边本来都能
+严格通过，所以仍不能证明成功率提升。这两份报告是
+`acceptance_claim=false` 的 live MPC 教师证据，不是学习模型结果。
+
+该预测器是通用视觉教师规则，不是写入已发布神经网络 checkpoint 的符卡专用
+记忆。本次 A/B 报告尚未转换为 gap-aware DAgger 或 demonstration archive，
+当前发布的 stream-v1 checkpoint 也尚未从此类档案重新训练。
+
 ### MPC 预筛选的精确等价与性能
 
 `experiments/benchmark_engine_mpc_beam.py` 在原生报告 `engine-mpc-boss3-heldout-v40-d5-region-dynamics-v2.json`（SHA-256 `e7577aa475ed9a9de6542fedfba8a193dca1b3d8a927e139371e22f41b2d94ef`）的记录观测上，对比保守候选 AABB 威胁预筛选和不筛选参考 beam。已记录的三次运行中位数如下：
@@ -117,35 +191,38 @@ uv run stg-lab train-region-dynamics \
 
 ### MPC 净空、变向迟滞与网格消融
 
-当前 live MPC 仍每 3 帧重规划，但普通弹幕目标净空由 12 提高到 20，强制位移区域目标由 1 提高到 8。束搜索对换向、180 度反向、`A -> B -> A` 和同方向速度档切换分别累计 `3/9/6/0.75` 代价，并在目标净空外继续提供有上限的净空奖励。方向通常至少保持 9 帧；未来 12 帧将碰撞、当前方案净空不超过 4、新方案净空提高至少 6 或真正进入限时 `evacuate` 时可立即解除。`preposition` 只是提前站位，不再无条件绕过迟滞，旧 committed plan 也必须通过相同检查。碰撞、首次碰撞、碰撞帧和净空不足始终先于这些平滑偏好；保持期内已经通过紧急或净空提升条件的换向，也不能再被旧 committed action 覆盖。
+当前 live MPC 仍每 3 帧重规划。普通弹使用 20 单位硬净空，强制位移区域使用独立的 8 单位硬净空；二者分别记分，狭窄强制通道不会掩盖普通子弹净空不足。16 单位危险优先层排在 20 单位目标之前，普通弹净空在 48 单位以内继续获得有上限的软奖励，角落逃生也有 48 单位软余量；这两个 48 都是偏好，不是不可穿越边界。束搜索对换向、180 度反向、`A -> B -> A` 和同方向速度档切换分别累计 `3/9/6/0.75` 代价。
+
+方向通常至少保持 12 帧。近距离碰撞、保持期后段获得至少 8 单位净空增益、立即离开危险角落，或限时 `evacuate` 且新方向在边界/Boss 对齐代价上取得至少 3 单位真实路线进展时才提前释放。`evacuate` 不再仅因模式名绕过迟滞，`preposition` 也不会绕过；旧 committed plan 必须通过相同安全门，不能在安全释放后恢复过时方向。碰撞、首次碰撞、碰撞帧数、16/20 单位净空层级始终先于平滑偏好。
 
 区域目标 `4/6/8/12` 在 32 个 `hold/preposition/evacuate/settle` 记录样本上的碰撞帧均为 15，8 个 crossing 样本均可达且无碰撞；中位净空约为 `4.35/6.33/8.29/12.18`。目标 12 会降低 crossing 推进并把最终锚点 L1 误差从目标 8 的约 0.87 增至 1.25，因此采用 8，而不是在狭窄入口强求 12。
 
-同 seed `20260730` 的两次原生闭环都严格击破。与旧严格局相比，最终平滑局的相邻决策变向为 `835 -> 487`，完全反向 `65 -> 20`，`A -> B -> A` 为 `154 -> 20`，实际连续非零位移夹角大于 90 度为 `236 -> 154`；预测最小净空中位数为 `1.43 -> 8.27`，净空不高于 4 的决策为 `815 -> 215`，预测碰撞帧为 `2346 -> 1009`。这些预测字段含 60 帧滚动未来，并不表示实际碰撞；两局最终均为 `death=0`。
+较早的 v46 同 seed 原生闭环用于量化平滑改动：相邻决策变向为 `835 -> 487`，完全反向 `65 -> 20`，`A -> B -> A` 为 `154 -> 20`，实际连续非零位移夹角大于 90 度为 `236 -> 154`；预测最小净空中位数为 `1.43 -> 8.27`，净空不高于 4 的决策为 `815 -> 215`，预测碰撞帧为 `2346 -> 1009`。这些预测字段含 60 帧滚动未来，并不表示实际碰撞；两局当时均为 `death=0`。该证据早于当前 12 帧迟滞与撤离释放修复，属于历史对照，不能替代当前源冻结后的原生复验。
 
-`experiments/benchmark_engine_mpc_grid.py` 还在来源帧 `488/1292/2102/2801/3695` 的同一批真实五帧延迟观测上，对 8/12/16 单元的时间分层网格和连续 beam 做开环对照。每条计划最后都用 Engine MPC 的逐逻辑帧连续圆形几何复算，不能用网格自身等级给自己作证。最终 v46 对照如下：
+`experiments/benchmark_engine_mpc_grid.py` 还在来源帧 `488/1292/2102/2801/3695` 的同一批真实五帧延迟观测上，对 8/12/16 单元的时间分层网格和连续 beam 做开环对照。网格层仍每 3 帧一个，但每层接收该时间段内每个逻辑帧的 swept threat 占用；同一观测内所有方案截断为共同最短动作时长，再用 Engine MPC 的逐逻辑帧连续圆形几何复算，不能用网格自身等级给自己作证。这比较的是完整规划器，不是只隔离栅格化。公平对照如下：
 
 | 方案 | 预测碰撞计划 | 碰撞帧率 | 最小净空中位数 | 每 60 帧计划内变向 | 平均耗时 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 连续 beam 20/8 | 3/5 | 9.09% | -4.87 | 5.66 | 0.103 秒 |
-| 8 单元中心网格 | 3/5 | 11.00% | -8.51 | 7.40 | 0.638 秒 |
-| 12 单元中心网格 | 3/5 | 10.67% | -5.49 | 9.40 | 0.248 秒 |
-| 16 单元中心网格 | 4/5 | 47.67% | -27.67 | 10.80 | 0.085 秒 |
+| 连续 beam 20/8 | 3/5 | 9.67% | -4.47 | 6.20 | 0.120 秒 |
+| 8 单元中心网格 | 2/5 | 9.00% | 1.90 | 7.80 | 1.326 秒 |
+| 12 单元中心网格 | 3/5 | 10.00% | -3.04 | 9.20 | 0.698 秒 |
+| 16 单元中心网格 | 4/5 | 45.33% | -26.29 | 10.60 | 0.460 秒 |
 
-半格对角线膨胀的整格保守版本也未反超：8/12/16 单元的碰撞帧率分别为 14.33%/17.33%/52.00%。8 单元中心网格的 33 个碰撞帧中，22 个在采样层之间，另有 11 个就在采样层，说明问题同时来自时间间隔、空间量化和累计风险选路。结论是保留网格用于可视化、连通域和全局区域提示，但最终动作继续使用逐帧连续 beam 校验；纯网格不替换当前控制器。最终对照报告 SHA-256 为 `a05c36395bc13c6bc829b5694d1b556bdf9be9fb720d554f0bfaa641bc6c67d9`。这是固定观测上的开环计划消融，不是 `attack_complete` 成功率。
+半格对角线膨胀的整格保守版本也未反超：8/12/16 单元的碰撞帧率分别为 11.67%/15.67%/52.33%。8 单元中心网格只比连续 beam 少 2 个碰撞帧（`27/300` 对 `29/300`），不足以证明 episode 级闭环优势；它的平均规划耗时约为连续 beam 的 11 倍，且变向更多。结论是保留网格用于可视化、连通域和全局区域提示，但最终局部动作继续使用逐帧连续几何、迟滞和 committed-plan 安全门；纯网格不替换当前控制器。工作报告 SHA-256 为 `ffc69082eefd2501d473981689eddd4fcfb67a0152a5723b9f099a46c7bbd901`。这是固定五观测上的开环完整规划器消融，不是 `attack_complete` 成功率。
 
 旧 standalone v2 的 SQLite 单路线/多路线库和对应哈希仍可用于复现历史基准，但它们包含录制路线，不再代表当前 Engine MPC 的策略记忆，也不能证明原生引擎泛化。
 
 ## 跨平台完整引擎、高速测试目标与渲染
 
-当前 `/Users/happyelements/LuaSTG-Sub` 源码已经不再保留“完整引擎依赖 DirectX”的旧前提。完整可执行文件可在 Windows、macOS 和 Linux 使用 SDL2 窗口/输入/音频与 OpenGL 4.1 GPU 精灵/FBO 渲染器，也可组合 null 图形/窗口/音频执行不限帧 headless 测试；两条路径都运行真实 Lua 脚本、资源系统、碰撞逻辑和测试桥。OpenGL 路径会批量提交旧顶点/索引，在 GPU 缓存源纹理，以 FBO 承载 RenderTarget，并直接显示主目标，不再逐帧上传 CPU 画布；受支持构建均不编译或链接 DirectX。
+当前 LuaSTG-Sub 源码树已经不再保留“完整引擎依赖 DirectX”的旧前提。完整可执行文件可在 Windows、macOS 和 Linux 使用 SDL2 窗口/输入/音频与 OpenGL 4.1 GPU 精灵/FBO 渲染器，也可组合 null 图形/窗口/音频执行不限帧 headless 测试；两条路径都运行真实 Lua 脚本、资源系统、碰撞逻辑和测试桥。OpenGL 路径会批量提交旧顶点/索引，在 GPU 缓存源纹理，以 FBO 承载 RenderTarget，并直接显示主目标，不再逐帧上传 CPU 画布；受支持构建均不编译或链接 DirectX。
 
 当前边界也必须保留：任意旧 HLSL 效果尚未翻译为 GLSL，只能退化为可见的 RenderTarget 直通合成；model 绘制和现代 MeshRenderer 尚未完全等价。上文 CrossOver/DXVK 结果验证的是原 Windows 可执行文件，属于独立证据，不是当前跨平台源码的运行依赖。
 
 完整 macOS 引擎的 preset 会依次配置、构建、执行无 DirectX 审计并运行对应测试：
 
 ```bash
-cd /Users/happyelements/LuaSTG-Sub
+LUA_STG_SUB_ROOT=/path/to/LuaSTG-Sub
+cd "$LUA_STG_SUB_ROOT"
 cmake --workflow --preset macos-headless-release
 cmake --workflow --preset macos-opengl-release
 ```
@@ -153,7 +230,8 @@ cmake --workflow --preset macos-opengl-release
 仓库仍保留较小且隔离的 `LuaSTGPortableTest` target。它复用原引擎 `XCollision` 的圆形/旋转椭圆判定，支持完全不初始化视频设备的不限帧 headless 模式，以及 SDL2 软件简化碰撞/风险区视图。这个 target 适合算法测试，但不能当作完整 macOS 游戏运行时。
 
 ```bash
-cd /Users/happyelements/LuaSTG-Sub
+LUA_STG_SUB_ROOT=/path/to/LuaSTG-Sub
+cd "$LUA_STG_SUB_ROOT"
 cmake --preset portable-native
 cmake --build --preset portable-native-release
 ctest --preset portable-native
@@ -172,9 +250,9 @@ build/portable-native/portable/LuaSTGPortableTest \
 
 `pulse` 覆盖安全区扩张、保持、收缩和最小保持，`orbit` 覆盖旋转强制位移体与旋转扇形弹；简化画面绘制与碰撞体一致的椭圆轮廓、自机判定和四级风险栅格。本机 arm64 macOS 已完成全新配置、Release 构建并由 CTest `1/1` 通过。已记录的 10 万帧 pulse 无渲染实测约为 1,511,690 逻辑帧/秒；包含 710,400 个风险采样的 600 帧 orbit 实测约为 496,620 逻辑帧/秒。macOS SDL2 软件截图 `build/portable-native/portable/pulse-macos.bmp` 和 SDL dummy 软件截图 `build/portable-native/portable/orbit-dummy.bmp` 都是非空 `480x560` BMP。该 target 是算法开发/碰撞可视化部分模块，不执行任意 SR Lua，不能替代完整引擎的 `attack_complete` 验收。
 
-引擎根目录的 `game/plugins/SafetyZoneVisualizer` 提供原生游戏内 F7 分级覆盖层；也可设置 `SR_SAFETY_ZONE_OVERLAY=1` 在首次游戏渲染前开启。它按当前可碰撞对象及未来 0 到 24 帧、每 3 帧一个时间层的线性投影绘制绿色安全、黄色注意、橙色危险和红色碰撞四级区域。16 单元网格按半格对角线膨胀判定半径，因此覆盖整个 cell 而不只是中心点；红色为净空不大于 0，橙色为净空不大于 12 或同一未来层 36 范围内至少 5 个威胁，黄色为净空不大于 24 或至少 3 个威胁。净空取所有未来层最差值，密度则逐层计数后取最大值，不再把先后经过的子弹虚构成同一时刻的密集弹幕。插件支持圆、旋转椭圆、矩形及直线激光。直线激光不再依赖通用椭圆字段：即使 THlib 对象的 `a=b=0`，插件也会按 `l1/l2/l3/w` 构造两端渐宽/渐窄的多边形并计算距离。插件只读对象几何，不修改输入、RNG、碰撞或 AI 记忆；曲线激光内部仍不由此诊断插件栅格化，实际碰撞以引擎为准。
+引擎根目录的 `game/plugins/SafetyZoneVisualizer` 提供原生游戏内 F7 分级覆盖层；也可设置 `SR_SAFETY_ZONE_OVERLAY=1` 在首次游戏渲染前开启。它按当前可碰撞对象及未来 0 到 24 帧的每个逻辑帧线性投影，绘制绿色安全、黄色注意、橙色危险和红色碰撞四级区域。16 单元网格按半格对角线膨胀判定半径，因此覆盖整个 cell 而不只是中心点；红色为净空不大于 0，橙色为净空不大于 16 或同一未来层 36 范围内至少 5 个威胁，黄色为净空不大于 28 或至少 3 个威胁。净空取所有未来帧最差值，密度逐帧计数后取最大值，不再把先后经过的子弹虚构成同一时刻的密集弹幕。椭圆半径只沿增长方向外推：最近重建提供观测增长率，`GROUP_INDES` 椭圆另至少按 Boss #3 的 0.7 单位/帧增长保护预测，绝不靠假设未来缩小来把格子判安全。插件支持圆、旋转椭圆、矩形及直线激光。直线激光不再依赖通用椭圆字段：即使 THlib 对象的 `a=b=0`，插件也会按 `l1/l2/l3/w` 构造两端渐宽/渐窄的多边形并计算距离。插件只读对象几何，不修改输入、RNG、碰撞或 AI 记忆；曲线激光内部仍不由此诊断插件栅格化，实际碰撞以引擎为准。
 
-覆盖层的保守空间索引只登记可能影响分级的投影边界内单元。独立测试针对椭圆、旋转矩形、渐宽/渐窄激光、快速投影、格角碰撞、错时密度、边界条件和 350 发弹幕逐格对比 full scan，任何风险等级降低都会失败。当前实跑仅有 `34548/2116800` 次查询进入精确净空距离计算，即 1.63%；672 个栅格单元合并为 45 个同级渲染矩形，即 `45/672`（渲染矩形/原单元），同时保持逐格完全等价。主脚本 SHA-256 为 `a39c7a1ac49e8a6214c1af2f1df6d6ae72ea113ac7bca6bc195c83a7bcf871be`。
+覆盖层的保守空间索引只登记可能影响分级的投影边界内单元。独立测试针对椭圆、旋转矩形、渐宽/渐窄激光、旧 3 帧层之间穿越的快速子弹、增长中的强制位移体、格角碰撞、错时密度、边界条件和 350 发弹幕逐格对比 full scan，任何风险等级降低都会失败。当前实跑仅有 `94585/5880000` 次查询进入精确净空距离计算，即 1.61%；672 个栅格单元合并为 45 个同级渲染矩形，即 `45/672`（渲染矩形/原单元），同时保持逐格完全等价。主脚本 SHA-256 为 `b87ff9802e43345a300bca9329572917e9454e8dda62a720ef7b3f471011c4ee`。
 
 ### 原生渲染性能与指标边界
 
@@ -195,10 +273,10 @@ build/portable-native/portable/LuaSTGPortableTest \
 
 原生 LuaSTG 每个显示循环都会先把交换链目标清为黑色，再调用 Lua `RenderFunc`，最后执行 Present。可见 lockstep 等待 Python 时不能通过提前返回来减少重复绘制，否则这些已清空的缓冲仍会提交，形成完整画面与黑帧交替的高频闪烁。桥接器现已在所有可见显示循环重绘当前逻辑状态；`--render-every` 只作为旧协议兼容提示保留，不再在 Lua 层跳过绘制。无渲染模式仍会抑制 Lua 场景绘制。
 
-Windows 必须先关闭正在运行的 LuaSTG，再把修改后的桥接器同步到本地游戏副本；从映射盘运行控制器不影响连接：
+Windows 必须先关闭正在运行的 LuaSTG，再把修改后的桥接器同步到本地游戏副本；从映射盘运行控制器不影响连接。先把 `SR_SOURCE_ROOT` 指向包含 `game` 的源码根目录：
 
 ```powershell
-$SourceRoot = 'Z:\crack\LuaSTG_aex+v0.8.22-beta.2 (based on LuaSTG_ex+v0.83b)'
+$SourceRoot = [IO.Path]::GetFullPath($env:SR_SOURCE_ROOT)
 $Mod = 'SR_Subterrain_Reanimation_v100'
 Copy-Item -LiteralPath "$SourceRoot\game\mod\$Mod\compat\testing\bridge.lua" `
   -Destination "C:\stg-win-demo\mod\$Mod\compat\testing\bridge.lua" -Force
@@ -206,7 +284,7 @@ Copy-Item -LiteralPath "$SourceRoot\game\mod\$Mod\compat\testing\bridge.lua" `
 
 可见演示使用 `SR_TEST_HEADLESS=0`、`SR_TEST_LOCKSTEP=1` 和 `--render --render-every 1`。启动参数应设置 `setting.vsync=true`；这可禁止允许 tearing 的提交，但仅开 vsync 不能修复旧桥接器产生的黑帧。修改 Lua 文件后必须重启引擎，因为文件只在启动时加载。若只有风险色块闪动而游戏底图稳定，可按 F7 关闭覆盖层并单独排查；整屏明暗交替则应先检查本地 `bridge.lua` 是否已经同步。
 
-完成本地游戏复制和 `.venv-win` 安装后，可直接双击 `tools\stg_lab\run-win-boss3.cmd`。它只启动现有文件，不复制、覆盖或安装游戏与 Python 环境。脚本会校验本地桥接器与当前源码一致，设置测试环境变量，以 `setting.vsync=true` 启动 `C:\stg-win-demo\LuaSTGSub.exe`，无连接地等待端口监听，然后运行 Boss #3 可见 MPC 测试。成功仍只接受引擎返回 `attack_complete`。报告写入带时间戳的 `tools\stg_lab\artifacts\engine-mpc-boss3-win-*.json`；默认保留游戏窗口，传入 `-CloseGameWhenDone` 才会在结束后请求关闭。
+完成本地游戏复制和 `.venv-win` 安装后，可直接双击 `tools\stg_lab\run-win-boss3.cmd`。它只启动现有文件，不复制、覆盖或安装游戏与 Python 环境。脚本会校验本地桥接器与当前源码一致，默认读取已纳入版本库的 `models\region_dynamics_boss3_v2.json`，设置测试环境变量，以 `setting.vsync=true` 启动 `C:\stg-win-demo\LuaSTGSub.exe`，无连接地等待端口监听，然后运行 Boss #3 可见 MPC 测试。成功仍只接受引擎返回 `attack_complete`。报告写入带时间戳的 `tools\stg_lab\artifacts\engine-mpc-boss3-win-*.json`；默认保留游戏窗口，传入 `-CloseGameWhenDone` 才会在结束后请求关闭。
 
 也可从 PowerShell 覆盖默认参数：
 
@@ -226,6 +304,163 @@ luac -p ../../plugins/SafetyZoneVisualizer/__init__.lua
 luac -p ../../plugins/SafetyZoneVisualizer/SafetyZoneVisualizer.lua
 git diff --check
 ```
+
+## 原生流式策略 v1：当前严格结果
+
+最终保留的 checkpoint 是
+[`policy_native_stream_v1.pt`](../tools/stg_lab/models/policy_native_stream_v1.pt)，
+SHA-256 为
+`829eebe53c886e5ba53f577542938b904aad740f3a5bf04b49d61e73ab61557d`；
+完整模型卡见
+[`policy_native_stream_v1.md`](../tools/stg_lab/models/policy_native_stream_v1.md)。
+训练档案含 25 个 episode、21,916 个决策，SHA-256 为
+`1bc03ce647d34c1fb3f77ba751d50ca7b602a9e16189025819e3cf89a423c384`。
+
+模型由全局/局部语义视觉编码器和 192 单元 GRU 组成，
+`memory_size=0`、`proficiency_size=0`。输入只有最近一帧延迟后的全局/
+局部六通道语义图、当前可见自机位置和 GRU 隐状态；场景/符卡编号、
+绝对帧、脚本相位、记录路线、waypoint、教师风险场和外置策略记忆都不
+进入模型。当前 checkpoint 的时序记忆全部由 GRU 学习。
+
+训练采用 episode-stateful TBPTT，chunk 长度 32，并按完整 episode 平衡
+优化：20 个训练 episode 每个 epoch 各贡献一个等权 optimizer step，长局
+不会仅凭样本数获得更大权重。类别平衡指数为 0.75，首次开始移动的
+权重为 4.0，方向变化权重为 1.5；两种变化只按同一 episode 内相邻的
+`teacher_action` 计算，方向只看 `(move_x, move_y)`，不把 slow 切换当成
+方向变化。episode 11-15 整局保留为验证集。
+
+本次训练明确使用 `restore_best_validation=false`。内部验证 loss 最低的是
+epoch 8（2.3124849571），最终保留 epoch 40 时为 2.5737202304。保留 epoch
+40 是因为它是通过原生 Koishi 严格门槛的候选，而不是因为它是
+validation-best；离线 loss 和动作准确率不能代替原生通关结果。
+
+`contextualize-demos` 可以根据严格 provenance manifest，为每个完整 episode
+附加仅含攻击身份的 one-hot token。词表包含 unknown token 和已登记的符卡/
+道中身份，并由 `--scenario-vocabulary-manifest` 写入 checkpoint；其中不含
+相位、坐标、动作、waypoint 或路线。这样可以让网络权重自行学习不同攻击
+所需的行为，而不是新增手写策略分支。启用
+`--previous-action-conditioning` 时，另一个 18 维 one-hot token 只表示上一条
+真正执行的移动动作。direct-corrective DAgger 保留这条实际执行动作流，
+live inference 也只在引擎确认推进后提交；其中不含未来动作、教师建议、
+坐标、帧、相位、waypoint 或路线，只作为网络学习时序动力学的运动反馈。
+该实验仍未通过发布门槛：一个 256
+单元 GRU 候选在 915 帧严格通过 Koishi #1，但 Okuu #3 于 522 帧中弹；再
+训练 20 epoch 只延长到 642 帧。一局严格完成的 Okuu #3 DAgger 数据需要
+在 1272 个决策中介入 1100 次，随后续训 10 epoch 的纯模型仍于 514 帧
+中弹。因此正式随附的 checkpoint 继续采用 `memory_size=0`。
+
+四类控制结果必须分开：
+
+| 类别 | 移动决策来源 | 证据边界 |
+| --- | --- | --- |
+| pure GRU | 延迟语义视觉、当前可见自机位置、GRU 隐状态 | 可作为学习模型结果 |
+| visible safety | 独立的纯可见局部预测可覆盖 GRU 动作 | 仅为 hybrid 诊断，必须报告检查与介入次数 |
+| DAgger teacher | 学生访问状态，精确状态 MPC 为每步打标签并可介入执行 | 仅训练数据；严格完成不等于学生通过 |
+| Engine MPC | 精确对象几何/速度和可选的教师专用区域动力学记忆 | 规划器/教师结果，不是神经 checkpoint 输出 |
+
+DAgger 目前有两种显式声明的档案契约。旧 teacher-labelled 档案在每个学生
+访问状态上都以 `teacher_action` 为监督目标。当前 direct-corrective 档案则
+保留学生实际执行动作和完整 recurrent context；教师介入时，实际执行标签
+就是教师纠正动作，`supervision_mask` 可以让动作损失只监督这些介入/纠正
+点。带 mask 的档案与旧无 mask 档案合并时，旧样本仍按全监督处理。只有
+满足严格原生完成条件的局才可进入档案，但这只证明数据有效，不能把教师
+介入后的击破记作学生成功。
+
+新一轮 Okuu #3 direct-corrective 收集在 seed 20260813 和 20260815 均于
+第 3,815 帧返回 `attack_complete`、death 0，但分别介入 489/1,272 次
+（38.44%）和 467/1,272 次（36.71%）。报告明确设置
+`pure_policy=false`、`pure_policy_success=false` 和
+`pure_policy_validation_eligible=false`。v13 all-label 聚合档案含 35 个
+episode、33,866 个 recurrent 决策；critical-intervention 聚合档案保留同样
+的 33,866 个决策，总计 30,376 个有监督标签，并为六局 Okuu #3 保留完整
+recurrent context，但在这些局中只监督 4,142 个教师介入点。
+
+最新 pure、关闭 visible safety 的 Okuu #3 候选严格结果如下：
+
+| 候选 | seed | 逻辑帧 | 观测 HP | 终态 / death | 结果 |
+| --- | ---: | ---: | --- | --- | --- |
+| v10 unweighted | 20260812 | 392 | `6000 -> 5524.5` | `player_hit` / 100 | 失败 |
+| v11 corrected unique | 20260812 | 764 | `6000 -> 4924.5` | `player_hit` / 100 | 失败 |
+| v11 纠正样本重复四次 | 20260812 | 431 | `6000 -> 5453` | `player_hit` / 100 | 失败 |
+| v12 Okuu specialist，最终 epoch 80 | 20260812 | 726 | `6000 -> 5086` | `player_hit` / 100 | 失败 |
+| v12 general，最终 epoch 30 | 20260812 | 414 | `6000 -> 5478` | `player_hit` / 100 | 失败 |
+| v13 all-label，validation-best epoch 3 | 20260816 | 413 | `6000 -> 5481` | `player_hit` / 100 | 失败 |
+
+v13 all-label 在 epoch 3 取得最低 validation loss 1.9728760589。该离线
+改善和前述两局教师辅助击破都没有通过 pure native 发布门槛，因此
+v10-v13 均不能发布或替换 v1。
+
+符卡严格成功必须同时满足：`terminated=true`、
+`termination_reason=attack_complete`，以及显式、有限、非布尔的数值
+`final_player.death=0`。完整关卡必须改为 `stage_complete` 并满足相同的
+零死亡证据。达到帧数/时间上限、仅削减部分 HP、活得更久、死亡后完成、
+ghost/protected 状态、缺失或非数值 death 都是失败。以下是最终 checkpoint
+已经执行的完整 pure GRU 矩阵，统一使用 history 1、观察延迟 5、expert，
+且关闭 visible safety：
+
+| 目标 | seed | 逻辑帧 | 观测 HP | 终态 / death | 严格结果 |
+| --- | ---: | ---: | --- | --- | --- |
+| Koishi #1 | 20260738 | 906 | `700 -> 0` | `attack_complete` / 0 | 通过 |
+| Koishi #1 | 20260739 | 906 | `700 -> 0` | `attack_complete` / 0 | 通过 |
+| Koishi #1 | 20260740 | 906 | `700 -> 0` | `attack_complete` / 0 | 通过 |
+| Yamame #3 | 20260738 | 491 | `1800 -> 1306.25` | `player_hit` / 100 | 失败 |
+| Satori #5 | 20260738 | 384 | `3200 -> 2883` | `player_hit` / 100 | 失败 |
+| Okuu #3 | 20260740 | 754 | `6000 -> 5046` | `player_hit` / 100 | 失败 |
+| Okuu #4 | 20260740 | 1065 | `3500 -> 2629.5` | `player_hit` / 100 | 失败 |
+| Okuu EX #2 | 20260740 | 446 | `3333 -> 2834` | `player_hit` / 100 | 失败 |
+| Orin #4 | 20260740 | 261 | `4500 -> 4407` | `player_hit` / 100 | 失败 |
+| Stage 1 Normal | 20260740 | 543 | 道中多波 HP 不可直接比较 | `player_hit` / 100 | 失败 |
+
+随后又在最终源码指纹
+`fa891752547e10f478fbec6b4f85349e4c43061fb3788bea9014ac1f9337ac56`
+上复测保留 checkpoint，并验证 checkpoint 路径/SHA-256；其余设置仍为
+history 1、观察延迟 5、expert、关闭 visible safety：
+
+| 当前源码目标 | seed | 逻辑帧 | 观测 HP | 终态 / death | 严格结果 |
+| --- | ---: | ---: | --- | --- | --- |
+| Koishi #1 | 20260738 | 906 | `700 -> 0` | `attack_complete` / 0 | 通过 |
+| Koishi #1 | 20260739 | 906 | `700 -> 0` | `attack_complete` / 0 | 通过 |
+| Koishi #1 | 20260740 | 906 | `700 -> 0` | `attack_complete` / 0 | 通过 |
+| Koishi #1，held-out | 314159265 | 906 | `700 -> 0` | `attack_complete` / 0 | 通过 |
+| Yamame #3，held-out | 314159265 | 493 | `1800 -> 1300.25` | `player_hit` / 100 | 失败 |
+| Okuu #4，held-out | 314159265 | 1065 | `3500 -> 2629.5` | `player_hit` / 100 | 失败 |
+| Stage 1 Normal，held-out | 314159265 | 543 | 道中多波 HP 不可直接比较 | `player_hit` / 100 | 失败 |
+
+因此当前发布版只证明 Koishi #1 的 strict pure 完成：三个已知 seed 和一个
+独立选择的 held-out seed 均通过，而当前源码上的跨目标探测全部失败，不
+外推为更广的成功率。原三局每千帧变向 105.96-107.06 次、精确反向
+10-11 次、ABA 均为 7、方向保持中位数 6 帧。严格 Koishi DAgger 教师参照
+为每千帧
+变向 97.46 次、ABA 0、保持中位数 9 帧，因此 checkpoint 仍显得更躁动。
+这说明成功轨迹没有退化为静止，但同一张近确定性符卡的三个已知 seed 加
+一个 held-out seed 仍不能声称达到真人水平。后来用于 DAgger 的 Yamame #1
+和 Satori #1 没有最终 checkpoint 的 pure 运行，不能声称模型通过。与真人
+尽可能相近的通用表现、跨符卡可靠性和完整关卡能力仍未达成。
+
+熟练度由模型外的确定性执行参数模拟，不是网络条件输入。expert 为新增
+反应延迟 0、最短保持 3 帧、次优动作 0%；intermediate 为 3/6/1%；novice
+为 6/9/4%。在仍关闭 visible safety 时，intermediate 的 Koishi #1 seed
+20260741 于 593 帧中弹（`700 -> 291.5`、death 100），novice 于 478 帧
+中弹（`700 -> 342.5`、death 100）。expert 的 3/3 使用另一组 seed，不能
+当作严格配对的熟练度统计。
+
+validation-best 和专用模型也没有绕过原生门槛。Yamame #3 specialist v1
+的 validation-best epoch 1 于 598 帧中弹，同模型 epoch 40 于 495 帧中弹；
+recurrent size 256 的 specialist v2 validation-best epoch 19 在 seed
+20260740/20260743 分别于 530/502 帧中弹，四局 death 均为 100。因此当前
+specialist 和 validation-best 候选均作为部署方案否决，而不是用较好的
+离线 loss 美化结果。另一个含 29 个 episode、26,234 个决策的 v5 候选从头
+训练 60 epoch，validation loss 降至 2.2334204706，但在 seed
+20260742/20260744 的 Koishi #1 都于 391 帧中弹（`700 -> 592.5`、death
+100）；再以 `5e-5` 续训 15 epoch 也只到 436 帧。该模型在 Okuu #3 加入
+可见安全层后，经 66 次介入仍于 902 帧死亡，反而短于纯模型的 1,146 帧，
+因此两者都没有替换当前 3/3 checkpoint。
+
+完整关卡仍失败。最终 pure GRU 在 Stage 1 Normal 全程保持静止并于 543
+帧中弹。另行运行的 MPC teacher 在 seed 20260731 首次达到 7,199 帧
+`time_limit`，death 0，仍按规则失败；seed 20260732 后续运行在 12,453
+帧返回 `stage_complete`、death 0。后者只是教师证据，不是模型成功；该
+超长 episode 因过度放大静止决策而从符卡训练池中移除。
 
 ## 实施阶段
 
@@ -276,7 +511,7 @@ git diff --check
 
 这份历史验收只证明文档定义的独立仿真门槛。规划器是精确状态教师；路线评估使用延迟可见 cue 和旧路线库，其动作不是神经 checkpoint 输出，也不是当前 Engine MPC 的记忆方案。Python 场景仍是近似，存活结果不等于原符卡击破，也不等于 AI 已在真实引擎中存活。
 
-原生 Engine MPC 的单局成功标准只有：报告同时满足 `terminated=true` 和 `termination_reason=attack_complete`。由引擎确认 Boss 被击破或符卡完整结束均可；达到 `max_frames`、仅延长存活时间或只削减部分 Boss HP 一律不计成功。所有动作必须保持 `spell=false`；仅当预测安全余量达到射击阈值时才输出 `shoot=true`，危险时停止射击。带动作前缀的运行必须单列为“前缀辅助复现”，不能混入无前缀成功率。
+原生 Engine MPC 的符卡单局成功标准只有：报告同时满足 `terminated=true`、`termination_reason=attack_complete`，以及显式、有限、非布尔的数值 `final_player.death=0`。由引擎确认 Boss 被击破或符卡完整结束均可；完整关卡则必须使用 `termination_reason=stage_complete` 并提供相同的零死亡证据。达到 `max_frames`、仅延长存活时间、只削减部分 Boss HP、死亡后完成，或缺少有效 death 证据，一律不计成功。所有动作必须保持 `spell=false`；仅当预测安全余量达到射击阈值时才输出 `shoot=true`，危险时停止射击。带动作前缀的运行必须单列为“前缀辅助复现”，不能混入无前缀成功率。
 
 ### 当前原生 Boss #3 严格结果
 
@@ -299,6 +534,18 @@ git diff --check
 
 两局均为 `unsafe_shot_frames=0`、强制 `spell=false`，实现指纹为 `8422915228d7b867ae01ffae0e2d0ae85d7ab8d1aac71e3a383c6b8a6e6d2044`。这是已执行尝试的 `2/2`，不外推未执行 seed，也不证明 Boss #4；报告仍以 `acceptance_claim=false` 正确标记为 live teacher 严格引擎证据，而不是部署模型验收。它们取代修复前的 v44/v45；后两份只保留为中间过程记录。
 
+当前 live bridge 和 MPC 还覆盖直线及曲线激光。渐宽/渐窄的直线段和曲线
+折线段使用保守的 16-32 px 圆覆盖，每个圆的半径包含准确的分段半步长；
+连续采样位置会反映旋转和长度变化，不会错误地只复用激光原点位移。实现
+`fab98499b72c55fb92ceb5586b58be5093df9e42b9755631e008633ceaf96f95`
+在原生 headless Okuu #2、零观察延迟下的一局严格结果于 episode 第 3036
+帧完成，Boss HP `4300 -> 0`、`death=0`、`unsafe_shot_frames=0`，观测峰值
+为 552 发子弹和 40 条激光。规划器威胁数中位数为 302、最大值为 697。
+报告 SHA-256 为
+`70d5afc69faa6fbae55cef0bdd678f6fe090d977608ec4d16ec281377f85dfd2`。
+这只是一局零延迟 MPC 教师的几何集成结果，不是五帧延迟或学习模型证据，
+也不是成功率声明。
+
 另有一轮完整引擎的原生 macOS OpenGL 验证在启用优化 F7 覆盖层时满足同一严格成功定义。`engine-mpc-boss3-gpu-overlay-strict-seed20260730.json` 的 SHA-256 为 `ec3f758a8a5135b33e139076bdecdb050bf1117f1e13622679a91c40e8110def`；报告在第 3816 帧写入 `terminated=true`、`termination_reason=attack_complete` 和 `passed=true`，Boss HP `6000 -> 0`、`death=0`、`unsafe_shot_frames=0`，并强制 `spell=false`。该报告的 `acceptance_claim=false`，所以它是单局 live MPC teacher 的严格原生击破证据，不是部署模型验收，也不证明 Boss #4。该运行早于当前覆盖层实现，只能作为历史版本的完整引擎集成证据，不能作为当前覆盖层 SHA-256 的实机执行证明。
 
 桥接器已经由真实引擎启动并监听 `24816` 后，可用下列命令复跑；命令在未达到唯一成功条件时以非零状态退出：
@@ -309,7 +556,7 @@ uv run stg-lab engine-mpc-play \
   --host 127.0.0.1 --port 24816 \
   --scenario 'okuu:Lunatic' --attack 3 --seed 20260730 \
   --max-frames 4200 --horizon-frames 60 --observation-delay 5 \
-  --region-dynamics-memory artifacts/region-dynamics-boss3-v2.json \
+  --region-dynamics-memory models/region_dynamics_boss3_v2.json \
   --output artifacts/engine-mpc-boss3-rerun.json
 
 for report in \

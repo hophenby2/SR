@@ -24,7 +24,13 @@ except ImportError:  # pragma: no cover - base installation intentionally omits 
 from .memory import EpisodeMemory, EpisodicMemory
 from .metrics import EpisodeMetrics, state_hash
 from .planning import PlanResult, SpatioTemporalPlanner
-from .policy import safety_shield
+from .policy import (
+    PlayerProficiencyProfile,
+    ProficiencyRuntime,
+    proficiency_vector,
+    resolve_proficiency,
+    safety_shield,
+)
 from .protocol import Action
 from .sim import ActionLike, Observation, Outcome, STGEnvironment, coerce_action
 from .training import Demonstrations
@@ -128,17 +134,71 @@ def load_demonstrations(path: str | Path) -> Demonstrations:
     return Demonstrations.load(path)
 
 
-def scenario_memory_vector(scenario_key: str, memory_size: int = 4) -> np.ndarray:
-    """Encode known attack identity while reserving two route-memory slots."""
+def scenario_memory_vector(
+    scenario_key: str,
+    memory_size: int = 4,
+    vocabulary: Sequence[str] | None = None,
+) -> np.ndarray:
+    """Encode an identity token, with legacy Boss #3/#4 compatibility."""
 
-    if memory_size < 2:
-        raise ValueError("scenario memory requires at least two values")
+    if memory_size < 0:
+        raise ValueError("scenario memory size cannot be negative")
     vector = np.zeros(memory_size, dtype=np.float32)
+    if vocabulary is not None:
+        from .native_dataset import UNKNOWN_SCENARIO_CONTEXT
+
+        values = tuple(str(value) for value in vocabulary)
+        if len(values) > memory_size:
+            raise ValueError(
+                "scenario vocabulary width exceeds policy memory_size"
+            )
+        if len(set(values)) != len(values):
+            raise ValueError("scenario vocabulary entries must be unique")
+        try:
+            index = values.index(str(scenario_key))
+        except ValueError:
+            try:
+                index = values.index(UNKNOWN_SCENARIO_CONTEXT)
+            except ValueError:
+                return vector
+        vector[index] = 1.0
+        return vector
+    # New stream policies deliberately use memory_size=0: their GRU must infer
+    # attack phase from visible motion rather than a handwritten boss identity.
+    if memory_size < 2:
+        return vector
     normalized = scenario_key.lower()
     if "boss3" in normalized:
         vector[0] = 1.0
     elif "boss4" in normalized:
         vector[1] = 1.0
+    return vector
+
+
+def policy_context_vector(
+    model: Any,
+    scenario_key: str,
+    previous_action: Action | None = None,
+) -> np.ndarray:
+    """Build the model's identity and observed prior-motor context."""
+
+    config = getattr(model, "config", None)
+    memory_size = int(getattr(config, "memory_size", 4))
+    vector = scenario_memory_vector(
+        scenario_key,
+        memory_size,
+        getattr(model, "scenario_vocabulary", None),
+    )
+    previous_action_size = int(getattr(model, "previous_action_size", 0))
+    if previous_action_size:
+        if previous_action_size != 18:
+            raise ValueError("previous action context must contain 18 entries")
+        offset = int(getattr(model, "previous_action_offset", 0))
+        if offset + previous_action_size > memory_size:
+            raise ValueError("previous action context does not fit policy memory")
+        vector[offset:offset + previous_action_size] = 0.0
+        if previous_action is not None:
+            vector[offset + previous_action.discrete] = 1.0
     return vector
 
 
@@ -227,6 +287,7 @@ def collect_demonstrations(
     config: RolloutConfig = RolloutConfig(),
     shield: bool = True,
     include_scenario_memory: bool = True,
+    proficiency: str | PlayerProficiencyProfile = "expert",
     output: str | Path | None = None,
 ) -> tuple[Demonstrations, tuple[EpisodeMetrics, ...]]:
     """Collect delayed-vision samples labelled by the exact-state planner."""
@@ -239,6 +300,7 @@ def collect_demonstrations(
     episode_ids: list[int] = []
     metrics: list[EpisodeMetrics] = []
     current_episode_id = 0
+    profile = resolve_proficiency(proficiency)
 
     def record(visible: VisionObservation, action: Action, risk: float) -> None:
         steps = visible.global_frames.shape[0]
@@ -296,6 +358,14 @@ def collect_demonstrations(
         actions=np.stack(actions),
         risks=np.stack(risks),
         memory=memory,
+        proficiency=np.broadcast_to(
+            proficiency_vector(profile),
+            (
+                len(global_frames),
+                global_frames[0].shape[0],
+                len(proficiency_vector(profile)),
+            ),
+        ).copy(),
         episode_ids=np.asarray(episode_ids, dtype=np.int64),
     )
     demonstrations.validate()
@@ -549,6 +619,7 @@ def _policy_logits(
     *,
     device: str,
     memory: Sequence[float] | np.ndarray | None,
+    proficiency: Sequence[float] | np.ndarray | None = None,
     hidden: Any | None = None,
     latest_only: bool = False,
 ) -> tuple[np.ndarray, Any | None]:
@@ -567,14 +638,35 @@ def _policy_logits(
         if len(memory_array) != expected:
             raise ValueError(f"policy memory vector has size {len(memory_array)}; expected {expected}")
         memory_tensor = torch.from_numpy(memory_array[None]).to(device)
+    proficiency_tensor = None
+    expected_proficiency = int(
+        getattr(getattr(model, "config", None), "proficiency_size", 0)
+    )
+    if expected_proficiency > 0:
+        proficiency_array = np.asarray(
+            proficiency_vector("expert") if proficiency is None else proficiency,
+            dtype=np.float32,
+        )
+        if proficiency_array.ndim != 1 or len(proficiency_array) != expected_proficiency:
+            raise ValueError(
+                "policy proficiency vector has size "
+                f"{len(proficiency_array)}; expected {expected_proficiency}"
+            )
+        proficiency_tensor = torch.from_numpy(proficiency_array[None]).to(device)
     with torch.no_grad():
-        supports_hidden = "hidden" in inspect.signature(model.forward).parameters
+        parameters = inspect.signature(model.forward).parameters
+        supports_hidden = "hidden" in parameters
+        kwargs = {"hidden": hidden} if supports_hidden else {}
+        if proficiency_tensor is not None and "proficiency" in parameters:
+            kwargs["proficiency"] = proficiency_tensor
         if supports_hidden:
             logits, _risk, next_hidden = model(
-                global_frames, local_frames, memory_tensor, hidden=hidden,
+                global_frames, local_frames, memory_tensor, **kwargs,
             )
         else:
-            logits, _risk, next_hidden = model(global_frames, local_frames, memory_tensor)
+            logits, _risk, next_hidden = model(
+                global_frames, local_frames, memory_tensor, **kwargs,
+            )
             next_hidden = None
     return logits[0, -1].detach().cpu().numpy(), next_hidden
 
@@ -597,13 +689,19 @@ def _policy_behavior_action(
     inference_mode: str,
     config: RolloutConfig,
     shield: bool,
+    runtime: ProficiencyRuntime | None = None,
+    commit_runtime: bool = True,
 ) -> tuple[Action, Any | None]:
+    profile = resolve_proficiency(
+        runtime.profile if runtime is not None else "expert"
+    )
     if inference_mode == "window":
         logits, next_hidden = _policy_logits(
             model,
             visible,
             device=device,
             memory=memory,
+            proficiency=proficiency_vector(profile),
             hidden=None,
             latest_only=False,
         )
@@ -614,24 +712,43 @@ def _policy_behavior_action(
             visible,
             device=device,
             memory=memory,
+            proficiency=proficiency_vector(profile),
             hidden=hidden,
             latest_only=True,
         )
-    preferred = Action.from_discrete(int(np.argmax(logits)))
+    preferred = (
+        runtime.preferred_action(logits, decision_interval=config.decision_interval)
+        if runtime is not None else
+        Action.from_discrete(int(np.argmax(logits)))
+    )
+
+    def finish(action: Action) -> tuple[Action, Any | None]:
+        if runtime is not None and commit_runtime:
+            runtime.commit(action, decision_interval=config.decision_interval)
+        return action, next_hidden
+
     if not shield:
-        return preferred, next_hidden
+        return finish(preferred)
     if environment is None:
         raise ValueError("authority-state shields require an environment")
+    if runtime is not None and not runtime.should_apply_shield():
+        return finish(preferred)
+    shield_horizon = min(
+        config.shield_horizon,
+        profile.prediction_horizon_frames,
+    )
+    if shield_horizon <= 0:
+        return finish(preferred)
     if config.shield_strategy == "toward":
-        return shield_action_toward(
+        return finish(shield_action_toward(
             environment,
             preferred,
-            horizon=config.shield_horizon,
-        ), next_hidden
-    if _action_endpoint_if_safe(environment, preferred, config.shield_horizon) is not None:
-        return preferred, next_hidden
-    allowed = imminent_safe_actions(environment, config.shield_horizon)
-    return Action.from_discrete(safety_shield(logits, allowed)), next_hidden
+            horizon=shield_horizon,
+        ))
+    if _action_endpoint_if_safe(environment, preferred, shield_horizon) is not None:
+        return finish(preferred)
+    allowed = imminent_safe_actions(environment, shield_horizon)
+    return finish(Action.from_discrete(safety_shield(logits, allowed)))
 
 
 def teacher_action_agreement(
@@ -664,7 +781,30 @@ def teacher_action_agreement(
                 memory = torch.zeros(shape, dtype=global_frames.dtype, device=resolved)
             else:
                 memory = torch.from_numpy(demonstrations.memory[start:end]).float().to(resolved)
-            logits, _risk, _hidden = model(global_frames, local_frames, memory)
+            proficiency_size = int(
+                getattr(getattr(model, "config", None), "proficiency_size", 0)
+            )
+            if proficiency_size == 0:
+                proficiency = None
+            elif demonstrations.proficiency is None:
+                values = np.broadcast_to(
+                    proficiency_vector("expert"),
+                    (*demonstrations.actions[start:end].shape, proficiency_size),
+                ).copy()
+                proficiency = torch.from_numpy(values).float().to(resolved)
+            else:
+                proficiency = torch.from_numpy(
+                    demonstrations.proficiency[start:end]
+                ).float().to(resolved)
+            parameters = inspect.signature(model.forward).parameters
+            kwargs = (
+                {"proficiency": proficiency}
+                if proficiency is not None and "proficiency" in parameters else
+                {}
+            )
+            logits, _risk, _hidden = model(
+                global_frames, local_frames, memory, **kwargs,
+            )
             labels = torch.from_numpy(demonstrations.actions[start:end]).long().to(resolved)
             if demonstrations.supervision_mask is None:
                 mask = torch.zeros_like(labels, dtype=torch.bool)
@@ -689,6 +829,7 @@ def evaluate_policy(
     shield: bool = False,
     device: str = "auto",
     memory_provider: MemoryProvider | None = None,
+    proficiency: str | PlayerProficiencyProfile = "expert",
 ) -> tuple[EpisodeMetrics, ...]:
     """Run a delayed visual policy, with an optional imminent-collision shield."""
 
@@ -697,7 +838,10 @@ def evaluate_policy(
     model.eval()
     inference_mode = _policy_inference_mode(model)
     hidden: Any | None = None
+    runtime: ProficiencyRuntime | None = None
+    previous_action: Action | None = None
     episode_started = False
+    profile = resolve_proficiency(proficiency)
 
     def controller(
         environment: STGEnvironment,
@@ -705,10 +849,11 @@ def evaluate_policy(
         _plan: PlanResult | None,
         _memory: EpisodeMemory | None,
     ) -> Action:
-        nonlocal hidden, episode_started
+        nonlocal hidden, episode_started, runtime, previous_action
         first_decision = not episode_started
         if first_decision:
             hidden = None
+            previous_action = None
             episode_started = True
         scenario_key = str(getattr(environment.scenario, "scenario_key", environment.scenario.name))
         if first_decision and memory_provider is not None:
@@ -718,10 +863,7 @@ def evaluate_policy(
         vector = (
             memory_provider(scenario_key, visible)
             if memory_provider is not None
-            else scenario_memory_vector(
-                scenario_key,
-                int(getattr(getattr(model, "config", None), "memory_size", 4)),
-            )
+            else policy_context_vector(model, scenario_key, previous_action)
         )
         action, hidden = _policy_behavior_action(
             model,
@@ -733,12 +875,16 @@ def evaluate_policy(
             inference_mode=inference_mode,
             config=config,
             shield=shield,
+            runtime=runtime,
         )
+        previous_action = action
         return action
 
     results = []
     for seed in seeds:
         hidden = None
+        previous_action = None
+        runtime = ProficiencyRuntime(profile, seed=int(seed))
         episode_started = False
         results.append(_run_episode(
             environment_factory,
@@ -762,6 +908,7 @@ def collect_dagger_demonstrations(
     device: str = "auto",
     shield: bool = True,
     teacher_shield: bool = True,
+    proficiency: str | PlayerProficiencyProfile = "expert",
     output: str | Path | None = None,
 ) -> tuple[Demonstrations, tuple[EpisodeMetrics, ...]]:
     """Label policy-visited states with exact-state planner actions."""
@@ -776,12 +923,15 @@ def collect_dagger_demonstrations(
     actions: list[np.ndarray] = []
     risks: list[np.ndarray] = []
     memories: list[np.ndarray] = []
+    proficiencies: list[np.ndarray] = []
     episode_ids: list[int] = []
     metrics: list[EpisodeMetrics] = []
     current_episode_id = 0
     pending_teacher: Action | None = None
     pending_memory: np.ndarray | None = None
     hidden: Any | None = None
+    runtime: ProficiencyRuntime | None = None
+    previous_action: Action | None = None
     decisions = 0
     overrides = 0
 
@@ -791,11 +941,13 @@ def collect_dagger_demonstrations(
         plan: PlanResult | None,
         _memory: EpisodeMemory | None,
     ) -> Action:
-        nonlocal pending_teacher, pending_memory, hidden, decisions, overrides
+        nonlocal pending_teacher, pending_memory, hidden, decisions, overrides, runtime
+        nonlocal previous_action
         if plan is None:
             raise RuntimeError("DAgger teacher plan is unavailable")
         if environment.frame == 0:
             hidden = None
+            previous_action = None
         pending_teacher = planner_teacher_action(
             environment,
             plan,
@@ -803,9 +955,10 @@ def collect_dagger_demonstrations(
             shield=teacher_shield,
         )
         scenario_key = str(getattr(environment.scenario, "scenario_key", environment.scenario.name))
-        pending_memory = scenario_memory_vector(
+        pending_memory = policy_context_vector(
+            model,
             scenario_key,
-            int(getattr(getattr(model, "config", None), "memory_size", 4)),
+            previous_action,
         )
         selected, hidden = _policy_behavior_action(
             model,
@@ -817,9 +970,11 @@ def collect_dagger_demonstrations(
             inference_mode=inference_mode,
             config=config,
             shield=shield,
+            runtime=runtime,
         )
         decisions += 1
         overrides += int(selected != pending_teacher)
+        previous_action = selected
         return selected
 
     def record(visible: VisionObservation, _behavior: Action, risk: float) -> None:
@@ -833,6 +988,8 @@ def collect_dagger_demonstrations(
             (steps,), _normalized_risk(risk, config.risk_scale), dtype=np.float32,
         ))
         memories.append(np.broadcast_to(pending_memory, (steps, len(pending_memory))).copy())
+        vector = proficiency_vector(proficiency)
+        proficiencies.append(np.broadcast_to(vector, (steps, len(vector))).copy())
         episode_ids.append(current_episode_id)
 
     for episode_index, seed in enumerate(seeds):
@@ -840,6 +997,7 @@ def collect_dagger_demonstrations(
         pending_teacher = None
         pending_memory = None
         hidden = None
+        runtime = ProficiencyRuntime(proficiency, seed=int(seed))
         decisions = 0
         overrides = 0
         trace = _run_episode(
@@ -865,6 +1023,7 @@ def collect_dagger_demonstrations(
         actions=np.stack(actions),
         risks=np.stack(risks),
         memory=np.stack(memories).astype(np.float32, copy=False),
+        proficiency=np.stack(proficiencies).astype(np.float32, copy=False),
         episode_ids=np.asarray(episode_ids, dtype=np.int64),
     )
     demonstrations.validate()
