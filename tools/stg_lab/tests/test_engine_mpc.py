@@ -1862,6 +1862,142 @@ def test_parallel_bullet_wavefront_forms_a_persistent_rotatable_gap(
     assert stable.path_margin >= 8.0
 
 
+@pytest.mark.parametrize(
+    ("bullet_count", "expected_profiles"),
+    (
+        (3, {"bullet-group-expert"}),
+        (4, {"bullet-group-intermediate", "bullet-group-expert"}),
+        (
+            5,
+            {
+                "bullet-group-novice",
+                "bullet-group-intermediate",
+                "bullet-group-expert",
+            },
+        ),
+    ),
+)
+def test_bullet_group_profiles_recognize_increasingly_subtle_wavefronts(
+    bullet_count: int,
+    expected_profiles: set[str],
+) -> None:
+    from stg_lab.engine_matrix import apply_controller_profile
+
+    points = tuple(
+        (-80.0 + 40.0 * index, 60.0)
+        for index in range(bullet_count)
+    )
+    recognized = set()
+    for profile in (
+        "bullet-group-novice",
+        "bullet-group-intermediate",
+        "bullet-group-expert",
+    ):
+        config = apply_controller_profile(profile, _gap_test_config())
+        *_, groups, _corridors = _gap_geometry(
+            _gap_wavefront(points),
+            config=config,
+        )
+        if groups:
+            recognized.add(profile)
+
+    assert recognized == expected_profiles
+
+
+@pytest.mark.parametrize(
+    ("direction_offsets", "expected_profiles"),
+    (
+        (
+            (-10.0, -5.0, 0.0, 5.0, 10.0),
+            {"bullet-group-expert"},
+        ),
+        (
+            (-6.0, -3.0, 0.0, 3.0, 6.0),
+            {"bullet-group-intermediate", "bullet-group-expert"},
+        ),
+        (
+            (0.0, 0.0, 0.0, 0.0, 0.0),
+            {
+                "bullet-group-novice",
+                "bullet-group-intermediate",
+                "bullet-group-expert",
+            },
+        ),
+    ),
+)
+def test_bullet_group_profiles_handle_direction_noise_by_skill(
+    direction_offsets: tuple[float, ...],
+    expected_profiles: set[str],
+) -> None:
+    from stg_lab.engine_matrix import apply_controller_profile
+
+    bullets = []
+    for index, degrees in enumerate(direction_offsets):
+        angle = math.radians(degrees)
+        bullets.append(bullet(
+            index,
+            -80.0 + 40.0 * index,
+            60.0,
+            dx=2.0 * math.sin(angle),
+            dy=-2.0 * math.cos(angle),
+        ))
+    recognized = set()
+    for profile in (
+        "bullet-group-novice",
+        "bullet-group-intermediate",
+        "bullet-group-expert",
+    ):
+        config = apply_controller_profile(profile, _gap_test_config())
+        *_, groups, _corridors = _gap_geometry(bullets, config=config)
+        if groups:
+            recognized.add(profile)
+
+    assert recognized == expected_profiles
+
+
+@pytest.mark.parametrize(
+    ("spacing", "expected_profiles"),
+    (
+        (32.0, {"bullet-group-expert"}),
+        (40.0, {"bullet-group-intermediate", "bullet-group-expert"}),
+        (
+            50.0,
+            {
+                "bullet-group-novice",
+                "bullet-group-intermediate",
+                "bullet-group-expert",
+            },
+        ),
+    ),
+)
+def test_bullet_group_profiles_require_level_appropriate_gap_width(
+    spacing: float,
+    expected_profiles: set[str],
+) -> None:
+    from stg_lab.engine_matrix import apply_controller_profile
+
+    wavefront = _gap_wavefront(tuple(
+        ((index - 2) * spacing, 60.0)
+        for index in range(5)
+    ))
+    for value in wavefront:
+        value["a"] = 1.0
+        value["b"] = 1.0
+    accepted = set()
+    for profile in (
+        "bullet-group-novice",
+        "bullet-group-intermediate",
+        "bullet-group-expert",
+    ):
+        config = apply_controller_profile(profile, _gap_test_config())
+        *_, groups, corridors = _gap_geometry(wavefront, config=config)
+        assert len(groups) == 1
+        if corridors:
+            accepted.add(profile)
+
+    assert accepted == expected_profiles
+
+
 def test_detected_parallel_gap_steers_toward_reachable_corridor() -> None:
     wavefront = _gap_wavefront((
         (-72.5, 40.0),

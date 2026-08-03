@@ -294,20 +294,19 @@ the tested native action sequence or produce a strict completion. No v14-v25
 checkpoint replaces the published v1 model.
 
 The current parallel-wave gap logic is still an Engine MPC planner/teacher
-feature. The final same-source continuous-fire gap-enabled and gap-disabled
-reports bind implementation SHA-256
-`002d770a1e4d10ad98a2ce00f21796dd7deeddc931b08ab638a3e07e0bbefb86`
-and both strictly complete Okuu #3 seed 20260730. They send shoot commands on
-3,363/3,363 and 3,360/3,360 logical frames even though their selected movement
-plans predict collisions on 522 and 528 frames respectively.
-The enabled report records 172 detections and 44 selections; across 1,120 common
-decisions, 749 movement choices differ from the disabled run. Their report
+feature. Current-source novice/intermediate/expert bullet-group profiles bind
+implementation SHA-256
+`394d8298f5b42c6a42d586a75ab908bac0fdb7281d6cd5fd54478a83e048d99b`
+and all strictly complete Okuu #3 seed 20260730 with continuous fire and zero
+deaths. Novice accepts no corridor; intermediate records 42 observe decisions
+but does not enter; expert records 172 detections and 44 certified entries,
+changing 749 movement directions from either lower profile. Their report
 SHA-256 values are respectively
-`7dc328637957f0682974d97e0227475bea10f4eb79994334bea9599b76b18ea1`
-and `93f27f603bb852021ccab8f62e87285072140a1788cab510a02d69ed51c15e3a`.
-This single passing seed demonstrates gap activation and non-regression, not a
-success-rate improvement. Both are `acceptance_claim=false` MPC-teacher reports,
-not learned-policy evidence.
+`8fb9d002e7b0c8a6e993edd602995cf1d5e5fbcfdd4a457fb73a8bfc37c77850`,
+`dd73c9fdb36e1e0a34c4dbf4c39ffd1e30749f667953d46eeae6594d6a217c57`,
+and `3370da8b2debfdb5b77e05fb7f023d3c3181e0e3894a88e0e5dde6ef8eaf0047`.
+This single seed demonstrates graded teacher processing and non-regression, not
+human success-rate calibration or learned-policy evidence.
 These reports are not training archives: no gap-aware DAgger or demonstration
 archive has yet been generated, and the GRU has not been retrained from one.
 Therefore the v14-v25 results neither train nor validate learned gap-entry

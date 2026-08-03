@@ -1074,6 +1074,54 @@ def test_engine_mpc_play_selects_general_controller_profile(
     assert json.loads(capsys.readouterr().out)["passed"] is True
 
 
+def test_engine_mpc_play_selects_bullet_group_skill_profile(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab import engine, engine_mpc_play
+
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        engine.EngineClient,
+        "connect",
+        lambda *_args, **_kwargs: FakeClient(),
+    )
+
+    def fake_play(client, **kwargs):
+        calls.update(client=client, **kwargs)
+        return {
+            "passed": True,
+            "success": True,
+            "termination_reason": "attack_complete",
+        }
+
+    monkeypatch.setattr(engine_mpc_play, "run_engine_mpc_play", fake_play)
+    output = tmp_path / "bullet-group-novice.json"
+
+    assert cli.main([
+        "engine-mpc-play",
+        "--profile", "bullet-group-novice",
+        "--horizon-frames", "60",
+        "--output", str(output),
+    ]) == 0
+
+    config = calls["controller"].config
+    assert config.gap_minimum_group_size == 5
+    assert config.gap_direction_tolerance_degrees == 5.0
+    assert config.gap_safety_margin == 18.0
+    assert config.gap_entry_candidate_limit == 2
+    assert config.gap_detour_beam_width == 12
+    assert json.loads(output.read_text())["profile"] == "bullet-group-novice"
+    assert json.loads(capsys.readouterr().out)["passed"] is True
+
+
 def test_engine_mpc_play_can_target_a_complete_stage(monkeypatch, tmp_path, capsys) -> None:
     from stg_lab import engine, engine_mpc_play
 

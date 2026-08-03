@@ -512,6 +512,50 @@ top-level `gap_prediction` summary reports whether it was enabled, detection and
 selection counts, counts for each navigation mode, and maximum group/corridor
 counts.
 
+Three controlled MPC profiles simulate player skill at processing bullet
+groups. They all inherit the `current` movement scoring and continuous-fire
+contract; only wavefront perception, acceptable opening geometry, forecast
+sampling, and entry-search capacity differ.
+
+| Profile | Group perception | Opening requirement | Entry capacity |
+| --- | --- | --- | --- |
+| `bullet-group-novice` | at least 5 bullets; 5-degree direction tolerance; 6%/0.15 speed tolerance | 18-unit side reserve, 10 usable units, 24-frame lifetime, 65% screen coverage | 12-frame samples, 2 certified candidates, 12-wide detour beam |
+| `bullet-group-intermediate` | at least 4 bullets; 8-degree direction tolerance; 12%/0.25 speed tolerance | 14-unit side reserve, 6 usable units, 18-frame lifetime, 55% screen coverage | 9-frame samples, 4 certified candidates, 24-wide detour beam |
+| `bullet-group-expert` | at least 3 bullets; 12-degree direction tolerance; 20%/0.35 speed tolerance | current 10-unit side reserve, 4 usable units, 12-frame lifetime, 45% screen coverage | 6-frame samples, 8 certified candidates, 48-wide detour beam |
+
+The profiles are deterministic capability limits, not random mistakes. In the
+synthetic regressions, 3/4/5-bullet wavefronts are recognized by expert only,
+intermediate plus expert, and all three levels respectively. A 20-degree
+direction spread leaves a valid group only for expert, a 12-degree spread is
+handled by intermediate and expert, and a parallel group is handled by all.
+For the canonical five-bullet width probe, 32/40/50-unit spacing admits expert,
+intermediate plus expert, and all three levels respectively. Select any profile
+with `engine-mpc-play --profile PROFILE`, or compare all three with repeated
+`--profile` options in `engine-mpc-matrix`. These profiles describe the MPC
+teacher; they do not claim that the released neural checkpoint learned the same
+graded group-processing behavior.
+
+A current-source native comparison then ran all three profiles on Okuu #3 seed
+`20260730`, with the same runner configuration, region-dynamics memory, runtime
+identity, and verified runtime source map. The reports bind implementation
+SHA-256
+`394d8298f5b42c6a42d586a75ab908bac0fdb7281d6cd5fd54478a83e048d99b`;
+their controller configurations differ only in the 15 documented bullet-group
+fields.
+
+| Profile | Strict outcome | Group handling | Movement | Report SHA-256 |
+| --- | --- | --- | --- | --- |
+| novice | `attack_complete`; 3,360 frames; HP `6000 -> 0`; death 0; shoot `3360/3360` | at most 6 groups, no acceptable corridor; all gap modes 0 | path 9500.6747; changes 308; reversals 26; sharp turns 122; ABA 6; median hold 9 | `8fb9d002e7b0c8a6e993edd602995cf1d5e5fbcfdd4a457fb73a8bfc37c77850` |
+| intermediate | `attack_complete`; 3,360 frames; HP `6000 -> 0`; death 0; shoot `3360/3360` | 42 detected/observed decisions, 0 selected; maxima 30 groups / 3 corridors | identical to novice in this episode | `dd73c9fdb36e1e0a34c4dbf4c39ffd1e30749f667953d46eeae6594d6a217c57` |
+| expert | `attack_complete`; 3,363 frames; HP `6000 -> 0`; death 0; shoot `3363/3363` | 172 detected, 44 selected; observe/enter/hold/exit `119/44/0/9`; maxima `54/13` | path 9621.0025; changes 316; reversals 26; sharp turns 112; ABA 7; median hold 9 | `3370da8b2debfdb5b77e05fb7f023d3c3181e0e3894a88e0e5dde6ef8eaf0047` |
+
+Intermediate perception therefore activated without forcing needless movement:
+ordinary MPC was already safe whenever its three corridors appeared. Expert
+entry planning changed 802 emitted actions and 749 directions across the 1,120
+decisions shared with either lower profile. All three happened to clear this
+one seed, so the result validates graded processing and non-regression, not
+three calibrated human success rates.
+
 A deterministic four-bullet wavefront regression also verifies that this is an
 action input rather than telemetry only. With the player just outside a natural
 10-unit corridor, the enabled controller chooses left toward the selected
@@ -527,7 +571,7 @@ entry certification is explicitly capped after geometry instead of running for
 all 276 corridors. These are focused algorithm-performance checks, not native
 closed-loop success or real-time throughput claims.
 
-A final same-source, continuous-fire native A/B exercised the predictor on Okuu
+A preceding same-source, continuous-fire native A/B exercised the predictor on Okuu
 #3 seed `20260730`. Both runs bind implementation SHA-256
 `002d770a1e4d10ad98a2ce00f21796dd7deeddc931b08ab638a3e07e0bbefb86`;
 their top-level run configuration, runtime source map, and seed are identical,

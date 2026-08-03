@@ -79,8 +79,16 @@ def test_controller_profiles_bind_explicit_clearance_targets() -> None:
     current = controller_config_for_profile("current", config)
     general = controller_config_for_profile("general", config)
     legacy = controller_config_for_profile("legacy-clearance-12-1", config)
+    novice = controller_config_for_profile("bullet-group-novice", config)
+    intermediate = controller_config_for_profile("bullet-group-intermediate", config)
+    expert = controller_config_for_profile("bullet-group-expert", config)
     assert available_engine_profiles() == (
-        "current", "general", "legacy-clearance-12-1",
+        "current",
+        "general",
+        "legacy-clearance-12-1",
+        "bullet-group-novice",
+        "bullet-group-intermediate",
+        "bullet-group-expert",
     )
     assert (current.safe_margin_target, current.region_safe_margin_target) == (20.0, 8.0)
     assert (
@@ -95,6 +103,37 @@ def test_controller_profiles_bind_explicit_clearance_targets() -> None:
         general.switch_margin_gain,
     ) == (9, 36.0, 6.0)
     assert (legacy.safe_margin_target, legacy.region_safe_margin_target) == (12.0, 1.0)
+    assert expert == current
+    assert (
+        novice.gap_minimum_group_size,
+        intermediate.gap_minimum_group_size,
+        expert.gap_minimum_group_size,
+    ) == (5, 4, 3)
+    assert (
+        novice.gap_direction_tolerance_degrees,
+        intermediate.gap_direction_tolerance_degrees,
+        expert.gap_direction_tolerance_degrees,
+    ) == (5.0, 8.0, 12.0)
+    assert (
+        novice.gap_safety_margin,
+        intermediate.gap_safety_margin,
+        expert.gap_safety_margin,
+    ) == (18.0, 14.0, 10.0)
+    assert (
+        novice.gap_minimum_lifetime_frames,
+        intermediate.gap_minimum_lifetime_frames,
+        expert.gap_minimum_lifetime_frames,
+    ) == (24, 18, 12)
+    assert (
+        novice.gap_entry_candidate_limit,
+        intermediate.gap_entry_candidate_limit,
+        expert.gap_entry_candidate_limit,
+    ) == (2, 4, 8)
+    assert (
+        novice.gap_detour_beam_width,
+        intermediate.gap_detour_beam_width,
+        expert.gap_detour_beam_width,
+    ) == (12, 24, 48)
 
 
 def test_strict_success_requires_explicit_zero_death_evidence() -> None:

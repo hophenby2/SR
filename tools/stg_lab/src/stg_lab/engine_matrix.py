@@ -30,16 +30,18 @@ from .provenance import file_sha256, source_tree_sha256
 from .vision import VisionConfig
 
 
+_CURRENT_PROFILE: dict[str, float | int] = {
+    "danger_margin_target": 16.0,
+    "safe_margin_target": 20.0,
+    "region_safe_margin_target": 8.0,
+    "minimum_direction_hold_frames": 12,
+    "clearance_reward_cap": 48.0,
+    "switch_margin_gain": 8.0,
+}
+
 _PROFILE_OVERRIDES: dict[str, Mapping[str, float | int]] = {
     # Conservative hysteresis used by the current Boss #3 controller.
-    "current": {
-        "danger_margin_target": 16.0,
-        "safe_margin_target": 20.0,
-        "region_safe_margin_target": 8.0,
-        "minimum_direction_hold_frames": 12,
-        "clearance_reward_cap": 48.0,
-        "switch_margin_gain": 8.0,
-    },
+    "current": _CURRENT_PROFILE,
     # General-purpose hysteresis recovered from the strict Orin #4 success.
     "general": {
         "danger_margin_target": 16.0,
@@ -56,6 +58,63 @@ _PROFILE_OVERRIDES: dict[str, Mapping[str, float | int]] = {
         "minimum_direction_hold_frames": 12,
         "clearance_reward_cap": 48.0,
         "switch_margin_gain": 8.0,
+    },
+    # Controlled bullet-group proficiency profiles. Movement scoring remains
+    # identical to "current"; only group perception and gap-route capability
+    # change, so matrix differences have an interpretable source.
+    "bullet-group-novice": {
+        **_CURRENT_PROFILE,
+        "gap_direction_tolerance_degrees": 5.0,
+        "gap_speed_relative_tolerance": 0.06,
+        "gap_speed_absolute_tolerance": 0.15,
+        "gap_minimum_group_size": 5,
+        "gap_wavefront_depth": 14.0,
+        "gap_maximum_lateral_spacing": 80.0,
+        "gap_safety_margin": 18.0,
+        "gap_minimum_usable_width": 10.0,
+        "gap_sample_interval": 12,
+        "gap_minimum_lifetime_frames": 24,
+        "gap_entry_guard_frames": 12,
+        "gap_path_minimum_margin": 8.0,
+        "gap_group_coverage_fraction": 0.65,
+        "gap_entry_candidate_limit": 2,
+        "gap_detour_beam_width": 12,
+    },
+    "bullet-group-intermediate": {
+        **_CURRENT_PROFILE,
+        "gap_direction_tolerance_degrees": 8.0,
+        "gap_speed_relative_tolerance": 0.12,
+        "gap_speed_absolute_tolerance": 0.25,
+        "gap_minimum_group_size": 4,
+        "gap_wavefront_depth": 20.0,
+        "gap_maximum_lateral_spacing": 96.0,
+        "gap_safety_margin": 14.0,
+        "gap_minimum_usable_width": 6.0,
+        "gap_sample_interval": 9,
+        "gap_minimum_lifetime_frames": 18,
+        "gap_entry_guard_frames": 9,
+        "gap_path_minimum_margin": 6.0,
+        "gap_group_coverage_fraction": 0.55,
+        "gap_entry_candidate_limit": 4,
+        "gap_detour_beam_width": 24,
+    },
+    "bullet-group-expert": {
+        **_CURRENT_PROFILE,
+        "gap_direction_tolerance_degrees": 12.0,
+        "gap_speed_relative_tolerance": 0.20,
+        "gap_speed_absolute_tolerance": 0.35,
+        "gap_minimum_group_size": 3,
+        "gap_wavefront_depth": 24.0,
+        "gap_maximum_lateral_spacing": 112.0,
+        "gap_safety_margin": 10.0,
+        "gap_minimum_usable_width": 4.0,
+        "gap_sample_interval": 6,
+        "gap_minimum_lifetime_frames": 12,
+        "gap_entry_guard_frames": 6,
+        "gap_path_minimum_margin": 4.0,
+        "gap_group_coverage_fraction": 0.45,
+        "gap_entry_candidate_limit": 8,
+        "gap_detour_beam_width": 48,
     },
 }
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")

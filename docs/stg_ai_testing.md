@@ -329,6 +329,42 @@ Each JSON decision contains `gap_bullet_group_count`, `gap_corridor_count`,
 per-mode counts, `maximum_bullet_group_count`, and
 `maximum_corridor_count`.
 
+Three deterministic MPC profiles now model different player capability at
+processing bullet groups while holding ordinary movement scoring constant:
+
+| Profile | Perception | Accepted opening | Search capacity |
+| --- | --- | --- | --- |
+| `bullet-group-novice` | 5+ bullets, 5-degree direction tolerance, 6%/0.15 speed tolerance | 18-unit side reserve, 10 usable units, 24-frame lifetime, 65% coverage | sample every 12 frames, certify 2 entries, detour beam 12 |
+| `bullet-group-intermediate` | 4+ bullets, 8-degree direction tolerance, 12%/0.25 speed tolerance | 14-unit side reserve, 6 usable units, 18-frame lifetime, 55% coverage | sample every 9 frames, certify 4 entries, detour beam 24 |
+| `bullet-group-expert` | 3+ bullets, 12-degree direction tolerance, 20%/0.35 speed tolerance | 10-unit side reserve, 4 usable units, 12-frame lifetime, 45% coverage | sample every 6 frames, certify 8 entries, detour beam 48 |
+
+These are capability limits rather than random action corruption. Controlled
+fixtures establish monotonic behavior: 3/4/5-bullet wavefronts are recognized
+by expert only, intermediate plus expert, and all profiles; 20/12/0-degree
+direction spreads produce the same ordering; and 32/40/50-unit canonical gaps
+are accepted at the same three levels. `engine-mpc-play --profile` selects one
+level, while repeated matrix `--profile` options compare them on identical
+targets and seeds. This is MPC-teacher behavior, not evidence that the released
+neural checkpoint learned these levels.
+
+A current-source native comparison ran all three profiles on Okuu #3 seed
+`20260730`. Runner configuration, region-dynamics memory, runtime identity, and
+verified runtime source maps are equal; only the 15 documented bullet-group
+controller fields differ. All reports bind implementation SHA-256
+`394d8298f5b42c6a42d586a75ab908bac0fdb7281d6cd5fd54478a83e048d99b`.
+
+| Profile | Strict outcome | Group behavior | Movement | Report SHA-256 |
+| --- | --- | --- | --- | --- |
+| novice | `attack_complete`; 3,360 frames; HP `6000 -> 0`; death 0; shoot `3360/3360` | maximum 6 groups, no acceptable corridor, all modes 0 | path 9500.6747; changes 308; reversals 26; sharp turns 122; ABA 6; median hold 9 | `8fb9d002e7b0c8a6e993edd602995cf1d5e5fbcfdd4a457fb73a8bfc37c77850` |
+| intermediate | `attack_complete`; 3,360 frames; HP `6000 -> 0`; death 0; shoot `3360/3360` | 42 detected/observe decisions, 0 selected; maxima `30/3` groups/corridors | identical to novice in this episode | `dd73c9fdb36e1e0a34c4dbf4c39ffd1e30749f667953d46eeae6594d6a217c57` |
+| expert | `attack_complete`; 3,363 frames; HP `6000 -> 0`; death 0; shoot `3363/3363` | 172 detected, 44 selected; observe/enter/hold/exit `119/44/0/9`; maxima `54/13` | path 9621.0025; changes 316; reversals 26; sharp turns 112; ABA 7; median hold 9 | `3370da8b2debfdb5b77e05fb7f023d3c3181e0e3894a88e0e5dde6ef8eaf0047` |
+
+Intermediate recognition did not force unnecessary motion because ordinary MPC
+was already safe when those corridors appeared. Expert entry planning changed
+802 emitted actions and 749 directions across the 1,120 decisions shared with
+either lower profile. The three strict clears validate graded processing and
+non-regression on one seed; they do not calibrate human success rates.
+
 A deterministic four-bullet wavefront regression verifies that the selected
 anchor can affect control rather than telemetry only. Starting just outside a
 natural 10-unit corridor, gap prediction changes the collision-free first move
@@ -344,7 +380,7 @@ so dense geometry no longer runs a Python route search for every corridor.
 These figures are not a native episode A/B, real-time throughput, or
 success-rate claim.
 
-A final same-source, continuous-fire native A/B used Okuu #3 seed `20260730`.
+A preceding same-source, continuous-fire native A/B used Okuu #3 seed `20260730`.
 Both reports bind implementation SHA-256
 `002d770a1e4d10ad98a2ce00f21796dd7deeddc931b08ab638a3e07e0bbefb86`,
 have identical top-level run configuration and runtime source maps, and differ
