@@ -298,6 +298,46 @@ coordinates, and absolute frames for failure analysis, but current code cannot
 reinterpret either a report or `.rep` as a policy input. Every formal run is
 controlled continuously by live MPC from reset.
 
+When `--region-dynamics-memory` is omitted, four stable visible-radius samples
+enable an initial `0 / horizon/2 / horizon` row-flow projection without naming
+an unobserved plateau. The controller then learns the radius envelope, phase
+durations, rates, and cycle from the current episode. A selected exterior
+component is retained through brief ambiguous geometry and cleared on reset;
+an explicit opposite visible forecast replaces it. If its latest safe
+departure enters the visual horizon while the direct route is blocked, actual
+collision and ordinary-bullet danger stay ahead of route progress, while route
+progress may temporarily outrank the normal forced-region reserve. No scenario,
+attack, seed, fixed coordinate, absolute frame, side sequence, or recorded
+action participates in these decisions.
+
+Final native arm64 macOS headless validation used implementation
+`0c0b25f53ab677500a830d40e0f38377151e75e2b1ed7fcd63ffa621d9c0f268`,
+five frames of observation delay, a 60-frame horizon, and no memory option.
+Seeds `20260730/31/32` all returned `attack_complete`, reduced HP `6000 -> 0`,
+and ended with death 0 in `3327/3334/3331` controlled frames. Their JSON
+SHA-256 values are respectively
+`a6344535eb1eee7364ac8b4a87dc85b0a02b9d09785a00ee817dc0122ac603ba`,
+`2334dd12cd4c9dc51b99be86bdccc7e122f2442473a7763b5372cffd566b0539`,
+and `d6d2422c03ebe4f8807e8bce8129e5214e6da800d3a469f8426affe100c3851d`.
+Every decision is `live_mpc`, every action fires with spell disabled, and all
+three verified native replays are retained as ignored local analysis output.
+This is 3/3 for the executed seeds only and remains teacher, not neural-policy,
+evidence.
+
+The same implementation was then rerun visibly in the native macOS OpenGL
+window at seed `20260730`, still without a memory option. It completed in 3327
+controlled frames with `attack_complete`, HP `6000 -> 0`, and death 0. Its 1109
+live decisions exactly match the headless run at the same seed. The overlay
+reports `enabled=true`, `data_source=controller`, revision 3320, a 60-frame
+horizon, and 16/20/8 margins. The report
+`engine-mpc-boss3-no-memory-visible-demo-20260804-seed20260730.json` has SHA-256
+`963df911ffa73f9509f97e48463ec517166ff8a8c3ffc1d2704db96c6e845bff`;
+the verified replay has SHA-256
+`9aa6f4afa27306660fe84f0dfafef77eace07ef1b09bb0b2c843c833bc6b76bb`
+and CRC32 `c3faa620`. Per-frame overlay rendering measured 27.73 median FPS
+overall, 27.35 for `OBJ >= 300`, and 14.89 minimum. Lockstep preserves test
+correctness, but this visible run is not a 60-FPS performance result.
+
 `train-region-dynamics` reads source time, visible region radius, and adjacent
 visible indestructible positions from recorded controller-input observations.
 Time is used only for relative intervals and visible displacement. It rejects

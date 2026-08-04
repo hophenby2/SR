@@ -108,6 +108,22 @@ Python Stage 5 Boss #3 场景只近似原符卡后段的移动、周期扩张危
 
 当前 `engine-mpc-play` 没有录制动作 loader 或播放分支。可选的原生 replay 只作为输出，绝不会向控制器提供动作或其他输入。原生诊断报告仍保存逐帧动作、位置和绝对帧以便定位故障，但当前代码不会把报告或 `.rep` 重新解释为策略输入；正式运行只能从 reset 开始由 live MPC 连续闭环控制。
 
+完全省略 `--region-dynamics-memory` 时，报告中的 memory 路径、SHA-256 和控制器 memory 均为 `null`，也不会读取路线、动作前缀、checkpoint 或 SQLite。首批墙出现后，最近四个连续稳定的可见半径样本只建立“当前形状稳定”这一事实，不会擅自命名最大/最小平台；控制器用当前墙列位置和相邻画面估速，在 `0 / horizon/2 / horizon` 三个时刻投影左右开放数量，并选择预测窗内实际开放且最宽的同侧目标。第一次扩张/收缩后，半径包络、变化率、相位持续时间和 180 帧周期都在本局内在线学出。
+
+短期拓扑工作状态会在几帧几何无法区分左右时继续保持已经由可见信息选出的外侧连通域，直到新观测明确给出反侧或自机到达目标；每次 reset 都会清空，绝不形成跨局左右序列或绝对帧触发。当直达路线受阻且最迟换区时刻进入 60 帧视野时，真实碰撞与普通子弹危险仍排在最前，区域迁移进度可以暂时高于通常的 8 单位强制区域余量，从而允许必要的低等级危险区穿越，但不会接受预测碰撞。
+
+最终实现指纹为 `0c0b25f53ab677500a830d40e0f38377151e75e2b1ed7fcd63ffa621d9c0f268`。三次独立原生 arm64 macOS headless 进程都使用五帧观察延迟、60 帧 horizon、持续开枪、弹组空隙预测，并且命令中完全没有 memory 参数：
+
+| seed | 控制帧 / 决策 | 严格结果 | replay CRC32 / 帧数 | JSON SHA-256 |
+| ---: | ---: | --- | --- | --- |
+| 20260730 | 3327 / 1109 | `attack_complete`、Boss `6000 -> 0`、death 0 | `05ab4af6` / 3328 | `a6344535eb1eee7364ac8b4a87dc85b0a02b9d09785a00ee817dc0122ac603ba` |
+| 20260731 | 3334 / 1112 | `attack_complete`、Boss `6000 -> 0`、death 0 | `ce651750` / 3335 | `2334dd12cd4c9dc51b99be86bdccc7e122f2442473a7763b5372cffd566b0539` |
+| 20260732 | 3331 / 1111 | `attack_complete`、Boss `6000 -> 0`、death 0 | `a12fea5c` / 3332 | `d6d2422c03ebe4f8807e8bce8129e5214e6da800d3a469f8426affe100c3851d` |
+
+三局全部决策都是 `live_mpc`，全部动作保持开枪并禁用 spell，均在本局在线学出 180 帧周期；三份原生 replay 都是 `saved=true`、`verified=true`、`group_finish=0`。这是已执行 seed 的 `3/3` 严格 live-MPC-teacher 证据，不外推到其他 seed、Boss #4 或神经 checkpoint。
+
+同一实现随后在原生 macOS OpenGL 窗口中用 seed `20260730` 可见重跑。控制命令仍完全省略 memory，覆盖层报告 `enabled=true`、`data_source=controller`、revision 3320，并使用控制器的 60 帧 horizon 和 16/20/8 阈值。结果为 3327 控制帧、1109 次 `live_mpc` 决策、`attack_complete`、Boss `6000 -> 0`、death 0；与同 seed 的 headless 决策轨迹逐条一致。报告 `tools/stg_lab/artifacts/engine-mpc-boss3-no-memory-visible-demo-20260804-seed20260730.json` 的 SHA-256 为 `963df911ffa73f9509f97e48463ec517166ff8a8c3ffc1d2704db96c6e845bff`；已验证 replay 的 SHA-256 为 `9aa6f4afa27306660fe84f0dfafef77eace07ef1b09bb0b2c843c833bc6b76bb`，CRC32 为 `c3faa620`。可见逐帧覆盖层运行的全程 FPS 中位数为 27.73，`OBJ >= 300` 密集段为 27.35，最低 14.89；这不影响 lockstep 正确性，但不能声称本轮可见演示达到 60 FPS。
+
 `train-region-dynamics` 从原生报告中读取 `source_frame`、可见区域半径，以及已记录控制器输入中的可碰撞不可摧毁物 `id/x/y`；`id` 只用于相邻画面匹配，产物不保存对象身份。训练器拒绝带录制动作、非 `live_mpc` 决策、authority shield 或未强制 `spell=false` 的来源，并将训练 provenance 与可加载记忆分开保存：
 
 ```bash

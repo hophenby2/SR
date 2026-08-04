@@ -733,13 +733,14 @@ class _GapCorridor:
 
 @dataclass(frozen=True, slots=True)
 class _RegionSideForecast:
-    """Safe exterior inferred from the next relative expansion window."""
+    """Safe exterior inferred from projected, episode-local row geometry."""
 
     side: str
     x: float
-    frames_until_expansion: float
+    preposition_lead_frames: float
     open_samples: int
     total_samples: int
+    conservative_online: bool = False
 
 
 @dataclass(slots=True)
@@ -758,6 +759,7 @@ class _RegionTopologyMemory:
     """Persist safe-component intent while coordinates continue to move."""
 
     target_component: str | None = None
+    target_x: float | None = None
     portal: str | None = None
     navigation_mode: str = "hold"
     revision: int = 0
@@ -768,6 +770,7 @@ class _RegionTopologyMemory:
         self,
         *,
         target_component: str,
+        target_x: float,
         portal: str | None,
         navigation_mode: str,
     ) -> None:
@@ -776,6 +779,7 @@ class _RegionTopologyMemory:
         if state != previous:
             self.revision += 1
         self.target_component = target_component
+        self.target_x = target_x
         self.portal = portal
         self.navigation_mode = navigation_mode
 
@@ -1055,6 +1059,24 @@ class _RegionPhaseMemory:
         ):
             return "down", slope
         return "stable", slope
+
+    def stable_unknown_radius(self, minimum_samples: int = 4) -> float | None:
+        """Return a stable visible radius without assigning a plateau phase."""
+
+        if self.phase != "unknown" or len(self.history) < minimum_samples:
+            return None
+        window = self.history[-minimum_samples:]
+        for (previous_frame, previous), (frame, current) in zip(
+            window,
+            window[1:],
+        ):
+            elapsed = frame - previous_frame
+            if (
+                elapsed <= 0
+                or abs(current - previous) / elapsed > self.trend_threshold
+            ):
+                return None
+        return float(statistics.median(radius for _frame, radius in window))
 
     def update(self, frame: int, radii: Sequence[float]) -> None:
         if not radii or (self.last_frame is not None and frame <= self.last_frame):
@@ -1683,63 +1705,116 @@ class EngineMPC:
         player: tuple[float, float, float, float, float],
         bounds: tuple[float, float, float, float],
     ) -> _RegionSideForecast | None:
-        """Infer the safer exterior from flow during the next expansion.
+        """Infer the safer exterior from projected visible row flow.
 
-        This is intentionally episode-translation invariant. It projects only
-        currently visible row geometry from the learned relative phase; it does
-        not retain a side sequence, coordinate, action, or episode-frame cue.
+        This is intentionally episode-translation invariant. It uses either a
+        learned relative phase or a conservative episode-local radius envelope;
+        it never retains a side sequence, coordinate, action, or frame cue.
         """
 
         dynamics_memory = self._region_phase.dynamics_memory
-        if (
-            dynamics_memory is None
-            or dynamics_memory.safe_side_rule
-            != "opposite_incoming_lateral_flow"
-        ):
-            return None
-        if self._region_phase.phase not in {
-            "minimum_hold",
-            "contracting",
-            "expanding",
-        }:
-            return None
-        frames_until_expansion = self._frames_until_region_expansion()
-        expansion_frames = self._region_phase._phase_duration("expanding")
-        if frames_until_expansion is None or expansion_frames is None:
-            return None
-        if not math.isfinite(frames_until_expansion + expansion_frames):
-            return None
-
-        minimum_radius = (
-            self._region_phase.minimum_plateau_radius
-            or self.config.region_learned_min_radius
-        )
-        maximum_radius = (
-            self._region_phase.maximum_plateau_radius
-            or self.config.region_learned_max_radius
-        )
-        growth_rate = (
-            self._region_phase.growth_rate
-            or self.config.region_radius_step
-        )
+        phase = self._region_phase.phase
         left, right, bottom, top = bounds
+        conservative_online = False
+        samples: tuple[tuple[float, float], ...]
+        timed_online_phase = (
+            dynamics_memory is None
+            and self._region_phase.learned_cycle_frames is not None
+        )
+        stable_unknown_radius = (
+            self._region_phase.stable_unknown_radius()
+            if dynamics_memory is None else
+            None
+        )
+        if dynamics_memory is not None or timed_online_phase:
+            eligible_phases = {"minimum_hold", "contracting", "expanding"}
+            if timed_online_phase:
+                # After this episode has exposed a complete period, the next
+                # side is observable while the current maximum plateau is
+                # still active. Use that otherwise idle interval to
+                # preposition; the first cycle still waits for contraction.
+                eligible_phases.add("maximum_hold")
+            if (
+                dynamics_memory is not None
+                and dynamics_memory.safe_side_rule
+                != "opposite_incoming_lateral_flow"
+                or phase not in eligible_phases
+            ):
+                return None
+            frames_until_expansion = self._frames_until_region_expansion()
+            expansion_frames = self._region_phase._phase_duration("expanding")
+            if frames_until_expansion is None or expansion_frames is None:
+                return None
+            if not math.isfinite(frames_until_expansion + expansion_frames):
+                return None
+            minimum_radius = self._region_phase.minimum_plateau_radius
+            maximum_radius = self._region_phase.maximum_plateau_radius
+            growth_rate = self._region_phase.growth_rate
+            if dynamics_memory is not None:
+                minimum_radius = (
+                    minimum_radius or self.config.region_learned_min_radius
+                )
+                maximum_radius = (
+                    maximum_radius or self.config.region_learned_max_radius
+                )
+                growth_rate = growth_rate or self.config.region_radius_step
+            if (
+                minimum_radius is None
+                or maximum_radius is None
+                or growth_rate is None
+            ):
+                return None
+            phase_offsets = (0.0, 0.5 * expansion_frames, expansion_frames)
+            samples = tuple(
+                (
+                    frames_until_expansion + phase_offset,
+                    min(
+                        maximum_radius,
+                        minimum_radius + growth_rate * phase_offset,
+                    ),
+                )
+                for phase_offset in phase_offsets
+            )
+            preposition_lead_frames = frames_until_expansion
+        else:
+            if phase == "unknown":
+                # Four stable samples establish only the current visible
+                # shape. They do not label it as either radius plateau.
+                projection_radius = stable_unknown_radius
+            elif phase in {"minimum_hold", "contracting"}:
+                # Once this episode has exposed the upper plateau, project
+                # under that worst observed radius during the first cycle for
+                # which no exact expansion deadline exists yet.
+                projection_radius = self._region_phase.maximum_plateau_radius
+            else:
+                projection_radius = None
+            if projection_radius is None:
+                return None
+            projection_frames = float(self.config.horizon_frames)
+            samples = (
+                (0.0, projection_radius),
+                (0.5 * projection_frames, projection_radius),
+                (projection_frames, projection_radius),
+            )
+            # The projection window says which side remains open, not how long
+            # a full-width relocation may take. Preserve the visible intent
+            # for at least one playfield traversal so a collision detour on
+            # the first decision cannot immediately discard it.
+            preposition_lead_frames = max(
+                projection_frames,
+                (right - left) / max(0.1, player[3]),
+            )
+            conservative_online = True
+
         player_radius = player[2]
         side_clearance = (
             player_radius
             + self.config.portal_clearance
             + self.config.region_safe_margin_target
         )
-        # Start, midpoint, and end describe topology over the expansion rather
-        # than at a single trigger instant.
-        phase_offsets = (0.0, 0.5 * expansion_frames, expansion_frames)
         widths: dict[str, list[float]] = {"left": [], "right": []}
         targets: dict[str, list[float]] = {"left": [], "right": []}
-        for phase_offset in phase_offsets:
-            future_frame = frames_until_expansion + phase_offset
-            radius = min(
-                maximum_radius,
-                minimum_radius + growth_rate * phase_offset,
-            )
+        for future_frame, radius in samples:
             for row in rows:
                 center_y = sum(
                     item.y + item.vy * future_frame for item in row
@@ -1788,15 +1863,32 @@ class EngineMPC:
             < 2.0 * player_radius
         ):
             return None
-        target_x = (
-            min(targets[side]) if side == "left" else max(targets[side])
-        )
+        if phase == "unknown" and stable_unknown_radius is not None:
+            # The opening stable platform can enter from beyond the opposite
+            # edge of the screen.  Its earliest sample may therefore require
+            # an impossible boundary-hugging position even though the same
+            # side is wide open by the time the row reaches the playfield.
+            # Use the actually open sample with the greatest clearance as the
+            # preposition waypoint; the side vote still uses the complete
+            # 0 / h/2 / h projection above.
+            widest_index = max(
+                range(len(widths[side])),
+                key=widths[side].__getitem__,
+            )
+            if widths[side][widest_index] < 0.0:
+                return None
+            target_x = targets[side][widest_index]
+        else:
+            target_x = (
+                min(targets[side]) if side == "left" else max(targets[side])
+            )
         return _RegionSideForecast(
             side=side,
             x=min(max(target_x, left), right),
-            frames_until_expansion=frames_until_expansion,
+            preposition_lead_frames=preposition_lead_frames,
             open_samples=side_key(side)[0],
             total_samples=len(widths[side]),
+            conservative_online=conservative_online,
         )
 
     @staticmethod
@@ -3277,7 +3369,7 @@ class EngineMPC:
                 route = ((side_forecast.x, band_y),)
                 margin, phase_travel = path_margin(route)
                 phase_deadline = (
-                    side_forecast.frames_until_expansion
+                    side_forecast.preposition_lead_frames
                     + 0.5 * expansion_duration
                 )
                 phase_candidate = {
@@ -3304,6 +3396,7 @@ class EngineMPC:
             navigation_mode = "evacuate" if flow_wait <= 0.0 else "hold"
             self._region_topology.update(
                 target_component=target_component,
+                target_x=min(max(px, left), right),
                 portal=None,
                 navigation_mode=navigation_mode,
             )
@@ -3422,6 +3515,52 @@ class EngineMPC:
             )
 
         if (
+            remembered_exterior in {"exterior:left", "exterior:right"}
+            and current_component != remembered_exterior
+            and not remembered_candidates
+            and side_forecast is None
+            and self._region_phase.phase != "unknown"
+            and self._region_topology.target_x is not None
+        ):
+            # Visible row entry can be ambiguous for a few decisions between
+            # the learned phase forecast and the next concrete side portal.
+            # Preserve this episode's already observed exterior commitment;
+            # an explicit opposite forecast below still replaces it.
+            retained_x = min(
+                max(self._region_topology.target_x, left),
+                right,
+            )
+            retained_route = ((retained_x, band_y),)
+            retained_margin, retained_travel = path_margin(retained_route)
+            retained_deadline = self._frames_until_region_expansion()
+            if retained_deadline is None:
+                retained_deadline = float(self.config.horizon_frames)
+            retained_deadline += 0.5 * expansion_duration
+            retained_side = remembered_exterior.partition(":")[2]
+            retained_candidate = {
+                "portal": f"phase-flow:{retained_side}",
+                "target_component": remembered_exterior,
+                "persistent": True,
+                "corridor": True,
+                "aligned": (
+                    abs(px - retained_x)
+                    <= speed * self.config.decision_interval
+                ),
+                "x": retained_x,
+                "target_y": band_y,
+                "approach_y": band_y,
+                "close_frames": retained_deadline,
+                "deadline_slack": (
+                    retained_deadline - retained_travel - guard_frames
+                ),
+                "path_margin": retained_margin,
+                "travel": float(retained_travel),
+                "lateral": abs(retained_x - px) / max(0.1, speed),
+            }
+            portal_candidates.append(retained_candidate)
+            selected = retained_candidate
+
+        if (
             phase_candidate is not None
             and selected["target_component"]
             != phase_candidate["target_component"]
@@ -3501,6 +3640,7 @@ class EngineMPC:
 
         self._region_topology.update(
             target_component=selected_target_component,
+            target_x=float(selected["x"]),
             portal=str(selected["portal"]),
             navigation_mode=navigation_mode,
         )
@@ -3590,6 +3730,46 @@ class EngineMPC:
                     break
         return np.asarray(selected, dtype=np.int64)
 
+    def _region_route_urgent(
+        self,
+        region_anchor: _RegionAnchor | None,
+        player: tuple[float, float, float, float, float],
+    ) -> bool:
+        """Return whether delaying a required component change risks closure."""
+
+        if (
+            region_anchor is None
+            or region_anchor.navigation_mode not in {"preposition", "evacuate"}
+            or region_anchor.current_component == region_anchor.target_component
+        ):
+            return False
+        # A route that already meets the forced-region collision envelope can
+        # keep the normal reserve ordering even when its portal is urgent.
+        # The exception is for a locally blocked straight route, where the
+        # beam must deliberately search a lower-reserve detour before closure.
+        if region_anchor.path_margin >= 0.0:
+            return False
+        if (
+            math.isfinite(region_anchor.deadline_slack)
+            and region_anchor.deadline_slack <= self.config.horizon_frames
+        ):
+            return True
+
+        frames_until_expansion = self._frames_until_region_expansion()
+        if frames_until_expansion is None:
+            return False
+        dx = abs(region_anchor.x - player[0])
+        dy = abs(region_anchor.y - player[1])
+        diagonal = min(dx, dy)
+        travel_frames = (
+            diagonal / max(0.1, player[3] * _SQRT_HALF)
+            + (max(dx, dy) - diagonal) / max(0.1, player[3])
+        )
+        return (
+            frames_until_expansion - travel_frames
+            <= self.config.horizon_frames
+        )
+
     @staticmethod
     def _gap_center_space_distance(
         x: float,
@@ -3621,6 +3801,10 @@ class EngineMPC:
         """Search complete three-frame action sequences over the horizon."""
 
         px, py, player_radius, speed, focus_speed = player
+        route_progress_urgent = self._region_route_urgent(
+            region_anchor,
+            player,
+        )
         action_count = len(self.actions)
         move_x = np.asarray([action.move_x for action in self.actions], dtype=np.float64)
         move_y = np.asarray([action.move_y for action in self.actions], dtype=np.float64)
@@ -4017,6 +4201,7 @@ class EngineMPC:
                 preference,
                 minimum_margin,
                 collision_priority_frames=self.config.collision_priority_frames,
+                route_progress_urgent=route_progress_urgent,
                 tie_breaker=first_action,
             )
             keep = self._diverse_keep(
@@ -4137,6 +4322,7 @@ class EngineMPC:
                 preference,
                 minimum_margin[matches],
                 collision_priority_frames=self.config.collision_priority_frames,
+                route_progress_urgent=route_progress_urgent,
             )
             selected = matches[int(order[0])]
             earliest = int(earliest_collision[selected])
@@ -4195,6 +4381,7 @@ class EngineMPC:
         minimum_margin: np.ndarray,
         *,
         collision_priority_frames: int = 36,
+        route_progress_urgent: bool = False,
         tie_breaker: np.ndarray | None = None,
     ) -> np.ndarray:
         """Order beam candidates with safety ahead of motion preferences."""
@@ -4203,17 +4390,35 @@ class EngineMPC:
             earliest_collision,
             collision_priority_frames,
         )
-        keys: tuple[np.ndarray, ...] = (
-            -minimum_margin,
-            -earliest_collision,
-            preference,
-            collision_frames,
-            margin_shortfall,
-            region_margin_shortfall,
-            danger_margin_shortfall,
-            -priority_earliest,
-            collided.astype(np.int8),
-        )
+        if route_progress_urgent:
+            # Once the latest safe departure enters the visual prediction
+            # window, keep actual collision and ordinary-bullet danger first,
+            # then make route progress. This permits a short traversal of a
+            # lower-grade forced-region reserve instead of waiting inside a
+            # component that is about to become disconnected.
+            keys: tuple[np.ndarray, ...] = (
+                -minimum_margin,
+                -earliest_collision,
+                collision_frames,
+                margin_shortfall,
+                region_margin_shortfall,
+                preference,
+                danger_margin_shortfall,
+                -priority_earliest,
+                collided.astype(np.int8),
+            )
+        else:
+            keys = (
+                -minimum_margin,
+                -earliest_collision,
+                preference,
+                collision_frames,
+                margin_shortfall,
+                region_margin_shortfall,
+                danger_margin_shortfall,
+                -priority_earliest,
+                collided.astype(np.int8),
+            )
         if tie_breaker is not None:
             keys = (tie_breaker, *keys)
         return np.lexsort(keys)
@@ -4528,6 +4733,10 @@ class EngineMPC:
         bounds = self._bounds(observation, player[2])
         boss_x = self._boss_x(observation, self.config.observation_delay)
         region_anchor = self._region_anchor(player, bounds, threats, source_frame)
+        route_progress_urgent = self._region_route_urgent(
+            region_anchor,
+            player,
+        )
         gap_groups, gap_corridors, gap_anchor, gap_mode = self._gap_navigation(
             player,
             bounds,
@@ -4592,6 +4801,34 @@ class EngineMPC:
                     float(value.collision_frames),
                     preference,
                     -earliest,
+                    -value.minimum_margin,
+                    float(index),
+                )
+            if route_progress_urgent:
+                return (
+                    float(value.collided),
+                    -priority_earliest,
+                    gap_entry_mismatch,
+                    max(
+                        0.0,
+                        self.config.danger_margin_target
+                        - value.minimum_nonregion_margin,
+                    ),
+                    preference,
+                    max(
+                        0.0,
+                        self.config.region_safe_margin_target
+                        - value.minimum_region_margin,
+                    ),
+                    max(
+                        0.0,
+                        self.config.safe_margin_target
+                        - value.minimum_nonregion_margin,
+                    ),
+                    float(value.collision_frames),
+                    -earliest,
+                    -value.minimum_nonregion_margin,
+                    -value.minimum_region_margin,
                     -value.minimum_margin,
                     float(index),
                 )

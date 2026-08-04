@@ -17,6 +17,7 @@ from stg_lab.engine_mpc import (
     VisibleTrackEstimator,
     _GapCorridor,
     _RegionAnchor,
+    _RegionSideForecast,
     movement_actions,
 )
 
@@ -781,6 +782,24 @@ def test_region_reserve_precedes_extra_clearance_outside_danger_zone() -> None:
     assert order.tolist() == [1, 0]
 
 
+def test_urgent_region_route_can_cross_lower_grade_region_reserve() -> None:
+    order = EngineMPC._beam_candidate_order(
+        collided=np.asarray([False, False]),
+        earliest_collision=np.asarray([61, 61]),
+        collision_frames=np.asarray([0, 0]),
+        danger_margin_shortfall=np.asarray([0.0, 0.0]),
+        margin_shortfall=np.asarray([0.0, 0.0]),
+        # Candidate zero advances toward the closing component but has less
+        # than the normal eight-unit wall reserve. Candidate one waits safely.
+        region_margin_shortfall=np.asarray([6.0, 0.0]),
+        preference=np.asarray([0.0, 100.0]),
+        minimum_margin=np.asarray([2.0, 8.0]),
+        route_progress_urgent=True,
+    )
+
+    assert order.tolist() == [0, 1]
+
+
 def test_far_collision_timing_yields_to_escape_reserve() -> None:
     order = EngineMPC._beam_candidate_order(
         collided=np.asarray([True, True]),
@@ -1324,6 +1343,231 @@ def test_phase_flow_forecast_is_relative_and_mirrors_the_observed_flow() -> None
     assert not legacy.region_portal.startswith("phase-flow:")
 
 
+def test_online_region_flow_forecast_uses_only_visible_geometry_and_radius() -> None:
+    row_specs = (
+        (-207.0, 15.0, 5, 1.4172, -2.6441),
+        (-171.0, -48.5, 6, 1.1713, -2.7619),
+        (-132.4, -120.5, 8, 0.7765, -2.8978),
+        (-83.7, -187.9, 9, 0.2724, -2.9876),
+        (-24.0, -190.6, 9, -0.2724, -2.9876),
+        (41.4, -216.9, 9, -0.7765, -2.8978),
+        (105.2, -218.4, 9, -1.1713, -2.7619),
+        (163.2, -200.6, 9, -1.4172, -2.6441),
+        (216.2, -220.5, 10, -1.5, -2.5981),
+    )
+
+    def decide(
+        *,
+        mirror: int,
+        source_frame: int,
+        phase: str = "contracting",
+        timed_cycle: bool = False,
+    ):
+        rows: list[tuple[PredictedThreat, ...]] = []
+        for row_index, (y, first_x, count, vx, vy) in enumerate(row_specs):
+            row = tuple(sorted((
+                PredictedThreat(
+                    key=f"indestructibles:{row_index}:{column}",
+                    source="indestructibles",
+                    object_id=(row_index, column),
+                    x=mirror * (first_x + 48.0 * column),
+                    y=y,
+                    vx=mirror * vx,
+                    vy=vy,
+                    radius=25.9,
+                    radius_rate=0.0,
+                    source_frame=source_frame,
+                    observation_delay=0,
+                    radius_rate_horizon=0,
+                    motion_horizon=60,
+                )
+                for column in range(count)
+            ), key=lambda item: item.x))
+            rows.append(row)
+
+        teacher = EngineMPC(MPCConfig(observation_delay=0, horizon_frames=60))
+        teacher._region_phase.phase = phase
+        teacher._region_phase.minimum_plateau_radius = 7.0
+        teacher._region_phase.maximum_plateau_radius = 28.0
+        teacher._region_phase.growth_rate = 0.7
+        if timed_cycle:
+            teacher._region_phase.last_frame = source_frame
+            teacher._region_phase.expansion_starts = [
+                source_frame - 270,
+                source_frame - 90,
+            ]
+            teacher._region_phase.phase_durations["expanding"] = [30]
+        player = (mirror * -99.0, -195.0, 0.5, 4.0, 2.0)
+        bounds = (-184.0, 184.0, -208.0, 208.0)
+        forecast = teacher._region_side_forecast(rows, player, bounds)
+        anchor = teacher._region_anchor(
+            player,
+            bounds,
+            tuple(threat for row in rows for threat in row),
+            source_frame,
+        )
+        return teacher, forecast, anchor
+
+    teacher, right, right_anchor = decide(mirror=1, source_frame=1385)
+    _, shifted, shifted_anchor = decide(mirror=1, source_frame=9385)
+    _, left, left_anchor = decide(mirror=-1, source_frame=1385)
+    _, untimed_maximum, _ = decide(
+        mirror=1,
+        source_frame=1385,
+        phase="maximum_hold",
+    )
+    _, timed_maximum, _ = decide(
+        mirror=1,
+        source_frame=1385,
+        phase="maximum_hold",
+        timed_cycle=True,
+    )
+
+    assert teacher.config.region_dynamics_memory is None
+    assert right is not None and shifted is not None and left is not None
+    assert right.conservative_online is True
+    assert right.side == shifted.side == "right"
+    assert right.x == shifted.x
+    assert right.preposition_lead_frames == 92.0
+    assert left.side == "left"
+    assert left.x == pytest.approx(-right.x)
+    assert untimed_maximum is None
+    assert timed_maximum is not None
+    assert timed_maximum.conservative_online is False
+    assert timed_maximum.side == "right"
+    assert timed_maximum.preposition_lead_frames == 90.0
+
+    assert right_anchor is not None and shifted_anchor is not None
+    assert left_anchor is not None
+    assert right_anchor.target_component == shifted_anchor.target_component == (
+        "exterior:right"
+    )
+    assert right_anchor.portal == shifted_anchor.portal == "phase-flow:right"
+    assert right_anchor.x == shifted_anchor.x
+    assert left_anchor.target_component == "exterior:left"
+    assert left_anchor.portal == "phase-flow:left"
+    assert left_anchor.x == pytest.approx(-right_anchor.x)
+
+
+def test_online_region_flow_forecast_waits_for_observed_maximum_radius() -> None:
+    teacher = EngineMPC(MPCConfig(observation_delay=0, horizon_frames=60))
+    teacher._region_phase.phase = "contracting"
+    rows = ((PredictedThreat(
+        key=f"indestructibles:{column}",
+        source="indestructibles",
+        object_id=column,
+        x=-96.0 + 48.0 * column,
+        y=-60.0,
+        vx=1.0,
+        vy=-2.0,
+        radius=7.0,
+        radius_rate=0.0,
+        source_frame=0,
+        observation_delay=0,
+        radius_rate_horizon=0,
+        motion_horizon=60,
+    ) for column in range(5)),)
+
+    assert teacher._region_phase.maximum_plateau_radius is None
+    assert teacher._region_side_forecast(
+        rows,
+        (0.0, -90.0, 0.5, 4.0, 2.0),
+        (-184.0, 184.0, -208.0, 208.0),
+    ) is None
+
+
+def test_unknown_stable_platform_forecast_requires_four_samples_and_mirrors() -> None:
+    def decide(
+        *,
+        mirror: int = 1,
+        source_frame: int = 1200,
+        visible_radii: tuple[float, ...] = (7.0, 7.0, 7.0, 7.0),
+    ):
+        teacher = EngineMPC(MPCConfig(observation_delay=0, horizon_frames=60))
+        for index, radius in enumerate(visible_radii):
+            sample_frame = source_frame - 3 * (len(visible_radii) - index - 1)
+            teacher._region_phase.update(sample_frame, [radius] * 7)
+
+        rows: list[tuple[PredictedThreat, ...]] = []
+        for row_index, y in enumerate((-170.0, -50.0, 70.0, 190.0)):
+            row = tuple(sorted((
+                PredictedThreat(
+                    key=f"indestructibles:{row_index}:{column}",
+                    source="indestructibles",
+                    object_id=(row_index, column),
+                    x=mirror * (-144.0 + 48.0 * column),
+                    y=y,
+                    vx=mirror * -2.0,
+                    vy=-2.0,
+                    radius=visible_radii[-1],
+                    radius_rate=0.0,
+                    source_frame=source_frame,
+                    observation_delay=0,
+                    radius_rate_horizon=0,
+                    motion_horizon=60,
+                )
+                for column in range(7)
+            ), key=lambda item: item.x))
+            rows.append(row)
+
+        player = (mirror * -99.0, -195.0, 0.5, 4.0, 2.0)
+        bounds = (-184.0, 184.0, -208.0, 208.0)
+        forecast = teacher._region_side_forecast(rows, player, bounds)
+        anchor = teacher._region_anchor(
+            player,
+            bounds,
+            tuple(threat for row in rows for threat in row),
+            source_frame,
+        )
+        return teacher, forecast, anchor
+
+    before_threshold, early, early_anchor = decide(
+        visible_radii=(7.0, 7.0, 7.0),
+    )
+    online, right, right_anchor = decide()
+    _, shifted, shifted_anchor = decide(source_frame=9200)
+    _, left, left_anchor = decide(mirror=-1)
+    unstable, rejected, _ = decide(
+        visible_radii=(7.0, 7.0, 7.0, 7.5),
+    )
+
+    assert before_threshold._region_phase.phase == "unknown"
+    assert before_threshold._region_phase.stable_unknown_radius() is None
+    assert early is None
+    assert early_anchor is not None
+    assert not (early_anchor.portal or "").startswith("phase-flow:")
+    assert unstable._region_phase.phase == "unknown"
+    assert unstable._region_phase.stable_unknown_radius() is None
+    assert rejected is None
+
+    assert online.config.region_dynamics_memory is None
+    assert online._region_phase.phase == "unknown"
+    assert online._region_phase.stable_unknown_radius() == 7.0
+    assert online._region_phase.minimum_plateau_radius is None
+    assert online._region_phase.maximum_plateau_radius is None
+    assert right is not None and shifted is not None and left is not None
+    assert right.conservative_online is True
+    assert right.side == shifted.side == "right"
+    assert right.x == shifted.x
+    assert abs(right.x) < 184.0
+    assert left.side == "left"
+    assert left.x == pytest.approx(-right.x)
+
+    assert right_anchor is not None and shifted_anchor is not None
+    assert left_anchor is not None
+    assert right_anchor.navigation_mode == shifted_anchor.navigation_mode == (
+        "preposition"
+    )
+    assert right_anchor.target_component == shifted_anchor.target_component == (
+        "exterior:right"
+    )
+    assert right_anchor.portal == shifted_anchor.portal == "phase-flow:right"
+    assert right_anchor.x == shifted_anchor.x
+    assert left_anchor.target_component == "exterior:left"
+    assert left_anchor.portal == "phase-flow:left"
+    assert left_anchor.x == pytest.approx(-right_anchor.x)
+
+
 def test_region_dynamics_prior_makes_first_cycle_portal_deadline_finite() -> None:
     row_x = (-96.0, -48.0, 0.0, 48.0, 96.0)
     walls = [
@@ -1505,6 +1749,77 @@ def test_persistent_region_intent_survives_a_blocked_straight_path() -> None:
     assert blocked.target_component == first.target_component
     assert blocked.path_margin < 0.0
     assert blocked.navigation_mode == "preposition"
+    assert teacher._region_topology.target_x == blocked.x
+
+
+def test_episode_local_exterior_intent_survives_ambiguity_then_reverses() -> None:
+    row_x = (-96.0, -48.0, 0.0, 48.0, 96.0)
+    walls = [
+        wall_object(
+            row * 100 + column,
+            x,
+            y,
+            radius=7.0,
+            dx=0.0,
+            dy=0.0,
+        )
+        for row, y in enumerate((-200.0, -120.0, -63.0, 0.0))
+        for column, x in enumerate(row_x)
+    ]
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        horizon_frames=60,
+        region_dynamics_memory=learned_region_dynamics(),
+    ))
+    initial_observation = observation(
+        10,
+        player_x=80.0,
+        player_y=-160.0,
+        indestructibles=walls,
+        bounds=(-140.0, 140.0, -240.0, 256.0),
+    )
+    initial_threats = teacher.estimator.update(initial_observation)
+    teacher._update_region_phase(initial_observation, 10)
+    player = teacher._player(initial_observation, 0)
+    bounds = teacher._bounds(initial_observation, player[2])
+    initial = teacher._region_anchor(player, bounds, initial_threats, 10)
+
+    assert initial is not None
+    assert initial.target_component == "exterior:right"
+    remembered_x = teacher._region_topology.target_x
+    assert remembered_x is not None
+
+    shifted_threats = tuple(
+        replace(threat, x=threat.x + 80.0, source_frame=13)
+        for threat in initial_threats
+    )
+    ambiguous = teacher._region_anchor(player, bounds, shifted_threats, 13)
+
+    assert ambiguous is not None
+    assert ambiguous.target_component == "exterior:right"
+    assert ambiguous.portal == "phase-flow:right"
+    assert ambiguous.x == remembered_x
+
+    teacher._region_side_forecast = lambda *_args: _RegionSideForecast(
+        side="left",
+        x=-100.0,
+        preposition_lead_frames=60.0,
+        open_samples=3,
+        total_samples=3,
+        conservative_online=True,
+    )
+    reversed_anchor = teacher._region_anchor(
+        player,
+        bounds,
+        tuple(replace(threat, source_frame=16) for threat in shifted_threats),
+        16,
+    )
+
+    assert reversed_anchor is not None
+    assert reversed_anchor.target_component == "exterior:left"
+    assert reversed_anchor.portal is not None
+    assert reversed_anchor.portal.endswith(":left")
+    assert teacher._region_topology.target_component == "exterior:left"
 
 
 def test_exterior_side_changes_when_row_motion_will_close_the_near_boundary() -> None:

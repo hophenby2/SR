@@ -511,6 +511,60 @@ has SHA-256
 These are ignored local artifacts named `boss3-analysis-seed20260730.rep` and
 `engine-mpc-boss3-analysis-seed20260730.json`.
 
+### Memory-free Boss #3 online inference
+
+Omitting `--region-dynamics-memory` now leaves the memory path, memory SHA-256,
+and controller memory fields `null`. The controller does not load a route,
+action prefix, checkpoint, SQLite database, or prior episode. Four consecutive
+stable visible-radius samples are enough to project the currently visible rows
+at `0`, `horizon/2`, and `horizon`; this selects a side and the widest actually
+open waypoint without assigning an unobserved minimum or maximum phase. After
+the first expansion/contraction, the same episode learns the radius envelope,
+change rates, phase durations, and 180-frame cycle from visible samples.
+
+The per-episode topology state retains an already selected exterior connected
+component through a short ambiguous observation window, but is cleared by
+every reset. It stores neither a side sequence nor an absolute frame trigger.
+When a required component change has entered the 60-frame visual horizon and
+the direct route is blocked, collision and ordinary-bullet danger remain first,
+then route progress may outrank the normal eight-unit forced-region reserve.
+This is the explicit case where the player crosses a lower-grade danger region
+before it disconnects; it never permits a predicted collision.
+
+The final implementation fingerprint is
+`0c0b25f53ab677500a830d40e0f38377151e75e2b1ed7fcd63ffa621d9c0f268`.
+Three independent native arm64 macOS headless processes used five frames of
+observation delay, a 60-frame horizon, continuous fire, gap prediction, and no
+external memory option:
+
+| Seed | Controlled frames / decisions | Strict result | Replay CRC32 / frames | JSON SHA-256 |
+| ---: | ---: | --- | --- | --- |
+| 20260730 | 3327 / 1109 | `attack_complete`; HP `6000 -> 0`; death 0 | `05ab4af6` / 3328 | `a6344535eb1eee7364ac8b4a87dc85b0a02b9d09785a00ee817dc0122ac603ba` |
+| 20260731 | 3334 / 1112 | `attack_complete`; HP `6000 -> 0`; death 0 | `ce651750` / 3335 | `2334dd12cd4c9dc51b99be86bdccc7e122f2442473a7763b5372cffd566b0539` |
+| 20260732 | 3331 / 1111 | `attack_complete`; HP `6000 -> 0`; death 0 | `a12fea5c` / 3332 | `d6d2422c03ebe4f8807e8bce8129e5214e6da800d3a469f8426affe100c3851d` |
+
+All decisions report `control_source=live_mpc`, all actions shoot and disable
+spell, all three runs learned a 180-frame cycle online, and all native replays
+report `saved=true`, `verified=true`, and `group_finish=0`. This is `3/3` only
+for the executed seeds and is strict live-MPC-teacher evidence, not a claim
+about untested seeds, Boss #4, or a trained neural checkpoint. Reproduce one
+run by using the command above without the `--region-dynamics-memory` line and
+with a unique `--replay-name`.
+
+A visible native macOS OpenGL rerun at seed `20260730` also omitted memory and
+returned `attack_complete`, HP `6000 -> 0`, and death 0 after 3327 controlled
+frames. Its 1109 decisions exactly match the same-seed headless trace. The
+controller-fed overlay reports revision 3320 and the same 60-frame, 16/20/8
+configuration used by MPC. The ignored report
+`artifacts/engine-mpc-boss3-no-memory-visible-demo-20260804-seed20260730.json`
+has SHA-256
+`963df911ffa73f9509f97e48463ec517166ff8a8c3ffc1d2704db96c6e845bff`;
+its verified replay has SHA-256
+`9aa6f4afa27306660fe84f0dfafef77eace07ef1b09bb0b2c843c833bc6b76bb`
+and CRC32 `c3faa620`. Per-frame overlay rendering measured 27.73 median FPS
+overall, 27.35 for `OBJ >= 300`, and 14.89 minimum, so this is correctness
+evidence under lockstep rather than a 60-FPS performance claim.
+
 The fitted Boss #3 memory is versioned at
 `models/region_dynamics_boss3_v2.json`; training commands may still write new
 candidate memories and provenance reports under ignored `artifacts/` paths.
