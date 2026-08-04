@@ -122,6 +122,118 @@ Python Stage 5 Boss #3 场景只近似原符卡后段的移动、周期扩张危
 
 三局全部决策都是 `live_mpc`，全部动作保持开枪并禁用 spell，均在本局在线学出 180 帧周期；三份原生 replay 都是 `saved=true`、`verified=true`、`group_finish=0`。这是已执行 seed 的 `3/3` 严格 live-MPC-teacher 证据，不外推到其他 seed、Boss #4 或神经 checkpoint。
 
+连续全关测试使用独立的 `engine-mpc-campaign` 命令。它只发送一次
+`reset_campaign`，让原生流程自行从同一难度的 Stage 1 连续推进到 Stage 5，
+并在 `observation.campaign.stage_transition_count` 增加时清空场景局部轨迹、
+延迟画面、区域/空隙状态和 committed plan；控制器实例和游戏资源保持连续。
+campaign 元数据只负责生命周期边界，传入 MPC 前会被删除。命令不提供区域
+记忆、路线、checkpoint、动作前缀、reset option 或 replay 参数：
+
+```bash
+cd tools/stg_lab
+uv run stg-lab engine-mpc-campaign \
+  --host 127.0.0.1 --port 24816 \
+  --difficulty Lunatic --seed 20260804 \
+  --profile bullet-group-expert \
+  --max-frames 120000 --horizon-frames 60 --observation-delay 5 \
+  --no-render \
+  --output artifacts/no-memory-lunatic-campaign-seed20260804.json
+```
+
+只有顺序完成五关、每关均观察到真实活动敌人、最终原生转场返回
+`campaign_complete`、有限数值 `death=0`、恰好四次控制器边界清理、全部决策
+来源为 `live_mpc`、持续开枪且 `spell=false`、所有外置来源字段为 `null` 时才
+通过。达到帧上限、中弹、跳关、活动内容缺失或证据结构异常都会失败。THlib
+需要为每关分别记录初态，当前协议明确不支持把连续 campaign 保存成单个 replay。
+
+连续测试会在原生重置前和运行结束后各计算一次 Python 源码指纹；运行过程中若
+源码发生变化，即使游戏流程完成也会令严格结果失败。报告会额外保留终止关卡
+最后 24 帧原始权威观测和最后 8 次延迟 MPC 输入。这个有界窗口在每次原生转场
+时清空，只用于事后诊断，不会回送控制器，也不会成为跨关记忆。
+
+首轮 seed `20260804` 原生 Lunatic 诊断 campaign 在连续总帧 12550 完成
+Stage 1，随后于总帧 20173（Stage 2 timer 7624）中弹。该轮只有一次重置、
+同一个 MPC 实例、持续开枪、禁用 spell，且全部外置记忆字段为 `null`。最后
+两次决策预测碰撞 ETA 为 29 和 22，但实际弹丸在 6 个实时帧内命中，因而将
+“延迟画面中仍静止、当前帧已经启动”的弹丸预测定位为下一类失败。
+`no-memory-lunatic-campaign-gap-commit-v1-seed20260804.json` 只作为诊断证据：
+该轮运行中 Python 源码发生过变化，且当时尚未实现起止双指纹拒绝规则，不能
+作为严格验收产物。
+
+### 2026-08-04 无外置记忆全关工作暂停点
+
+本节记录暂停继续优化时的实际状态，不替代上述验收定义。本轮
+“无外置记忆”继续严格指：仅一次 `reset_campaign`、同一个实时 MPC、
+五帧观察延迟、三帧动作保持，且不读取 region memory、route、checkpoint、
+action prefix、replay 或 SQLite。每个动作必须 `shoot=true`、`spell=false`；
+只有五关按顺序完成、最终 `campaign_complete=true` 且有限数值 `death=0`
+才记为通过。
+
+当前已落地的通用实现包括：
+
+- `engine-mpc-campaign` 保留原生 Stage 1 -> 5 资源和流程，仅在真实关卡
+  边界清空轨迹、延迟队列、region/gap 状态和短期 plan；关卡元数据不进入
+  避弹输入。
+- 普通场景和 region 场景的 beam 都保留首动作与空间格多样性；当前
+  profile 为 `beam_width=512`、`beam_cell_size=8`。恒加速度外推默认关闭，
+  仅保留为显式消融开关，因为局部转向不能证明 60 帧内保持恒加速度。
+- 延迟启动弹模板只由本局可见的“静止 -> 运动”转换学习；当新弹在
+  学到的启动期限后仍静止时，预测会立即过期，不再把它永久当作即将启动的弹。
+- 平行弹组空隙、region 安全连通域、边界净空和 committed gap plan 均在
+  每次新可见几何上重验；关卡名、脚本 timer、固定帧号和预录坐标不参与决策。
+- live runner 已改为让轨迹估计器消费每一个成熟的延迟 source frame，
+  但 beam 仍每三帧只决策一次。重复的延迟填充帧会去重，同 source frame
+  的 `observe()`/`select()` 复用威胁缓存，campaign 转关时重置 feed。定向
+  MPC/play/campaign 集合共 150 项 Python 测试通过。
+
+截至暂停时的原生引擎证据如下。“存活延长”仍然记为失败：
+
+| 目标 / 配置 | 结束帧 | 严格终态 | 结论 |
+| --- | ---: | --- | --- |
+| Okuu Lunatic #4，关闭恒加速度 | 4295 | `attack_complete`、death 0 | 通过 |
+| Koishi Normal #1，512/8 空间 beam | 977 | `player_hit`、death 100 | 失败 |
+| Koishi Normal #1，边角余量 96 / 权重 0.5 | 1061 | `player_hit`、death 100 | 失败 |
+| Koishi Normal #1，逃生 plan 重验消融 | 1136 | `player_hit`、death 100 | 失败 |
+| Stage 1 Normal，早期无记忆基线 | 12838 | `stage_complete`、death 0 | 通过，历史实现 |
+| Stage 1 Lunatic，edge-gap v2 | 12974 | `stage_complete`、death 0 | 通过，历史实现 |
+| 当前 Lunatic campaign v4 | 11073 | Stage 1 `player_hit`、death 100 | 失败，0 次转关 |
+
+Okuu #4 报告为
+`no-memory-okuu4-no-accel-current-seed20260804.json`（SHA-256
+`e8f932add4bae7d8fad26f4477dc97433511e82bfc18c4f76ef8dff4e94fdba6`）。
+Koishi 三份报告的 SHA-256 依次为
+`fced5708fbe9ba575eb556f79eafc6401f2671de0e22006e16f607b4e0a1c74e`、
+`f872d103e12c9e741a8b3986328f759eb885cb2ac0769454ee042ee7c4ac4bef`、
+`0c550790fff653547097173d4424c9e5ce343ebf821256d124e865643319cfff`。
+campaign v4 报告 SHA-256 为
+`4c8f59135aa03b1e793d8c1da0dbfc9a72a39d7e61230d46a3c112d4c2cfe34b`。
+
+还没有新实现下的全关通过证据。较早的 Normal/Lunatic campaign 曾在完成
+Stage 1 后进入 Stage 2，分别于总帧 21970/20173 中弹；这只证明当时
+实现的 Stage 1 路径，不能与当前源码混合为“已通过前两关”。
+
+Koishi #1 的当前失败不是报告与引擎结果不一致。原生观测显示，多个静止
+可碰撞 `nontjt_enemies` 排成从中心伸向边界的六条链，把画面分成扇形连通域；
+内外两组心形弹同时沿径向非匀速运动。在 source frame 995 已找到零预测碰撞
+的长计划，但只执行首个三帧动作后，frame 998 的滚动重规划改向；旧计划剩余
+部分在新观测上仍为零碰撞，而新计划已预测必撞。通用逃生提交消融将存活
+从 1061 延长到 1136 帧，但最终仍把自机逼入右下角，因此没有合入为
+“已解决”策略。90 帧 horizon 诊断于 1061 帧失败，加强中心/纵向 anchor
+也只延长到 1068 帧。
+
+Stage 1 的另一个明确缺口是观察延迟窗口内才出生的弹。例如一次致命弹在
+source frame 10511 尚不存在，到权威 frame 10518 才出生；只用当局截止
+10511 的可见历史，可在线恢复约 2 帧发射周期、60 单位相对半径和
+`-21.5 deg/frame` 相位速度，对 10518 出生点的误差约 0.37 像素。
+工作树中已有一个匿名出生族预测原型：它尝试只从新可见轨迹、邻近可见 anchor、
+相对偏移、周期和相位生成 `spawn_forecast_inferred` 威胁，不应读取 class、timer、
+image、rot 或原始速度。但该原型在本次暂停前尚未完成 ID 打乱/复用、漏发撤销、
+邻近多发射体和原生 Stage 1 回归，不得将其写作已验证功能。
+
+暂停时没有保留运行中的训练、参数消融或 LuaSTG 服务器进程。下次继续时应先为
+匿名出生原型补完纯可见数据契约和单元测试，再独立回归 Stage 1、延迟启动弹、
+Koishi #1 与 Okuu #4；只有这些都不回归时才重启 Normal/Lunatic 连续全关。
+
 同一实现随后在原生 macOS OpenGL 窗口中用 seed `20260730` 可见重跑。控制命令仍完全省略 memory，覆盖层报告 `enabled=true`、`data_source=controller`、revision 3320，并使用控制器的 60 帧 horizon 和 16/20/8 阈值。结果为 3327 控制帧、1109 次 `live_mpc` 决策、`attack_complete`、Boss `6000 -> 0`、death 0；与同 seed 的 headless 决策轨迹逐条一致。报告 `tools/stg_lab/artifacts/engine-mpc-boss3-no-memory-visible-demo-20260804-seed20260730.json` 的 SHA-256 为 `963df911ffa73f9509f97e48463ec517166ff8a8c3ffc1d2704db96c6e845bff`；已验证 replay 的 SHA-256 为 `9aa6f4afa27306660fe84f0dfafef77eace07ef1b09bb0b2c843c833bc6b76bb`，CRC32 为 `c3faa620`。可见逐帧覆盖层运行的全程 FPS 中位数为 27.73，`OBJ >= 300` 密集段为 27.35，最低 14.89；这不影响 lockstep 正确性，但不能声称本轮可见演示达到 60 FPS。
 
 `train-region-dynamics` 从原生报告中读取 `source_frame`、可见区域半径，以及已记录控制器输入中的可碰撞不可摧毁物 `id/x/y`；`id` 只用于相邻画面匹配，产物不保存对象身份。训练器拒绝带录制动作、非 `live_mpc` 决策、authority shield 或未强制 `spell=false` 的来源，并将训练 provenance 与可加载记忆分开保存：
@@ -586,6 +698,62 @@ specialist 和 validation-best 候选均作为部署方案否决，而不是用�
 这份历史验收只证明文档定义的独立仿真门槛。规划器是精确状态教师；路线评估使用延迟可见 cue 和旧路线库，其动作不是神经 checkpoint 输出，也不是当前 Engine MPC 的记忆方案。Python 场景仍是近似，存活结果不等于原符卡击破，也不等于 AI 已在真实引擎中存活。
 
 原生 Engine MPC 的符卡单局成功标准只有：报告同时满足 `terminated=true`、`termination_reason=attack_complete`，以及显式、有限、非布尔的数值 `final_player.death=0`。由引擎确认 Boss 被击破或符卡完整结束均可；完整关卡则必须使用 `termination_reason=stage_complete` 并提供相同的零死亡证据。达到 `max_frames`、仅延长存活时间、只削减部分 Boss HP、死亡后完成，或缺少有效 death 证据，一律不计成功。所有动作必须保持 `spell=false`，并在每个有效逻辑帧保持 `shoot=true`。射击不改变自机速度或碰撞判定，把它与躲避净空耦合只会降低输出并延长危险暴露；旧射击阈值仅保留用于兼容已有命令与风险遥测，不再控制射击。新版 live runner 报告使用 schema 3，以 `shoot_command_frames`、`shoot_command_rate` 和 `continuous_fire` 表达发送给引擎的射击命令；schema 2 中语义错误的 `unsafe_shot_frames` 仅保留为 `null` 和弃用标记，移动规划的预测碰撞另行统计。带动作前缀的运行必须单列为“前缀辅助复现”，不能混入无前缀成功率。
+
+### 2026-08-04 Boss #3 真人行为校准
+
+`humanlike` profile 的目标是先保留原生严格击破，再缩小与成功真人 replay
+的运动差异。控制器仍只使用五帧延迟可见信息、在线运动估计和本局状态；本轮
+三局均没有传入 `--region-dynamics-memory`、路线、动作前缀或 checkpoint。
+`slot2.rep` 和 `slot3.rep` 仅由 replay 分析器产生报告，不会成为控制器输入。
+
+`slot2` 在第 2579 帧撞到强制区域，Boss 余 1190.5 HP；死亡前区域净空从
+`9.49 -> 4.64 -> -1.10`，而子弹净空仍为 84.58。`slot3` 在第 3236 帧
+严格击破。成功真人通常保持低速和较长稳定方向段，区域换边次数与 AI 接近，
+所以差异主要是局部重规划抖动，而不是安全区周期或换边逻辑错误。
+
+| 实际 replay 指标 | 成功真人 `slot3` | AI v12 | AI v14 |
+| --- | ---: | ---: | ---: |
+| 帧数 / 路径 | 3236 / 4939.79 | 3281 / 6366.70 | 3291 / 6178.90 |
+| 移动占比 / 低速占比 | 64.43% / 86.31% | 73.06% / 73.64% | 68.92% / 72.17% |
+| 底边钳制占比 / 平均 Y | 55.72% / -195.22 | 22.25% / -192.90 | 34.82% / -195.55 |
+| 移动中变向 / `>=90` / `>90` | 168 / 6 / 0 | 298 / 172 / 69 | 278 / 164 / 79 |
+| 精确反向 / 低速状态切换 | 0 / 72 | 22 / 251 | 24 / 251 |
+| 总净空 P10 / 区域净空 P10 | 12.17 / 12.96 | 11.17 / 11.12 | 11.56 / 11.94 |
+
+v14 修正了 `bottom_anchor_enabled` 在区域导航中的语义：只有当自机已经位于
+目标 `exterior:left/right` 连通区且模式为 `settle` 时，区域锚点才回到有效
+底边；`preposition`、`evacuate`、强制穿越、gap 入口和碰撞优先级完全不变。
+这使代表 seed 的路径缩短 2.95%，移动占比下降 4.14 个百分点，底边驻留增加
+12.57 个百分点，并修复 v12 在 seed `20260732` 第 2630 帧的区域碰撞。
+
+最终源码指纹为
+`0a67effb8e54225e0bcc7209902cacd7068f17dc386c68bbde2394a22aac9a1e`。
+三次原生 arm64 macOS headless 运行都使用 60 帧 horizon、五帧观察延迟、
+持续射击、禁用 spell、无外置区域记忆，并满足唯一严格成功标准：
+
+| seed | replay 帧 / 路径 | 终态 | replay CRC32 | 报告 SHA-256 |
+| ---: | ---: | --- | --- | --- |
+| 20260730 | 3291 / 6178.90 | `attack_complete`、HP 0、death 0 | `be0090d2` | `a3a69309078e83ff2646ee69fb55b3f6c8e4dc308992230e58cc8a5a98967181` |
+| 20260731 | 3278 / 6223.50 | `attack_complete`、HP 0、death 0 | `f44782c7` | `3c06e2dc8a4ef0c04656777e77613506c04702c022b508becbe5744f32ce7987` |
+| 20260732 | 3301 / 6582.41 | `attack_complete`、HP 0、death 0 | `3dd61d1c` | `7478675195b2ac1a6f66fb0ae36835a83225fc5f0e6b76346c8361e3cbec03bc` |
+
+三份 replay 都是 `saved=true`、`verified=true`、射击率 100%。对应 replay
+SHA-256 依次为 `f0c07634ac2aeb41a8fd49133fd0e9e2bcfe85097829bf338945edf40e913fb5`、
+`b98bd4ef36bc94aecab82151fdf0d677bd9a8160119e3ac6fada9ea201006fa2` 和
+`cb1fab256c947d70d38f5a170c8501911eb6237d9f4fe583bb7c3b97af0fb7cc`。
+这是已执行 seed 的 `3/3`，不是未测试 seed 的统计成功率。
+
+两个看似更平滑的消融被严格拒绝。按低速路程估算区域 deadline 的 v13 在
+第 1917 帧撞区域，Boss 余 2558 HP；在每次锐角转向前强插安全中间方向的
+v15 在第 2270 帧撞区域，Boss 余 1869 HP。后者代码已从最终源码删除；
+60 帧内“不更差”不足以保证三帧扰动后仍进入同一未来连通区。低速 deadline
+和 neutral-beat 实验开关保持默认关闭。不能用延长存活时间替代击破结果。
+
+v14 改善了路径、移动比例、底边驻留和跨 seed 稳健性，但 `>90` 转向、精确
+反向和低速切换仍明显差于真人，因此不声明达到真人水平。下一阶段应从成功
+真人 replay 构建带同步可见观测的训练数据，让 recurrent policy 学习动作
+持续性；仅有坐标轨迹的分析报告不能安全地反推出当时可见输入，也不能作为
+录制路线记忆注入当前 MPC。
 
 ### 当前原生 Boss #3 严格结果
 

@@ -98,6 +98,38 @@ class EngineClient:
             payload["replay_name"] = replay_name
         return self.request("reset_stage", **payload)
 
+    def reset_campaign(
+        self,
+        difficulty: str,
+        *,
+        seed: int,
+        player: str = "reimu_player",
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start one continuous Stage 1-5 campaign without replay input."""
+
+        if difficulty not in {"Normal", "Lunatic"}:
+            raise ValueError("difficulty must be Normal or Lunatic")
+        reset_options = dict(options or {})
+        if reset_options:
+            raise ValueError("campaign reset options must be empty")
+        return self.request(
+            "reset_campaign",
+            difficulty=difficulty,
+            seed=seed,
+            player=player,
+            options=reset_options,
+        )
+
+    def reset_replay(self, path: str) -> dict[str, Any]:
+        """Start deterministic playback of one bridge-supported native replay."""
+
+        if not isinstance(path, str) or not path:
+            raise ValueError("replay path must be a nonempty string")
+        if "\x00" in path:
+            raise ValueError("replay path cannot contain NUL")
+        return self.request("reset_replay", path=path)
+
     def ping(self) -> dict[str, Any]:
         return self.request("ping")
 

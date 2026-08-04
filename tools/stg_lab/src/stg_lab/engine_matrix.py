@@ -30,7 +30,9 @@ from .provenance import file_sha256, source_tree_sha256
 from .vision import VisionConfig
 
 
-_CURRENT_PROFILE: dict[str, float | int] = {
+_CURRENT_PROFILE: dict[str, float | int | bool] = {
+    "beam_width": 512,
+    "beam_cell_size": 8.0,
     "danger_margin_target": 16.0,
     "safe_margin_target": 20.0,
     "region_safe_margin_target": 8.0,
@@ -39,9 +41,38 @@ _CURRENT_PROFILE: dict[str, float | int] = {
     "switch_margin_gain": 8.0,
 }
 
-_PROFILE_OVERRIDES: dict[str, Mapping[str, float | int]] = {
+_HUMANLIKE_PROFILE: dict[str, float | int | bool] = {
+    **_CURRENT_PROFILE,
+    "beam_width": 256,
+    "region_beam_width": 256,
+    "minimum_direction_hold_frames": 6,
+    # A bottom wait point and short focused corrections match the successful
+    # human replay without weakening collision and deadline ordering.
+    "preferred_y_fraction": 0.0,
+    "vertical_anchor_weight": 0.5,
+    "bottom_anchor_enabled": True,
+    "boss_alignment_weight": 0.25,
+    "region_anchor_weight": 0.75,
+    "region_path_weight": 0.01,
+    "region_urgency_lead_frames": 60,
+    "region_nearest_waypoint_enabled": True,
+    "region_safe_margin_target": 12.0,
+    "portal_clearance": 8.0,
+    "direction_switch_penalty": 4.0,
+    "direction_reverse_penalty": 12.0,
+    "direction_sharp_turn_penalty": 12.0,
+    "direction_aba_penalty": 8.0,
+    "speed_switch_penalty": 1.5,
+    "sharp_turn_neutral_beat_enabled": False,
+    "moving_action_penalty": 1.0,
+    "fast_action_penalty": 6.0,
+}
+
+_PROFILE_OVERRIDES: dict[str, Mapping[str, float | int | bool]] = {
     # Conservative hysteresis used by the current Boss #3 controller.
     "current": _CURRENT_PROFILE,
+    # Human movement prior calibrated against the successful slot3 replay.
+    "humanlike": _HUMANLIKE_PROFILE,
     # General-purpose hysteresis recovered from the strict Orin #4 success.
     "general": {
         "danger_margin_target": 16.0,
@@ -331,9 +362,24 @@ def select_catalog_targets(
     return tuple(selected)
 
 
+def _strict_json_value(value: Any) -> Any:
+    """Represent unbounded diagnostics as null in strict JSON traces."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _strict_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_strict_json_value(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return (json.dumps(
-        value,
+        _strict_json_value(value),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

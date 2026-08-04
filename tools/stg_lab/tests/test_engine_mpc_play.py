@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import inspect
+import json
 from typing import Any, Mapping
 
 import pytest
@@ -237,6 +238,31 @@ class PredictedCollisionMPC(EngineMPC):
         return replace(decision, evaluations=evaluations)
 
 
+class ObservationCadenceMPC(EngineMPC):
+    def __init__(self, config: MPCConfig) -> None:
+        self.observed_source_frames: list[int] = []
+        self.selected_source_frames: list[int] = []
+        self.selected_current_frames: list[int] = []
+        super().__init__(config)
+
+    @staticmethod
+    def _frame(observed: Mapping[str, Any], field: str) -> int:
+        value = observed.get(field)
+        assert isinstance(value, int) and not isinstance(value, bool)
+        return value
+
+    def observe(self, observed: Mapping[str, Any]) -> int:
+        self.observed_source_frames.append(self._frame(observed, "episode_frame"))
+        return super().observe(observed)
+
+    def select(self, observed: Mapping[str, Any]) -> MPCDecision:
+        self.selected_source_frames.append(self._frame(observed, "episode_frame"))
+        self.selected_current_frames.append(
+            self._frame(observed, "own_player_observation_frame")
+        )
+        return super().select(observed)
+
+
 def test_controller_observation_delays_hazards_but_not_own_player() -> None:
     delayed = observation(10)
     delayed["player"]["x"] = -40.0
@@ -254,6 +280,33 @@ def test_controller_observation_delays_hazards_but_not_own_player() -> None:
     assert visible["own_player_observation_frame"] == 15
     assert "performance" not in visible
     assert "safety_zone_overlay" not in visible
+
+
+def test_runner_observes_each_matured_frame_but_selects_every_three() -> None:
+    client = FakeEngineClient(terminate_at=99)
+    controller = ObservationCadenceMPC(MPCConfig(
+        observation_delay=2,
+        horizon_frames=36,
+        beam_width=8,
+        region_beam_width=16,
+    ))
+
+    report = run_engine_mpc_play(
+        client,  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        controller=controller,
+        config=EngineMPCPlayConfig(max_frames=8, observation_delay=2),
+    )
+
+    assert controller.observed_source_frames == list(range(7))
+    assert controller.selected_source_frames == [0, 1, 4]
+    assert controller.selected_current_frames == [0, 3, 6]
+    assert [value["start_episode_frame"] for value in report["decisions"]] == [
+        0, 3, 6,
+    ]
 
 
 def test_attack_complete_is_strict_live_policy_success() -> None:
@@ -297,6 +350,7 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
         "predicted_minimum_nonregion_margin" in item
         and "predicted_minimum_region_margin" in item
         and "predicted_immediate_corner_clearance" in item
+        and "region_focus_deadline_slack" in item
         and item["gap_bullet_group_count"] == 0
         and item["gap_corridor_count"] == 0
         and item["gap_selected_center"] is None
@@ -334,6 +388,11 @@ def test_attack_complete_is_strict_live_policy_success() -> None:
     assert first_overlay_state is not None
     assert first_overlay_state["schema_version"] == 1
     assert first_overlay_state["region_navigation_active"] is False
+    json.dumps(report, allow_nan=False)
+    assert all(
+        item["predicted_minimum_margin"] is None
+        for item in report["decisions"]
+    )
 
 
 @pytest.mark.parametrize("replay_name", [

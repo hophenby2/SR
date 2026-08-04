@@ -939,6 +939,30 @@ def _command_engine_test(args: argparse.Namespace) -> int:
     return 0 if report["passed"] else 1
 
 
+def _command_engine_replay_analyze(args: argparse.Namespace) -> int:
+    from .engine import EngineClient
+    from .engine_replay_analysis import (
+        EngineReplayAnalysisConfig,
+        run_engine_replay_analysis,
+    )
+
+    config = EngineReplayAnalysisConfig(
+        max_frames=args.max_frames,
+        render=args.render,
+        render_every=args.render_every,
+        timeline_every=args.timeline_every,
+        region_grid_cell_size=args.region_grid_cell_size,
+    )
+    with EngineClient.connect(args.host, args.port, timeout=args.timeout) as client:
+        report = run_engine_replay_analysis(
+            client,
+            replay_path=args.replay,
+            config=config,
+        )
+    _emit_json(report, args.output)
+    return 0 if report["analysis_complete"] else 1
+
+
 def _command_engine_play(args: argparse.Namespace) -> int:
     from .engine import EngineClient
     from .engine_play import (
@@ -1194,6 +1218,47 @@ def _command_engine_mpc_play(args: argparse.Namespace) -> int:
                 "saved": False,
                 "reason": "episode did not satisfy strict native success",
             }
+    _emit_json(report, args.output)
+    return 0 if report["passed"] else 1
+
+
+def _command_engine_mpc_campaign(args: argparse.Namespace) -> int:
+    from .engine import EngineClient
+    from .engine_matrix import apply_controller_profile
+    from .engine_mpc import EngineMPC, MPCConfig
+    from .engine_mpc_campaign import (
+        EngineMPCCampaignConfig,
+        run_engine_mpc_campaign,
+    )
+
+    controller = EngineMPC(apply_controller_profile(
+        args.profile,
+        MPCConfig(
+            horizon_frames=args.horizon_frames,
+            observation_delay=args.observation_delay,
+            boundary_weight=args.boundary_weight,
+            boss_alignment_weight=args.boss_alignment_weight,
+            stale_track_frames=args.stale_track_frames,
+            gap_prediction_enabled=args.gap_prediction,
+            region_dynamics_memory=None,
+        ),
+    ))
+    config = EngineMPCCampaignConfig(
+        max_frames=args.max_frames,
+        observation_delay=args.observation_delay,
+        render=args.render,
+        render_every=args.render_every,
+    )
+    with EngineClient.connect(args.host, args.port, timeout=args.timeout) as client:
+        report = run_engine_mpc_campaign(
+            client,
+            difficulty=args.difficulty,
+            seed=args.seed,
+            player=args.player,
+            controller=controller,
+            config=config,
+        )
+    report["profile"] = args.profile
     _emit_json(report, args.output)
     return 0 if report["passed"] else 1
 
@@ -2083,6 +2148,40 @@ def build_parser() -> argparse.ArgumentParser:
     engine_parser.add_argument("--output", type=Path)
     engine_parser.set_defaults(handler=_command_engine_test)
 
+    replay_analysis_parser = subparsers.add_parser(
+        "engine-replay-analyze",
+        help="replay a native Spell Practice file and summarize live telemetry",
+    )
+    replay_analysis_parser.add_argument("--host", default="127.0.0.1")
+    replay_analysis_parser.add_argument("--port", type=int, default=24816)
+    replay_analysis_parser.add_argument("--timeout", type=float, default=30.0)
+    replay_analysis_parser.add_argument(
+        "--replay",
+        required=True,
+        help="path visible to the LuaSTG process; Windows/Wine paths are accepted",
+    )
+    replay_analysis_parser.add_argument("--max-frames", type=int, default=120_000)
+    replay_analysis_parser.add_argument(
+        "--timeline-every",
+        type=int,
+        default=1,
+        help="retain one compact telemetry row every N replay frames",
+    )
+    replay_analysis_parser.add_argument(
+        "--region-grid-cell-size",
+        type=float,
+        default=16.0,
+        help="cell size for indestructible-region connectivity analysis",
+    )
+    replay_analysis_parser.add_argument(
+        "--render",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    replay_analysis_parser.add_argument("--render-every", type=int, default=1)
+    replay_analysis_parser.add_argument("--output", type=Path)
+    replay_analysis_parser.set_defaults(handler=_command_engine_replay_analyze)
+
     engine_play_parser = subparsers.add_parser(
         "engine-play",
         help="demonstrate a delayed-visible controller in a live attack or stage",
@@ -2280,6 +2379,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     engine_mpc_parser.add_argument("--output", type=Path)
     engine_mpc_parser.set_defaults(handler=_command_engine_mpc_play)
+
+    engine_campaign_parser = subparsers.add_parser(
+        "engine-mpc-campaign",
+        help=(
+            "run one continuous memory-free Stage 1-5 campaign under live MPC"
+        ),
+    )
+    engine_campaign_parser.add_argument("--host", default="127.0.0.1")
+    engine_campaign_parser.add_argument("--port", type=int, default=24816)
+    engine_campaign_parser.add_argument("--timeout", type=float, default=30.0)
+    engine_campaign_parser.add_argument(
+        "--difficulty", choices=("Normal", "Lunatic"), default="Lunatic",
+    )
+    engine_campaign_parser.add_argument("--seed", type=int, default=20260729)
+    engine_campaign_parser.add_argument("--player", default="reimu_player")
+    engine_campaign_parser.add_argument(
+        "--profile",
+        choices=available_engine_profiles(),
+        default="bullet-group-expert",
+        help="named in-source live MPC parameter profile",
+    )
+    engine_campaign_parser.add_argument("--max-frames", type=int, default=120000)
+    engine_campaign_parser.add_argument("--horizon-frames", type=int, default=60)
+    engine_campaign_parser.add_argument("--observation-delay", type=int, default=5)
+    engine_campaign_parser.add_argument("--boundary-weight", type=float, default=1.0)
+    engine_campaign_parser.add_argument(
+        "--boss-alignment-weight", type=float, default=1.0,
+    )
+    engine_campaign_parser.add_argument("--stale-track-frames", type=int, default=48)
+    engine_campaign_parser.add_argument(
+        "--gap-prediction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="predict traversable gaps from parallel visible bullet groups",
+    )
+    engine_campaign_parser.add_argument(
+        "--render", action=argparse.BooleanOptionalAction, default=False,
+    )
+    engine_campaign_parser.add_argument("--render-every", type=int, default=1)
+    engine_campaign_parser.add_argument("--output", type=Path, required=True)
+    engine_campaign_parser.set_defaults(handler=_command_engine_mpc_campaign)
 
     engine_dagger_parser = subparsers.add_parser(
         "engine-dagger-play",

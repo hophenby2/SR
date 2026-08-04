@@ -324,6 +324,129 @@ three verified native replays are retained as ignored local analysis output.
 This is 3/3 for the executed seeds only and remains teacher, not neural-policy,
 evidence.
 
+Continuous whole-run evaluation uses the separate `engine-mpc-campaign`
+command. It sends one `reset_campaign`, retains one `EngineMPC` instance while
+native gameplay advances through Stage 1-5, and clears scene-local geometry,
+delayed frames, region/gap state, and committed plans when
+`observation.campaign.stage_transition_count` advances. Campaign metadata is
+used only for lifecycle boundaries and removed before MPC selection. The CLI
+has no region-memory, route, checkpoint, action-prefix, reset-option, or replay
+surface. Strict success requires all five ordered stages with active content,
+native `campaign_complete`, finite death 0, four intermediate boundary clears,
+only `live_mpc` decisions, continuous fire with spell disabled, and null
+external-memory fields. THlib campaign replay remains unsupported because each
+native stage needs its own serialized initial state and frame record.
+
+Campaign reports record the Python source fingerprint at both ends of the run;
+any in-run source drift makes the strict result fail. For terminal diagnosis,
+the report keeps a bounded window containing the last 24 raw authority
+observations and eight delayed MPC inputs from the final stage. The window is
+cleared on every native stage transition and is output evidence only, not
+controller memory.
+
+The first native Lunatic diagnostic campaign at seed `20260804` completed
+Stage 1 at continuous episode frame 12550, then was hit in Stage 2 at frame
+20173 (Stage 2 timer 7624). It used one reset, one MPC instance, continuous
+fire, no spell, and null external-memory fields. The last two decisions
+forecast collisions at ETA 29 and 22, but a bullet reached the player within
+six live frames, identifying delayed stationary-to-moving launch prediction as
+the next failure class. `no-memory-lunatic-campaign-gap-commit-v1-seed20260804.json`
+is diagnostic evidence only: Python source changed while that run was active,
+before the dual-fingerprint rejection rule existed, so it is not a strict
+acceptance artifact.
+
+### 2026-08-04 memory-free campaign pause point
+
+This section records the working state when further optimization was paused; it
+does not replace the acceptance definition above. Here, memory-free still means
+one `reset_campaign`, one live MPC instance, five frames of observation delay,
+three-frame action holds, and no region memory, route, checkpoint, action
+prefix, replay, or SQLite input. Every action must have `shoot=true` and
+`spell=false`. Only all five stages in order, native
+`campaign_complete=true`, and finite numeric `death=0` count as a pass.
+
+The current general implementation includes:
+
+- `engine-mpc-campaign` preserves the native Stage 1-5 resources and flow. It
+  clears tracks, delayed inputs, region/gap state, and short plans only at real
+  stage boundaries; stage metadata is not exposed to dodging decisions.
+- Ordinary and region-aware beams retain first-action and spatial-cell
+  diversity. The active profile uses `beam_width=512` and `beam_cell_size=8`.
+  Constant-acceleration extrapolation is off by default and remains an explicit
+  ablation because a local turn does not justify 60 frames of constant
+  acceleration.
+- Delayed-launch templates are learned only from visible stationary-to-moving
+  transitions in the current run. A still-stationary bullet is withdrawn from
+  prediction once its learned launch deadline has passed.
+- Parallel-wave gaps, connected safe regions, boundary clearance, and committed
+  gap plans are revalidated against each new visible geometry. Stage names,
+  script timers, fixed frame numbers, and recorded coordinates are not inputs.
+- The live runner now feeds every newly matured delayed source frame through
+  the trajectory observer while selecting a beam action only once per three
+  native frames. Duplicate delay-padding frames are skipped, same-source
+  observation and selection share the threat cache, and campaign feeds reset
+  at stage boundaries. The focused MPC/play/campaign suite passed 150 tests.
+
+Native-engine evidence at the pause point is below. Longer survival still
+counts as failure:
+
+| Target / configuration | End frame | Strict terminal state | Result |
+| --- | ---: | --- | --- |
+| Okuu Lunatic #4, constant acceleration off | 4295 | `attack_complete`, death 0 | Pass |
+| Koishi Normal #1, 512/8 spatial beam | 977 | `player_hit`, death 100 | Fail |
+| Koishi Normal #1, corner reserve 96 / weight 0.5 | 1061 | `player_hit`, death 100 | Fail |
+| Koishi Normal #1, escape-plan revalidation ablation | 1136 | `player_hit`, death 100 | Fail |
+| Stage 1 Normal, earlier memory-free baseline | 12838 | `stage_complete`, death 0 | Pass, historical source |
+| Stage 1 Lunatic, edge-gap v2 | 12974 | `stage_complete`, death 0 | Pass, historical source |
+| Current Lunatic campaign v4 | 11073 | Stage 1 `player_hit`, death 100 | Fail, zero transitions |
+
+The Okuu #4 report is
+`no-memory-okuu4-no-accel-current-seed20260804.json`, SHA-256
+`e8f932add4bae7d8fad26f4477dc97433511e82bfc18c4f76ef8dff4e94fdba6`.
+The three Koishi report hashes are
+`fced5708fbe9ba575eb556f79eafc6401f2671de0e22006e16f607b4e0a1c74e`,
+`f872d103e12c9e741a8b3986328f759eb885cb2ac0769454ee042ee7c4ac4bef`,
+and `0c550790fff653547097173d4424c9e5ce343ebf821256d124e865643319cfff`.
+The campaign v4 report hash is
+`4c8f59135aa03b1e793d8c1da0dbfc9a72a39d7e61230d46a3c112d4c2cfe34b`.
+
+There is no whole-campaign pass on the current source. Earlier Normal and
+Lunatic campaigns entered Stage 2 after completing Stage 1, then were hit at
+total frames 21970 and 20173 respectively. Those runs establish only the older
+Stage 1 behavior and cannot be combined with current-source evidence into a
+claim that the first two stages pass.
+
+Koishi #1 is a real controller failure, not a mismatch between the report and
+the engine result. Six chains of visible, stationary, collidable
+`nontjt_enemies` divide the playfield into wedge-shaped connected components,
+while two heart-bullet sets move non-uniformly in opposite radial directions.
+At source frame 995 the controller had a long collision-free plan. After the
+first three-frame action, rolling replanning changed direction at frame 998
+although the old remainder still revalidated collision-free and the replacement
+predicted a collision. Generic escape commitment extended survival from 1061 to
+1136 frames but ended in the lower-right corner, so it is not a solved result.
+A 90-frame horizon failed at 1061; stronger center/vertical anchoring reached
+only 1068.
+
+Stage 1 also exposes bullets born entirely inside the observation-delay window.
+One fatal bullet was absent at source frame 10511 and present by authority frame
+10518. Visible history through 10511 was sufficient to infer an approximately
+two-frame emission period, 60-unit relative radius, `-21.5 deg/frame` phase
+rate, and about 0.37-pixel birth-position error. The worktree contains an
+anonymous spawn-family prototype that derives `spawn_forecast_inferred` threats
+from newly visible tracks, nearby visible anchors, relative offsets, period,
+and phase. It is intended not to use class, timer, image, rotation, or raw
+velocity metadata. It has not yet been validated for shuffled or reused IDs,
+withdrawal after two missed emissions, nearby multiple emitters, metadata
+invariance, or native Stage 1 regression, and must not be described as a
+completed Stage 1 fix.
+
+No training, parameter ablation, or LuaSTG server process was left running at
+the pause point. When work resumes, the next step is to complete the prototype's
+visible-data contract and unit coverage, then independently regress Stage 1,
+delayed launch, Koishi #1, and Okuu #4 before restarting continuous Normal or
+Lunatic campaigns.
+
 The same implementation was then rerun visibly in the native macOS OpenGL
 window at seed `20260730`, still without a memory option. It completed in 3327
 controlled frames with `attack_complete`, HP `6000 -> 0`, and death 0. Its 1109
@@ -590,6 +713,76 @@ hysteresis, and the committed-plan safety gate. The working report SHA-256 is
 `ffc69082eefd2501d473981689eddd4fcfb67a0152a5723b9f099a46c7bbd901`.
 This is an open-loop five-observation complete-planner ablation, not an
 `attack_complete` success rate.
+
+### 2026-08-04 Boss #3 human-behavior calibration
+
+The `humanlike` profile first preserves strict native completion, then reduces
+movement differences from a successful human replay. The controller still uses
+only five-frame-delayed visible information, online motion estimates, and
+episode-local state. None of the three final runs supplied region-dynamics
+memory, a route, an action prefix, or a checkpoint. `slot2.rep` and `slot3.rep`
+are analysis inputs only and are never read by the controller.
+
+`slot2` hit a forced region at frame 2579 with 1190.5 boss HP remaining. Its
+region clearance fell `9.49 -> 4.64 -> -1.10` while bullet clearance was still
+84.58. `slot3` strictly completed at frame 3236. The successful human stays
+focused and holds directions longer; region-side changes are already close to
+the AI, locating the main mismatch in local replanning jitter rather than cycle
+or side-selection logic.
+
+| Executed-replay metric | successful `slot3` | AI v12 | AI v14 |
+| --- | ---: | ---: | ---: |
+| Frames / path | 3236 / 4939.79 | 3281 / 6366.70 | 3291 / 6178.90 |
+| Moving / focused | 64.43% / 86.31% | 73.06% / 73.64% | 68.92% / 72.17% |
+| Bottom-clamped / mean Y | 55.72% / -195.22 | 22.25% / -192.90 | 34.82% / -195.55 |
+| Moving turns / `>=90` / `>90` | 168 / 6 / 0 | 298 / 172 / 69 | 278 / 164 / 79 |
+| Exact reversals / focus-mode changes | 0 / 72 | 22 / 251 | 24 / 251 |
+| All-clearance P10 / region P10 | 12.17 / 12.96 | 11.17 / 11.12 | 11.56 / 11.94 |
+
+v14 makes `bottom_anchor_enabled` apply consistently during region navigation.
+Only when the player is already in the target `exterior:left/right` component
+and navigation mode is `settle` does the region anchor return to the effective
+floor. `preposition`, `evacuate`, forced crossings, certified gap entry, and all
+collision/deadline priorities are unchanged. On the representative seed this
+reduced path by 2.95%, moving time by 4.14 percentage points, increased
+bottom-clamped time by 12.57 points, and fixed v12's seed-`20260732` region hit
+at frame 2630.
+
+The final source fingerprint is
+`0a67effb8e54225e0bcc7209902cacd7068f17dc386c68bbde2394a22aac9a1e`.
+Three native arm64 macOS headless runs used a 60-frame horizon, five frames of
+observation delay, continuous fire, forced spell-off, and no external region
+memory. Each met the sole strict success criterion:
+
+| Seed | Replay frames / path | Terminal state | Replay CRC32 | Report SHA-256 |
+| ---: | ---: | --- | --- | --- |
+| 20260730 | 3291 / 6178.90 | `attack_complete`, HP 0, death 0 | `be0090d2` | `a3a69309078e83ff2646ee69fb55b3f6c8e4dc308992230e58cc8a5a98967181` |
+| 20260731 | 3278 / 6223.50 | `attack_complete`, HP 0, death 0 | `f44782c7` | `3c06e2dc8a4ef0c04656777e77613506c04702c022b508becbe5744f32ce7987` |
+| 20260732 | 3301 / 6582.41 | `attack_complete`, HP 0, death 0 | `3dd61d1c` | `7478675195b2ac1a6f66fb0ae36835a83225fc5f0e6b76346c8361e3cbec03bc` |
+
+All three replays report `saved=true`, `verified=true`, and 100% firing. Their
+SHA-256 values are respectively
+`f0c07634ac2aeb41a8fd49133fd0e9e2bcfe85097829bf338945edf40e913fb5`,
+`b98bd4ef36bc94aecab82151fdf0d677bd9a8160119e3ac6fada9ea201006fa2`,
+and `cb1fab256c947d70d38f5a170c8501911eb6237d9f4fe583bb7c3b97af0fb7cc`.
+This is 3/3 only among executed seeds, not a statistical success claim.
+
+Two apparently smoother ablations were strictly rejected. v13 estimated region
+deadlines from focused-speed reachability and hit a region at frame 1917 with
+2558 HP remaining. v15 inserted a safe intermediate direction before obtuse
+turns and hit a region at frame 2270 with 1869 HP remaining. The latter code was
+removed from the final source: being no worse over the current 60-frame forecast
+does not prove that a three-frame perturbation reaches the same future connected
+component. Focus-deadline and neutral-beat experiment switches remain disabled.
+Longer survival never substitutes for attack completion.
+
+v14 improves path, moving time, bottom dwell, and three-seed robustness, but
+obtuse turns, exact reversals, and focus-mode changes remain far from the human
+trace. It therefore does not claim human-level behavior. A later learned-policy
+iteration should capture synchronized visible observations while replaying
+successful human inputs and train action persistence in the recurrent model.
+Coordinate-only analysis cannot reconstruct what was visible at each decision
+and must not be injected into MPC as recorded route memory.
 
 ### Strict native Boss #3 results
 

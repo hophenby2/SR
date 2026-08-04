@@ -114,7 +114,13 @@ def test_linear_bullet_prediction_avoids_neutral_collision() -> None:
         bullets=[bullet(1, 0.0, 24.0, dx=0.0, dy=-2.0)],
     ))
 
-    neutral = evaluation(decision, move_x=0, move_y=0, slow=True)
+    neutral = teacher._evaluate(
+        movement_actions()[0],
+        (0.0, 0.0, 0.5, 4.0, 2.0),
+        (-100.0, 100.0, -100.0, 100.0),
+        decision.threats,
+        None,
+    )
     selected = next(item for item in decision.evaluations if item.action == decision.action)
     assert neutral.collided is True
     assert selected.collided is False
@@ -171,6 +177,11 @@ def test_controller_overlay_state_uses_live_decision_and_phase_envelope() -> Non
         "radius_rate": decision.threats[0].radius_rate,
         "radius_rate_horizon": decision.threats[0].radius_rate_horizon,
         "motion_horizon": decision.threats[0].motion_horizon,
+        "motion_start_delay": decision.threats[0].motion_start_delay,
+        "launch_motion_inferred": decision.threats[0].launch_motion_inferred,
+        "ax": decision.threats[0].ax,
+        "ay": decision.threats[0].ay,
+        "acceleration_horizon": decision.threats[0].acceleration_horizon,
     }]
     json.dumps(state, allow_nan=False)
 
@@ -323,9 +334,36 @@ def test_visible_displacement_and_growing_radius_are_extrapolated_by_id() -> Non
         3,
         bullets=[bullet(9, 18.0, 0.0, a=8.0, b=8.0)],
     ))
-    neutral = evaluation(decision, move_x=0, move_y=0, slow=True)
+    neutral = teacher._evaluate(
+        movement_actions()[0],
+        (0.0, 0.0, 0.5, 4.0, 2.0),
+        (-100.0, 100.0, -100.0, 100.0),
+        decision.threats,
+        None,
+    )
     assert neutral.collided is True
     assert neutral.earliest_collision_frame is not None
+
+
+def test_consistent_visible_acceleration_extends_only_with_online_evidence() -> None:
+    estimator = VisibleTrackEstimator(MPCConfig(
+        observation_delay=0,
+        motion_dynamics_enabled=True,
+    ))
+    estimator.update(observation(0, bullets=[bullet(11, 0.0, 0.0)]))
+    estimator.update(observation(3, bullets=[bullet(11, 3.0, 0.0)]))
+    estimator.update(observation(6, bullets=[bullet(11, 9.0, 0.0)]))
+    threat = estimator.update(observation(
+        9,
+        bullets=[bullet(11, 18.0, 0.0)],
+    ))[0]
+
+    assert threat.vx == pytest.approx(3.0)
+    assert threat.vy == pytest.approx(0.0)
+    assert threat.ax == pytest.approx(1.0 / 3.0)
+    assert threat.ay == pytest.approx(0.0)
+    assert threat.acceleration_horizon == 12
+    assert threat.at(3)[:2] == pytest.approx((28.5, 0.0))
 
 
 def test_nuke_radius_uses_the_learned_maximum_envelope_at_float_oscillation() -> None:
@@ -432,6 +470,99 @@ def test_dx_and_observation_delay_compensate_to_estimated_current_position() -> 
     predicted = displacement.update(observation(3, bullets=[bullet(5, -8.0, 0.0)]))[0]
     assert predicted.vx == 4.0
     assert predicted.x == 12.0
+
+
+def test_delayed_launch_is_learned_from_episode_local_visible_transitions() -> None:
+    estimator = VisibleTrackEstimator(MPCConfig(
+        observation_delay=5,
+        launch_template_min_samples=3,
+    ))
+    stationary = [
+        bullet(object_id, x, 0.0, dx=0.0, dy=0.0)
+        for object_id, x in ((1, -12.0), (2, 0.0), (3, 12.0))
+    ]
+    estimator.update(observation(0, bullets=stationary))
+    estimator.update(observation(3, bullets=stationary))
+    moving = [
+        bullet(object_id, x + 6.0, 0.0, dx=2.0, dy=0.0)
+        for object_id, x in ((1, -12.0), (2, 0.0), (3, 12.0))
+    ]
+    launched = estimator.update(observation(6, bullets=moving))
+    assert all(threat.launch_motion_inferred is False for threat in launched)
+
+    warnings = estimator.update(observation(9, bullets=[
+        bullet(object_id, x, 0.0, dx=0.0, dy=0.0)
+        for object_id, x in ((4, -11.0), (5, 1.0), (6, 13.0))
+    ]))
+
+    assert all(threat.launch_motion_inferred is True for threat in warnings)
+    assert all(threat.vx == pytest.approx(2.0) for threat in warnings)
+    assert all(threat.vy == pytest.approx(0.0) for threat in warnings)
+    assert all(threat.motion_start_delay == 0 for threat in warnings)
+    assert warnings[1].x == pytest.approx(5.0)
+    assert warnings[1].at(1)[:2] == pytest.approx((7.0, 0.0))
+    assert warnings[1].radius == 4.0
+
+    estimator.reset()
+    reset_warning = estimator.update(observation(12, bullets=[
+        bullet(7, 1.0, 0.0, dx=0.0, dy=0.0),
+    ]))[0]
+    assert reset_warning.launch_motion_inferred is False
+    assert reset_warning.vx == 0.0
+
+
+def test_delayed_launch_template_expires_when_a_projectile_stays_still() -> None:
+    estimator = VisibleTrackEstimator(MPCConfig(
+        observation_delay=5,
+        launch_template_min_samples=3,
+    ))
+    stationary = [
+        bullet(object_id, x, 0.0, dx=0.0, dy=0.0)
+        for object_id, x in ((1, -12.0), (2, 0.0), (3, 12.0))
+    ]
+    estimator.update(observation(0, bullets=stationary))
+    estimator.update(observation(3, bullets=stationary))
+    estimator.update(observation(6, bullets=[
+        bullet(object_id, x + 6.0, 0.0, dx=2.0, dy=0.0)
+        for object_id, x in ((1, -12.0), (2, 0.0), (3, 12.0))
+    ]))
+
+    new_stationary = [bullet(926, 1.0, 0.0, dx=0.0, dy=0.0)]
+    warning = estimator.update(observation(9, bullets=new_stationary))[0]
+    estimator.update(observation(12, bullets=new_stationary))
+    expired = estimator.update(observation(15, bullets=new_stationary))[0]
+
+    assert warning.launch_motion_inferred is True
+    assert expired.launch_motion_inferred is False
+    assert expired.vx == 0.0
+    assert expired.vy == 0.0
+    assert expired.x == pytest.approx(1.0)
+    assert expired.y == pytest.approx(0.0)
+
+
+def test_delayed_launch_uses_learned_visible_orientation_not_stale_position() -> None:
+    estimator = VisibleTrackEstimator(MPCConfig(
+        observation_delay=0,
+        launch_template_min_samples=3,
+    ))
+    stationary = [
+        bullet(object_id, x, 0.0, dx=0.0, dy=0.0, rot=0.0)
+        for object_id, x in ((1, -4.0), (2, 0.0), (3, 4.0))
+    ]
+    estimator.update(observation(0, bullets=stationary))
+    estimator.update(observation(3, bullets=stationary))
+    estimator.update(observation(6, bullets=[
+        bullet(object_id, x + 6.0, 0.0, dx=2.0, dy=0.0, rot=0.0)
+        for object_id, x in ((1, -4.0), (2, 0.0), (3, 4.0))
+    ]))
+
+    warning = estimator.update(observation(9, bullets=[
+        bullet(4, 0.0, 0.0, dx=0.0, dy=0.0, rot=90.0),
+    ]))[0]
+
+    assert warning.launch_motion_inferred is True
+    assert warning.vx == pytest.approx(0.0, abs=1e-9)
+    assert warning.vy == pytest.approx(2.0)
 
 
 def test_reappearing_reused_id_starts_a_fresh_visible_track() -> None:
@@ -626,6 +757,104 @@ def test_region_navigation_only_breaks_hysteresis_for_urgent_progress() -> None:
     )
 
 
+@pytest.mark.parametrize(("focus_slack", "expected_slow"), (
+    (12.0, True),
+    (-1.0, False),
+))
+def test_region_deadline_prefers_focus_with_fast_fallback_on_diagonal_route(
+    focus_slack: float,
+    expected_slow: bool,
+) -> None:
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        horizon_frames=60,
+        preferred_y_fraction=0.5,
+        minimum_direction_hold_frames=0,
+        region_focus_deadline_enabled=True,
+        moving_action_penalty=1.0,
+        fast_action_penalty=6.0,
+    ))
+    anchor = _RegionAnchor(
+        x=60.0,
+        y=60.0,
+        crossing=False,
+        path_margin=20.0,
+        evacuating=True,
+        target_rows_ahead=1,
+        navigation_mode="preposition",
+        current_component="band:0",
+        target_component="exterior:right",
+        portal="test",
+        deadline_slack=30.0,
+        focus_deadline_slack=focus_slack,
+    )
+    teacher._region_anchor = lambda *_args: anchor
+
+    decision = teacher.select(observation(
+        0,
+        bounds=(-100.0, 100.0, -100.0, 100.0),
+    ))
+
+    assert (decision.action.move_x, decision.action.move_y) == (1, 1)
+    assert decision.action.slow is expected_slow
+
+
+def test_region_travel_frames_preserve_non_axis_waypoint_segments() -> None:
+    waypoints = ((6.0, 6.0), (12.0, 6.0))
+
+    focus_travel = EngineMPC._region_travel_frames(
+        (0.0, 0.0),
+        waypoints,
+        2.0,
+    )
+    fast_travel = EngineMPC._region_travel_frames(
+        (0.0, 0.0),
+        waypoints,
+        4.0,
+    )
+
+    assert focus_travel == 8.0
+    assert fast_travel == 5.0
+
+
+def test_region_focus_deadline_transition_invalidates_committed_slow_plan() -> None:
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        horizon_frames=60,
+        preferred_y_fraction=0.5,
+        minimum_direction_hold_frames=0,
+        region_focus_deadline_enabled=True,
+        moving_action_penalty=1.0,
+        fast_action_penalty=6.0,
+    ))
+    loose = _RegionAnchor(
+        x=60.0,
+        y=60.0,
+        crossing=False,
+        path_margin=20.0,
+        evacuating=True,
+        target_rows_ahead=1,
+        navigation_mode="preposition",
+        current_component="band:0",
+        target_component="exterior:right",
+        portal="test",
+        deadline_slack=30.0,
+        focus_deadline_slack=12.0,
+    )
+    anchors = iter((loose, replace(loose, focus_deadline_slack=-1.0)))
+    teacher._region_anchor = lambda *_args: next(anchors)
+
+    first = teacher.select(observation(0))
+    committed_after_first = teacher._committed_plan
+    tight = teacher.select(observation(3))
+
+    assert first.action.slow is True
+    assert committed_after_first
+    assert tight.region_focus_deadline_slack == -1.0
+    assert tight.action.slow is False
+    assert tight.using_committed_plan is False
+
+
 def test_committed_plan_cannot_bypass_direction_hold() -> None:
     teacher = EngineMPC(MPCConfig())
     right = next(
@@ -665,6 +894,7 @@ def test_committed_old_direction_cannot_override_a_safety_release() -> None:
     teacher = EngineMPC(MPCConfig(
         observation_delay=0,
         preferred_y_fraction=0.5,
+        corner_reserve_weight=0.0,
     ))
 
     def anchor(*_args: Any) -> _RegionAnchor:
@@ -860,6 +1090,7 @@ def test_imminent_collision_interrupts_direction_hold_immediately() -> None:
     teacher = EngineMPC(MPCConfig(
         observation_delay=0,
         preferred_y_fraction=0.5,
+        corner_reserve_weight=0.0,
     ))
     boss = {
         "id": 30,
@@ -902,6 +1133,7 @@ def test_material_clearance_gain_can_interrupt_direction_hold() -> None:
         observation_delay=0,
         preferred_y_fraction=0.5,
         switch_margin_gain=6.0,
+        corner_reserve_weight=0.0,
     ))
     boss = {
         "id": 30,
@@ -978,6 +1210,17 @@ def test_corner_escape_can_interrupt_direction_hold() -> None:
     assert selected == 0
 
 
+def test_boundary_reserve_uses_distance_to_the_nearest_edge() -> None:
+    teacher = EngineMPC(MPCConfig(observation_delay=0))
+    bounds = (-184.0, 184.0, -208.0, 192.0)
+
+    assert teacher._corner_clearance(0.0, -208.0, bounds) == 0.0
+    assert teacher._corner_clearance(0.0, -160.0, bounds) == 48.0
+
+    decision = teacher.select(observation(0, player_y=-208.0))
+    assert decision.action.move_y == 1
+
+
 def test_transition_penalty_distinguishes_switch_reverse_and_aba() -> None:
     teacher = EngineMPC(MPCConfig())
     right = next(
@@ -1003,6 +1246,131 @@ def test_transition_penalty_distinguishes_switch_reverse_and_aba() -> None:
         + teacher.config.direction_reverse_penalty
     )
     assert aba_reverse == reverse + teacher.config.direction_aba_penalty
+
+
+def test_humanlike_motion_penalties_prefer_focus_and_a_neutral_turn_beat() -> None:
+    teacher = EngineMPC(MPCConfig(
+        direction_sharp_turn_penalty=12.0,
+        moving_action_penalty=1.0,
+        fast_action_penalty=6.0,
+    ))
+    right = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (1, 0, True)
+    )
+    up_left = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (-1, 1, True)
+    )
+    fast_right = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (1, 0, False)
+    )
+    neutral = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y) == (0, 0)
+    )
+
+    assert teacher._transition_penalty(up_left, right, None) == (
+        teacher.config.direction_switch_penalty
+        + teacher.config.direction_sharp_turn_penalty
+    )
+    assert teacher._action_motion_penalty(neutral) == 0.0
+    assert teacher._action_motion_penalty(right) == 1.0
+    assert teacher._action_motion_penalty(fast_right) == 7.0
+
+
+def test_humanlike_sharp_turn_uses_safe_neutral_beat_but_not_in_emergency() -> None:
+    teacher = EngineMPC(MPCConfig(
+        sharp_turn_neutral_beat_enabled=True,
+        emergency_collision_frames=12,
+    ))
+    right = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (1, 0, True)
+    )
+    up_left = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (-1, 1, True)
+    )
+    neutral = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y) == (0, 0)
+    )
+    teacher._last_action = right
+
+    def candidate(
+        action,
+        *,
+        collided: bool = False,
+        earliest: int | None = None,
+    ) -> CandidateEvaluation:
+        return CandidateEvaluation(
+            action=action,
+            collided=collided,
+            collision_frames=int(collided),
+            earliest_collision_frame=earliest,
+            minimum_margin=20.0,
+            boundary_penalty=0.0,
+            boss_alignment=0.0,
+        )
+
+    safe = (candidate(neutral), candidate(up_left))
+    assert teacher._apply_sharp_turn_neutral_beat(
+        1,
+        safe,
+        None,
+        None,
+    ) == 0
+
+    imminent = (candidate(neutral, collided=True, earliest=12), candidate(up_left))
+    assert teacher._apply_sharp_turn_neutral_beat(
+        1,
+        imminent,
+        None,
+        None,
+    ) == 1
+
+    low_reserve = (
+        replace(candidate(neutral), minimum_margin=15.0),
+        candidate(up_left),
+    )
+    assert teacher._apply_sharp_turn_neutral_beat(
+        1,
+        low_reserve,
+        None,
+        None,
+    ) == 1
+
+    urgent_region = _RegionAnchor(
+        x=80.0,
+        y=-160.0,
+        crossing=True,
+        path_margin=8.0,
+        evacuating=True,
+        target_rows_ahead=1,
+        navigation_mode="evacuate",
+        current_component="band:0",
+        target_component="exterior:right",
+        portal="test",
+        deadline_slack=3.0,
+    )
+    assert teacher._apply_sharp_turn_neutral_beat(
+        1,
+        safe,
+        urgent_region,
+        None,
+    ) == 1
+
+
+def test_bottom_anchor_excludes_only_the_floor_from_maneuver_reserve() -> None:
+    bounds = (-184.0, 184.0, -208.0, 192.0)
+    ordinary = EngineMPC(MPCConfig())
+    anchored = EngineMPC(MPCConfig(bottom_anchor_enabled=True))
+
+    assert ordinary._maneuver_clearance(0.0, -208.0, bounds, 0.5) == 0.0
+    assert anchored._maneuver_clearance(0.0, -208.0, bounds, 0.5) == 183.5
+    assert anchored._maneuver_clearance(-184.0, -208.0, bounds, 0.5) == 0.0
 
 
 def test_clearance_reserve_prefers_more_distance_after_basic_safety() -> None:
@@ -1476,6 +1844,50 @@ def test_online_region_flow_forecast_waits_for_observed_maximum_radius() -> None
     ) is None
 
 
+def test_region_side_forecast_uses_the_nearest_open_row_waypoint() -> None:
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        horizon_frames=60,
+        portal_clearance=8.0,
+        region_nearest_waypoint_enabled=True,
+        region_safe_margin_target=8.0,
+    ))
+    teacher._region_phase.phase = "contracting"
+    teacher._region_phase.maximum_plateau_radius = 28.0
+    rows = tuple(
+        tuple(PredictedThreat(
+            key=f"indestructibles:{row_index}:{column}",
+            source="indestructibles",
+            object_id=(row_index, column),
+            x=x,
+            y=y,
+            vx=0.0,
+            vy=0.0,
+            radius=7.0,
+            radius_rate=0.0,
+            source_frame=0,
+            observation_delay=0,
+            radius_rate_horizon=0,
+            motion_horizon=60,
+        ) for column, x in enumerate(row_x))
+        for row_index, (row_x, y) in enumerate((
+            ((-120.0, -80.0, -40.0), -40.0),
+            ((-40.0, 0.0, 40.0), 40.0),
+        ))
+    )
+
+    forecast = teacher._region_side_forecast(
+        rows,
+        (0.0, -90.0, 0.5, 4.0, 2.0),
+        (-200.0, 200.0, -100.0, 100.0),
+    )
+
+    assert forecast is not None
+    assert forecast.side == "right"
+    # radius 28 + player/portal/region reserve 16.5 beyond x=-40.
+    assert forecast.x == pytest.approx(4.5)
+
+
 def test_unknown_stable_platform_forecast_requires_four_samples_and_mirrors() -> None:
     def decide(
         *,
@@ -1556,7 +1968,7 @@ def test_unknown_stable_platform_forecast_requires_four_samples_and_mirrors() ->
     assert right_anchor is not None and shifted_anchor is not None
     assert left_anchor is not None
     assert right_anchor.navigation_mode == shifted_anchor.navigation_mode == (
-        "preposition"
+        "evacuate"
     )
     assert right_anchor.target_component == shifted_anchor.target_component == (
         "exterior:right"
@@ -1689,7 +2101,7 @@ def test_default_region_reserve_skips_a_band_that_becomes_too_narrow() -> None:
     assert legacy_evaluation.minimum_margin > 8.0
 
 
-def test_persistent_region_intent_survives_a_blocked_straight_path() -> None:
+def test_active_region_flow_evacuates_before_blocked_preposition() -> None:
     row_x = (-96.0, -48.0, 0.0, 48.0, 96.0)
     row_y = (-200.0, -120.0, -63.0, 0.0)
     walls = [
@@ -1748,8 +2160,225 @@ def test_persistent_region_intent_survives_a_blocked_straight_path() -> None:
     assert first.target_component == "exterior:right"
     assert blocked.target_component == first.target_component
     assert blocked.path_margin < 0.0
-    assert blocked.navigation_mode == "preposition"
+    assert blocked.deadline_slack > 0.0
+    assert blocked.navigation_mode == "evacuate"
     assert teacher._region_topology.target_x == blocked.x
+
+
+def test_expired_region_deadline_evacuates_before_corridor_preposition() -> None:
+    teacher = EngineMPC(MPCConfig(observation_delay=0, horizon_frames=60))
+    teacher._region_side_forecast = lambda *_args: _RegionSideForecast(
+        side="right",
+        x=104.0,
+        preposition_lead_frames=0.0,
+        open_samples=3,
+        total_samples=3,
+    )
+    walls = [
+        wall_object(column, x, 40.0, radius=7.0, dx=0.0, dy=0.0)
+        for column, x in enumerate((-48.0, 0.0, 48.0))
+    ]
+    current = observation(
+        10,
+        player_x=0.0,
+        player_y=0.0,
+        indestructibles=walls,
+        bounds=(-200.0, 200.0, -100.0, 100.0),
+    )
+    threats = teacher.estimator.update(current)
+    teacher._update_region_phase(current, 10)
+    teacher._region_phase.phase = "expanding"
+    teacher._region_phase.maximum_plateau_radius = 28.0
+    teacher._region_phase.growth_rate = 0.7
+    player = teacher._player(current, 0)
+    anchor = teacher._region_anchor(
+        player,
+        teacher._bounds(current, player[2]),
+        threats,
+        10,
+    )
+
+    assert anchor is not None
+    assert anchor.deadline_slack <= 0.0
+    assert anchor.navigation_mode == "evacuate"
+
+
+def test_region_anchor_settles_inside_target_despite_expired_deadline() -> None:
+    teacher = EngineMPC(MPCConfig(observation_delay=0, horizon_frames=60))
+    teacher._region_side_forecast = lambda *_args: _RegionSideForecast(
+        side="right",
+        x=184.0,
+        preposition_lead_frames=0.0,
+        open_samples=3,
+        total_samples=3,
+    )
+    walls = [
+        wall_object(column, x, 40.0, radius=7.0, dx=0.0, dy=0.0)
+        for column, x in enumerate((-48.0, 0.0, 48.0))
+    ]
+    current = observation(
+        10,
+        player_x=80.0,
+        player_y=0.0,
+        indestructibles=walls,
+        bounds=(-200.0, 200.0, -100.0, 100.0),
+    )
+    threats = teacher.estimator.update(current)
+    teacher._update_region_phase(current, 10)
+    teacher._region_phase.phase = "expanding"
+    teacher._region_phase.maximum_plateau_radius = 28.0
+    teacher._region_phase.growth_rate = 0.7
+    player = teacher._player(current, 0)
+    anchor = teacher._region_anchor(
+        player,
+        teacher._bounds(current, player[2]),
+        threats,
+        10,
+    )
+
+    assert anchor is not None
+    assert anchor.current_component == anchor.target_component == "exterior:right"
+    assert anchor.deadline_slack <= 0.0
+    assert anchor.navigation_mode == "settle"
+    assert anchor.crossing is False
+    assert anchor.x == player[0]
+    assert teacher._region_topology.target_x == 184.0
+
+
+def test_bottom_anchor_settles_at_floor_inside_target_exterior() -> None:
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        horizon_frames=60,
+        bottom_anchor_enabled=True,
+    ))
+    teacher._region_side_forecast = lambda *_args: _RegionSideForecast(
+        side="right",
+        x=184.0,
+        preposition_lead_frames=0.0,
+        open_samples=3,
+        total_samples=3,
+    )
+    walls = [
+        wall_object(column, x, 40.0, radius=7.0, dx=0.0, dy=0.0)
+        for column, x in enumerate((-48.0, 0.0, 48.0))
+    ]
+    current = observation(
+        10,
+        player_x=80.0,
+        player_y=0.0,
+        indestructibles=walls,
+        bounds=(-200.0, 200.0, -100.0, 100.0),
+    )
+    threats = teacher.estimator.update(current)
+    teacher._update_region_phase(current, 10)
+    teacher._region_phase.phase = "expanding"
+    teacher._region_phase.maximum_plateau_radius = 28.0
+    teacher._region_phase.growth_rate = 0.7
+    player = teacher._player(current, 0)
+    anchor = teacher._region_anchor(
+        player,
+        teacher._bounds(current, player[2]),
+        threats,
+        10,
+    )
+
+    assert anchor is not None
+    assert anchor.current_component == anchor.target_component == "exterior:right"
+    assert anchor.navigation_mode == "settle"
+    assert anchor.x == player[0]
+    assert anchor.y == teacher._bounds(current, player[2])[2]
+
+
+def test_region_anchor_waits_in_place_until_finite_deadline_enters_window() -> None:
+    walls = [
+        wall_object(column, x, 40.0, radius=7.0, dx=0.0, dy=0.0)
+        for column, x in enumerate((-48.0, 0.0, 48.0))
+    ]
+
+    def anchor(*, preposition_lead: float):
+        teacher = EngineMPC(MPCConfig(
+            observation_delay=0,
+            horizon_frames=60,
+            region_urgency_lead_frames=0,
+        ))
+        teacher._region_side_forecast = lambda *_args: _RegionSideForecast(
+            side="right",
+            x=40.0,
+            preposition_lead_frames=preposition_lead,
+            open_samples=3,
+            total_samples=3,
+        )
+        current = observation(
+            10,
+            player_x=0.0,
+            player_y=0.0,
+            indestructibles=walls,
+            bounds=(-100.0, 100.0, -100.0, 100.0),
+        )
+        threats = teacher.estimator.update(current)
+        teacher._update_region_phase(current, 10)
+        player = teacher._player(current, 0)
+        result = teacher._region_anchor(
+            player,
+            teacher._bounds(current, player[2]),
+            threats,
+            10,
+        )
+        return teacher, result
+
+    waiting_teacher, waiting = anchor(preposition_lead=200.0)
+    planning_teacher, planning = anchor(preposition_lead=20.0)
+
+    assert waiting is not None and planning is not None
+    assert waiting.deadline_slack > waiting_teacher.config.horizon_frames
+    assert waiting.navigation_mode == "hold"
+    assert waiting.x == 0.0
+    assert waiting_teacher._region_topology.target_x == 40.0
+    assert planning.deadline_slack <= planning_teacher.config.horizon_frames
+    assert planning.focus_deadline_slack < planning.deadline_slack
+    assert planning.navigation_mode == "preposition"
+    assert planning.x == 40.0
+
+
+def test_region_anchor_position_deadzone_uses_one_focused_decision_step() -> None:
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        horizon_frames=60,
+        region_urgency_lead_frames=0,
+    ))
+    teacher._region_side_forecast = lambda *_args: _RegionSideForecast(
+        side="right",
+        x=6.0,
+        preposition_lead_frames=20.0,
+        open_samples=3,
+        total_samples=3,
+    )
+    walls = [
+        wall_object(column, x, 40.0, radius=7.0, dx=0.0, dy=0.0)
+        for column, x in enumerate((-48.0, 0.0, 48.0))
+    ]
+    current = observation(
+        10,
+        player_x=0.0,
+        player_y=0.0,
+        indestructibles=walls,
+        bounds=(-100.0, 100.0, -100.0, 100.0),
+    )
+    threats = teacher.estimator.update(current)
+    teacher._update_region_phase(current, 10)
+    player = teacher._player(current, 0)
+    anchor = teacher._region_anchor(
+        player,
+        teacher._bounds(current, player[2]),
+        threats,
+        10,
+    )
+
+    assert player[4] * teacher.config.decision_interval == 6.0
+    assert anchor is not None
+    assert anchor.navigation_mode == "hold"
+    assert anchor.x == player[0]
+    assert teacher._region_topology.target_x == 6.0
 
 
 def test_episode_local_exterior_intent_survives_ambiguity_then_reverses() -> None:
@@ -2146,6 +2775,20 @@ def _gap_test_config(**values: Any) -> MPCConfig:
     ), **values)
 
 
+def _humanlike_gap_test_config(**values: Any) -> MPCConfig:
+    return _gap_test_config(
+        minimum_direction_hold_frames=6,
+        direction_switch_penalty=4.0,
+        direction_reverse_penalty=12.0,
+        direction_sharp_turn_penalty=12.0,
+        direction_aba_penalty=8.0,
+        speed_switch_penalty=1.5,
+        moving_action_penalty=1.0,
+        fast_action_penalty=6.0,
+        **values,
+    )
+
+
 def _gap_wavefront(
     points: tuple[tuple[float, float], ...],
     *,
@@ -2380,8 +3023,11 @@ def test_detected_parallel_gap_steers_toward_reachable_corridor() -> None:
         bullets=wavefront,
     )
 
-    enabled = EngineMPC(_gap_test_config()).select(current)
+    enabled = EngineMPC(_gap_test_config(
+        corner_reserve_weight=0.0,
+    )).select(current)
     disabled = EngineMPC(_gap_test_config(
+        corner_reserve_weight=0.0,
         gap_prediction_enabled=False,
     )).select(current)
     selected = next(
@@ -2480,25 +3126,29 @@ def test_large_third_bullet_can_block_every_otherwise_valid_gap_entry() -> None:
     assert mode == "observe"
 
 
-def test_open_safe_gap_is_observed_without_unnecessary_lateral_chase() -> None:
+def test_open_safe_gap_remains_observation_only() -> None:
     wavefront = _gap_wavefront((
         (-80.0, 60.0),
         (-20.0, 60.0),
         (40.0, 60.0),
         (90.0, 60.0),
     ))
-    decision = EngineMPC(_gap_test_config()).select(observation(
+    current = observation(
         0,
         player_x=10.0,
         player_y=0.0,
         bullets=wavefront,
-    ))
+    )
+    decision = EngineMPC(_gap_test_config()).select(current)
+    disabled = EngineMPC(_gap_test_config(
+        gap_prediction_enabled=False,
+    )).select(current)
 
     assert decision.gap_bullet_group_count == 1
     assert decision.gap_corridor_count == 3
     assert decision.gap_selected_center is None
     assert decision.gap_navigation_mode == "observe"
-    assert decision.action.move_x == 0
+    assert decision.action.discrete == disabled.action.discrete
 
 
 def test_player_already_inside_gap_holds_as_wavefront_reaches_guard_window() -> None:
@@ -2563,6 +3213,93 @@ def test_gap_entry_certificate_uses_executable_three_frame_action_blocks() -> No
     assert certified_plan == ()
 
 
+def test_humanlike_gap_entry_uses_focus_and_direction_hold_when_reachable() -> None:
+    teacher = EngineMPC(_humanlike_gap_test_config())
+    left = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (-1, 0, True)
+    )
+    right = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (1, 0, True)
+    )
+    teacher._previous_action = right
+    teacher._last_action = left
+    teacher._direction_started_frame = 0
+    teacher._last_source_frame = 3
+
+    _path_x, _path_y, travel, settled, plan = teacher._gap_entry_path(
+        (0.0, 0.0, 0.5, 4.0, 2.0),
+        (-100.0, 100.0, -100.0, 100.0),
+        (24.0, 0.0),
+        (1.0, 0.0),
+        0.0,
+        30.0,
+        36,
+    )
+
+    moving = [action for action in plan if action.move_x or action.move_y]
+    assert settled is True
+    assert travel <= 30.0 - teacher.config.gap_entry_guard_frames
+    assert plan[0].discrete == left.discrete
+    assert any(
+        action.move_x == 0 and action.move_y == 0
+        for action in plan[1:]
+    )
+    assert any(action.move_x == 1 for action in plan)
+    assert moving and all(action.slow for action in moving)
+    assert teacher._gap_plan_style(plan)[0] == 0.0
+
+
+def test_gap_entry_deadline_overrides_direction_hold_and_fast_penalty() -> None:
+    teacher = EngineMPC(_humanlike_gap_test_config())
+    left = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (-1, 0, True)
+    )
+    teacher._last_action = left
+    teacher._direction_started_frame = 0
+    teacher._last_source_frame = 3
+
+    _path_x, _path_y, travel, settled, plan = teacher._gap_entry_path(
+        (0.0, 0.0, 0.5, 4.0, 2.0),
+        (-100.0, 100.0, -100.0, 100.0),
+        (24.0, 0.0),
+        (1.0, 0.0),
+        0.0,
+        12.0,
+        18,
+    )
+
+    assert settled is True
+    assert travel <= 12.0 - teacher.config.gap_entry_guard_frames
+    assert (plan[0].move_x, plan[0].move_y, plan[0].slow) == (1, 0, False)
+    assert teacher._gap_plan_style(plan)[0] > 0.0
+
+
+def test_gap_plan_style_penalizes_aba_reversal() -> None:
+    teacher = EngineMPC(_humanlike_gap_test_config())
+    left = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (-1, 0, True)
+    )
+    right = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (1, 0, True)
+    )
+
+    smooth = teacher._gap_plan_style((left, right, right))
+    oscillating = teacher._gap_plan_style((left, right, left))
+
+    assert oscillating[0] > smooth[0]
+    assert oscillating[1] == smooth[1] + (
+        teacher.config.direction_switch_penalty
+        + teacher.config.direction_reverse_penalty
+        + teacher.config.direction_sharp_turn_penalty
+        + teacher.config.direction_aba_penalty
+    )
+
+
 def test_gap_entry_certificate_finds_safe_discrete_detour() -> None:
     teacher = EngineMPC(_gap_test_config())
     current = observation(
@@ -2609,6 +3346,35 @@ def test_gap_entry_certificate_finds_safe_discrete_detour() -> None:
     assert any(action.move_y != 0 for action in plan)
 
 
+def test_humanlike_gap_detour_keeps_collision_and_deadline_before_style() -> None:
+    teacher = EngineMPC(_humanlike_gap_test_config(horizon_frames=60))
+    current = observation(
+        0,
+        bullets=[bullet(99, 24.0, 0.0, dx=0.0, dy=0.0)],
+    )
+    threats = teacher.estimator.update(current)
+    player = teacher._player(current, teacher.config.observation_delay)
+    bounds = teacher._bounds(current, player[2])
+    forecast = teacher._gap_threat_forecast(threats)
+
+    margin, travel, plan = teacher._gap_path_margin(
+        player,
+        bounds,
+        (55.556, 0.0),
+        (1.0, 0.0),
+        10.0,
+        36.0,
+        threats,
+        forecast,
+    )
+
+    moving = [action for action in plan if action.move_x or action.move_y]
+    assert margin >= teacher.config.gap_path_minimum_margin
+    assert travel <= 36.0 - teacher.config.gap_entry_guard_frames
+    assert plan and any(action.move_y != 0 for action in plan)
+    assert moving and all(action.slow for action in moving)
+
+
 def test_enter_uses_certified_route_and_reaches_hold() -> None:
     teacher = EngineMPC(_gap_test_config())
     bullet_x = (-130.0, -120.0, -110.0, 7.5, 42.5, 77.5)
@@ -2640,6 +3406,8 @@ def test_enter_uses_certified_route_and_reaches_hold() -> None:
 
     assert first.gap_selected_center == pytest.approx((25.0, 0.0))
     assert first.gap_navigation_mode == "enter"
+    assert first.gap_plan_certified is True
+    assert first.using_committed_plan is False
     assert (first.action.move_x, first.action.move_y, first.action.slow) == (
         1,
         0,
@@ -2648,7 +3416,90 @@ def test_enter_uses_certified_route_and_reaches_hold() -> None:
     assert first.planned_actions[0].discrete == first.action.discrete
     assert second.gap_navigation_mode == "enter"
     assert second.action.move_x == 1
+    assert second.gap_plan_certified is True
+    assert second.using_committed_plan is True
     assert inside.gap_navigation_mode == "hold"
+
+
+def test_gap_intent_survives_visible_wavefront_member_replacement() -> None:
+    teacher = EngineMPC(_gap_test_config())
+    bullet_x = (-130.0, -120.0, -110.0, 7.5, 42.5, 77.5)
+
+    def wavefront(frame: int, id_offset: int) -> list[dict[str, Any]]:
+        result = _gap_wavefront(tuple(
+            (x, 24.0 - 2.0 * frame) for x in bullet_x
+        ))
+        for value in result:
+            value["id"] += id_offset
+        return result
+
+    first = teacher.select(observation(
+        0,
+        player_x=0.0,
+        player_y=0.0,
+        bullets=wavefront(0, 0),
+    ))
+    first_intent = teacher._active_gap_key
+    replacement = teacher.select(observation(
+        3,
+        player_x=12.0,
+        player_y=0.0,
+        bullets=wavefront(3, 100),
+    ))
+
+    assert first.gap_selected_center == pytest.approx((25.0, 0.0))
+    assert replacement.gap_selected_center == pytest.approx((25.0, 0.0))
+    assert replacement.gap_navigation_mode == "enter"
+    assert replacement.using_committed_plan is True
+    assert teacher._active_gap_key == first_intent
+
+
+def test_committed_gap_plan_is_rechecked_against_new_visible_threats() -> None:
+    teacher = EngineMPC(_gap_test_config())
+    bullet_x = (-130.0, -120.0, -110.0, 7.5, 42.5, 77.5)
+    boss = [{
+        "id": 99,
+        "x": -100.0,
+        "y": 80.0,
+        "hp": 1000.0,
+        "maxhp": 1000.0,
+        "a": 1.0,
+        "b": 1.0,
+        "collidable": False,
+    }]
+
+    def wavefront(frame: int) -> list[dict[str, Any]]:
+        return _gap_wavefront(tuple(
+            (x, 24.0 - 2.0 * frame) for x in bullet_x
+        ))
+
+    first = teacher.select(observation(
+        0,
+        player_x=0.0,
+        player_y=0.0,
+        bullets=wavefront(0),
+        enemies=boss,
+    ))
+    blocked = teacher.select(observation(
+        3,
+        player_x=12.0,
+        player_y=0.0,
+        bullets=[
+            *wavefront(3),
+            bullet(999, 16.0, 0.0, dx=0.0, dy=0.0),
+        ],
+        enemies=boss,
+    ))
+    selected = next(
+        value for value in blocked.evaluations
+        if value.action.discrete == blocked.action.discrete
+    )
+
+    assert first.gap_plan_certified is True
+    assert blocked.using_committed_plan is False
+    assert blocked.action.move_x == -1
+    assert selected.collided is False
+    assert selected.minimum_margin >= teacher.config.gap_path_minimum_margin
 
 
 def test_gap_entry_certification_is_bounded_after_geometry_grouping(
@@ -2818,7 +3669,7 @@ def test_disabling_gap_prediction_preserves_legacy_action_and_empty_telemetry() 
         disabled.action.move_x,
         disabled.action.move_y,
         disabled.action.slow,
-    ) == (1, -1, False)
+    ) == (1, 0, False)
 
 
 def test_frame_rewind_clears_the_committed_gap_from_the_previous_run() -> None:
@@ -2847,6 +3698,8 @@ def test_frame_rewind_clears_the_committed_gap_from_the_previous_run() -> None:
     assert committed.gap_navigation_mode in {"enter", "hold"}
     assert restarted.gap_selected_center is None
     assert restarted.gap_navigation_mode == "inactive"
+    assert teacher._committed_plan_is_gap is False
+    assert teacher._active_gap is None
 
 
 def test_gap_alignment_cannot_override_a_predicted_collision() -> None:
@@ -2949,3 +3802,98 @@ def test_gap_anchor_does_not_expand_the_configured_beam_budget() -> None:
 
     assert len(kept) == teacher.config.beam_width
     assert kept == pytest.approx(np.arange(teacher.config.beam_width))
+
+
+def test_ordinary_beam_keeps_spatially_distinct_first_action_branches() -> None:
+    teacher = EngineMPC(MPCConfig(
+        beam_width=4,
+        beam_cell_size=8.0,
+    ))
+    kept = teacher._diverse_keep(
+        np.arange(8, dtype=np.int64),
+        np.asarray([0.0, 1.0, 2.0, 3.0, -48.0, 48.0, 0.0, 0.0]),
+        np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -48.0, 48.0]),
+        np.asarray([1, 1, 1, 1, 2, 3, 4, 5], dtype=np.int64),
+        None,
+        None,
+    )
+
+    assert len(kept) == teacher.config.beam_width
+    assert set(kept) == {0, 4, 5, 6}
+
+
+def test_bottom_edge_clearance_breaks_a_held_downward_direction() -> None:
+    teacher = EngineMPC(MPCConfig(
+        observation_delay=0,
+        preferred_y_fraction=0.5,
+    ))
+    downward = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (0, -1, False)
+    )
+    teacher._last_action = downward
+    teacher._direction_started_frame = 0
+
+    decision = teacher.select(observation(
+        3,
+        player_x=0.0,
+        player_y=-207.0,
+        bounds=(-192.0, 192.0, -224.0, 224.0),
+    ))
+    held = evaluation(decision, move_x=0, move_y=-1, slow=False)
+    selected = evaluation(
+        decision,
+        move_x=decision.action.move_x,
+        move_y=decision.action.move_y,
+        slow=decision.action.slow,
+    )
+
+    assert held.immediate_corner_clearance == 0.0
+    assert decision.action.move_y > 0
+    assert selected.immediate_corner_clearance > held.immediate_corner_clearance
+
+
+def test_gap_aware_beam_keeps_normal_progress_through_the_horizon() -> None:
+    teacher = EngineMPC(_gap_test_config(
+        beam_width=4,
+        gap_anchor_weight=20.0,
+        preferred_y_fraction=0.5,
+    ))
+    gap = _GapCorridor(
+        key="test-gap",
+        group_key="test-group",
+        center_x=80.0,
+        center_y=0.0,
+        usable_width=8.0,
+        lifetime_frames=36,
+        arrival_frames=24.0,
+        path_margin=20.0,
+        normal_x=1.0,
+        normal_y=0.0,
+        member_count=4,
+    )
+    player = (0.0, 0.0, 0.5, 4.0, 2.0)
+    bounds = (-200.0, 200.0, -100.0, 100.0)
+    evaluations, plans = teacher._beam_evaluations(
+        player,
+        bounds,
+        (),
+        None,
+        None,
+        gap,
+    )
+    right_index = next(
+        index for index, value in enumerate(evaluations)
+        if (value.action.move_x, value.action.move_y, value.action.slow)
+        == (1, 0, False)
+    )
+    endpoint = teacher._plan_endpoint(
+        plans[right_index],
+        player,
+        bounds,
+    )
+
+    assert len(plans[right_index]) == (
+        teacher.config.horizon_frames // teacher.config.decision_interval
+    )
+    assert endpoint[0] >= gap.center_x - 0.5 * gap.usable_width

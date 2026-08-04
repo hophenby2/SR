@@ -389,22 +389,48 @@ class MPCConfig:
     switch_margin_gain: float = 8.0
     direction_switch_penalty: float = 3.0
     direction_reverse_penalty: float = 9.0
+    direction_sharp_turn_penalty: float = 0.0
     direction_aba_penalty: float = 6.0
     speed_switch_penalty: float = 0.75
+    sharp_turn_neutral_beat_enabled: bool = False
+    moving_action_penalty: float = 0.0
+    fast_action_penalty: float = 0.0
     nonbullet_motion_horizon: int = 9
     preferred_y_fraction: float = 2.0 / 25.0
     vertical_anchor_weight: float = 0.25
+    bottom_anchor_enabled: bool = False
     beam_cell_size: float = 4.0
     region_anchor_weight: float = 2.0
     region_boundary_trigger_margin: float = 72.0
+    region_urgency_lead_frames: int = 0
+    region_nearest_waypoint_enabled: bool = False
     region_safe_margin_target: float = 8.0
     portal_clearance: float = 6.0
     region_path_weight: float = 0.05
     region_learned_min_radius: float = 7.0
     region_learned_max_radius: float = 28.0
     region_radius_step: float = 0.7
+    region_focus_deadline_enabled: bool = False
     region_dynamics_memory: RegionDynamicsMemory | None = None
     track_displacement_tolerance: float = 1.0
+    # Constant-acceleration extrapolation remains available for controlled
+    # ablations, but is opt-in.  A short run of locally consistent curvature
+    # is not evidence that acceleration stays constant over a 60-frame MPC
+    # horizon; enabling it globally regresses native Okuu #4.
+    motion_dynamics_enabled: bool = False
+    motion_acceleration_tolerance: float = 0.05
+    launch_prediction_enabled: bool = True
+    launch_template_max_age_frames: int = 240
+    launch_template_position_radius: float = 64.0
+    launch_template_min_samples: int = 3
+    launch_prediction_uncertainty: float = 2.0
+    spawn_prediction_enabled: bool = True
+    spawn_family_min_samples: int = 4
+    spawn_anchor_association_radius: float = 112.0
+    spawn_prediction_max_period_frames: int = 120
+    spawn_prediction_uncertainty: float = 3.0
+    spawn_missed_emission_limit: int = 2
+    spawn_motion_template_age_frames: int = 18
     gap_prediction_enabled: bool = True
     gap_direction_tolerance_degrees: float = 12.0
     gap_speed_relative_tolerance: float = 0.20
@@ -473,8 +499,11 @@ class MPCConfig:
             self.emergency_margin,
             self.direction_switch_penalty,
             self.direction_reverse_penalty,
+            self.direction_sharp_turn_penalty,
             self.direction_aba_penalty,
             self.speed_switch_penalty,
+            self.moving_action_penalty,
+            self.fast_action_penalty,
         )
         if not all(
             math.isfinite(value) and value >= 0.0
@@ -490,6 +519,20 @@ class MPCConfig:
             raise ValueError("preferred_y_fraction must be in [0, 1]")
         if not math.isfinite(self.vertical_anchor_weight) or self.vertical_anchor_weight < 0.0:
             raise ValueError("vertical_anchor_weight must be finite and nonnegative")
+        if not isinstance(self.bottom_anchor_enabled, bool):
+            raise ValueError("bottom_anchor_enabled must be boolean")
+        if not isinstance(self.sharp_turn_neutral_beat_enabled, bool):
+            raise ValueError("sharp_turn_neutral_beat_enabled must be boolean")
+        if (
+            isinstance(self.region_urgency_lead_frames, bool)
+            or not isinstance(self.region_urgency_lead_frames, int)
+            or self.region_urgency_lead_frames < 0
+        ):
+            raise ValueError("region_urgency_lead_frames must be a nonnegative integer")
+        if not isinstance(self.region_nearest_waypoint_enabled, bool):
+            raise ValueError("region_nearest_waypoint_enabled must be boolean")
+        if not isinstance(self.region_focus_deadline_enabled, bool):
+            raise ValueError("region_focus_deadline_enabled must be boolean")
         region_values = (
             self.beam_cell_size,
             self.region_anchor_weight,
@@ -507,6 +550,59 @@ class MPCConfig:
             raise ValueError("learned maximum radius must exceed the minimum")
         if not math.isfinite(self.region_path_weight) or self.region_path_weight < 0.0:
             raise ValueError("region_path_weight must be finite and nonnegative")
+        if not isinstance(self.motion_dynamics_enabled, bool):
+            raise ValueError("motion_dynamics_enabled must be boolean")
+        if (
+            not math.isfinite(self.motion_acceleration_tolerance)
+            or self.motion_acceleration_tolerance <= 0.0
+        ):
+            raise ValueError("motion acceleration tolerance must be positive")
+        if not isinstance(self.launch_prediction_enabled, bool):
+            raise ValueError("launch_prediction_enabled must be boolean")
+        if (
+            isinstance(self.launch_template_max_age_frames, bool)
+            or not isinstance(self.launch_template_max_age_frames, int)
+            or self.launch_template_max_age_frames <= 0
+        ):
+            raise ValueError("launch template age must be a positive integer")
+        if (
+            isinstance(self.launch_template_min_samples, bool)
+            or not isinstance(self.launch_template_min_samples, int)
+            or self.launch_template_min_samples < 2
+        ):
+            raise ValueError("launch prediction requires at least two samples")
+        launch_values = (
+            self.launch_template_position_radius,
+            self.launch_prediction_uncertainty,
+        )
+        if not all(
+            math.isfinite(value) and value >= 0.0 for value in launch_values
+        ) or self.launch_template_position_radius <= 0.0:
+            raise ValueError("launch prediction geometry is invalid")
+        if not isinstance(self.spawn_prediction_enabled, bool):
+            raise ValueError("spawn prediction enabled must be boolean")
+        spawn_integer_values = (
+            self.spawn_family_min_samples,
+            self.spawn_prediction_max_period_frames,
+            self.spawn_missed_emission_limit,
+            self.spawn_motion_template_age_frames,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in spawn_integer_values
+        ):
+            raise ValueError("spawn prediction counts must be positive integers")
+        if self.spawn_family_min_samples < 3:
+            raise ValueError("spawn prediction requires at least three samples")
+        spawn_geometry_values = (
+            self.spawn_anchor_association_radius,
+            self.spawn_prediction_uncertainty,
+        )
+        if not all(
+            math.isfinite(value) and value >= 0.0
+            for value in spawn_geometry_values
+        ) or self.spawn_anchor_association_radius <= 0.0:
+            raise ValueError("spawn prediction geometry is invalid")
         if not isinstance(self.gap_prediction_enabled, bool):
             raise ValueError("gap_prediction_enabled must be boolean")
         gap_positive_values = (
@@ -580,13 +676,26 @@ class PredictedThreat:
     observation_delay: int
     radius_rate_horizon: int
     motion_horizon: int
+    motion_start_delay: int = 0
+    launch_motion_inferred: bool = False
+    ax: float = 0.0
+    ay: float = 0.0
+    acceleration_horizon: int = 0
 
     def at(self, future_frame: int) -> tuple[float, float, float]:
         if future_frame < 0:
             raise ValueError("future_frame cannot be negative")
+        motion_frame = min(
+            max(0, future_frame - self.motion_start_delay),
+            self.motion_horizon,
+        )
+        acceleration_frame = min(motion_frame, self.acceleration_horizon)
+        acceleration_scale = acceleration_frame * (
+            motion_frame - 0.5 * acceleration_frame
+        )
         return (
-            self.x + self.vx * min(future_frame, self.motion_horizon),
-            self.y + self.vy * min(future_frame, self.motion_horizon),
+            self.x + self.vx * motion_frame + self.ax * acceleration_scale,
+            self.y + self.vy * motion_frame + self.ay * acceleration_scale,
             max(
                 0.1,
                 self.radius
@@ -660,6 +769,8 @@ class MPCDecision:
     gap_selected_width: float | None = None
     gap_selected_lifetime_frames: int | None = None
     gap_navigation_mode: str = "inactive"
+    gap_plan_certified: bool = False
+    region_focus_deadline_slack: float | None = None
 
 
 @dataclass(slots=True)
@@ -671,6 +782,89 @@ class _Track:
     vx: float
     vy: float
     radius_rate: float
+    first_frame: int
+    orientation: float | None
+    ax: float
+    ay: float
+    acceleration_streak: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LaunchSample:
+    frame: int
+    x: float
+    y: float
+    radius: float
+    vx: float
+    vy: float
+    stationary_frames: int
+    orientation: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AnonymousBulletPoint:
+    engine_id: Any
+    ordinal: int
+    x: float
+    y: float
+    radius: float
+
+
+@dataclass(slots=True)
+class _AnonymousBulletTrack:
+    identity: int
+    engine_id: Any
+    frame: int
+    x: float
+    y: float
+    radius: float
+    vx: float
+    vy: float
+    family_identity: int | None = None
+    birth_frame: int = 0
+    birth_x: float = 0.0
+    birth_y: float = 0.0
+    birth_angle: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SpawnEvent:
+    frame: int
+    anchor_x: float
+    anchor_y: float
+    offset_x: float
+    offset_y: float
+    radius: float
+    track_identity: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SpawnMotionSample:
+    age: int
+    x: float
+    y: float
+    radial_basis: bool
+
+
+@dataclass(slots=True)
+class _SpawnFamily:
+    identity: int
+    events: list[_SpawnEvent] = field(default_factory=list)
+    motion_samples: list[_SpawnMotionSample] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _SpawnFamilyModel:
+    period: float
+    anchor_vx: float
+    anchor_vy: float
+    offset_radius: float
+    offset_x: float
+    offset_y: float
+    offset_angle: float | None
+    angular_rate: float
+    projectile_radius: float
+    uncertainty: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,6 +880,7 @@ class _RegionAnchor:
     target_component: str
     portal: str | None
     deadline_slack: float
+    focus_deadline_slack: float = math.inf
 
     @property
     def commitment_key(self) -> tuple[str, str, str, str | None]:
@@ -720,6 +915,7 @@ class _GapCorridor:
     normal_x: float
     normal_y: float
     member_count: int
+    intent_key: tuple[int, int, int] = (0, 0, 0)
     entry_plan: tuple[Action, ...] = ()
 
     @property
@@ -1303,18 +1499,791 @@ class VisibleTrackEstimator:
 
     def reset(self) -> None:
         self._tracks: dict[str, _Track] = {}
+        self._launch_samples: list[_LaunchSample] = []
         self._previous_visible: set[str] = set()
+        self._anonymous_bullets: dict[int, _AnonymousBulletTrack] = {}
+        self._anonymous_bullet_frame: int | None = None
+        self._next_anonymous_bullet_identity = 1
+        self._spawn_families: list[_SpawnFamily] = []
+        self._next_spawn_family_identity = 1
         self._fallback_frame = -1
         self.last_frame: int | None = None
+        self._last_result: tuple[PredictedThreat, ...] | None = None
 
     @staticmethod
     def _key(source: str, record: Mapping[str, Any], ordinal: int) -> str:
         return f"{source}:{record.get('id', 'ordinal-' + str(ordinal))}"
 
+    @staticmethod
+    def _temporary_id(record: Mapping[str, Any]) -> Any:
+        value = record.get("id")
+        try:
+            hash(value)
+        except (TypeError, ValueError):
+            return None
+        return value
+
+    @staticmethod
+    def _wrapped_angle(value: float) -> float:
+        return math.atan2(math.sin(value), math.cos(value))
+
+    def _anonymous_points(
+        self,
+        records: Sequence[Any],
+    ) -> list[_AnonymousBulletPoint]:
+        result: list[_AnonymousBulletPoint] = []
+        for ordinal, record in enumerate(records):
+            if not isinstance(record, Mapping):
+                continue
+            x = _number(record.get("x"))
+            y = _number(record.get("y"))
+            if x is None or y is None:
+                continue
+            result.append(_AnonymousBulletPoint(
+                engine_id=self._temporary_id(record),
+                ordinal=ordinal,
+                x=x,
+                y=y,
+                radius=_radius(record),
+            ))
+        return result
+
+    @staticmethod
+    def _anonymous_predicted_position(
+        track: _AnonymousBulletTrack,
+        elapsed: int,
+    ) -> tuple[float, float]:
+        return track.x + track.vx * elapsed, track.y + track.vy * elapsed
+
+    def _record_spawn_motion(self, track: _AnonymousBulletTrack) -> None:
+        if track.family_identity is None:
+            return
+        family = next((
+            value for value in self._spawn_families
+            if value.identity == track.family_identity
+        ), None)
+        if family is None:
+            return
+        age = track.frame - track.birth_frame
+        if not 0 < age <= self.config.spawn_motion_template_age_frames:
+            return
+        dx = track.x - track.birth_x
+        dy = track.y - track.birth_y
+        radial_basis = track.birth_angle is not None
+        if radial_basis:
+            cosine = math.cos(track.birth_angle or 0.0)
+            sine = math.sin(track.birth_angle or 0.0)
+            dx, dy = cosine * dx + sine * dy, -sine * dx + cosine * dy
+        family.motion_samples.append(_SpawnMotionSample(
+            age=age,
+            x=dx,
+            y=dy,
+            radial_basis=radial_basis,
+        ))
+        family.motion_samples = family.motion_samples[-2048:]
+
+    def _update_anonymous_bullets(
+        self,
+        frame: int,
+        records: Sequence[Any],
+    ) -> list[_AnonymousBulletTrack]:
+        """Find births by visible geometry, using IDs only as temporary hints."""
+
+        points = self._anonymous_points(records)
+        previous = list(self._anonymous_bullets.values())
+        previous_frame = self._anonymous_bullet_frame
+        if previous_frame is None or frame <= previous_frame:
+            self._anonymous_bullets = {}
+            for point in points:
+                identity = self._next_anonymous_bullet_identity
+                self._next_anonymous_bullet_identity += 1
+                self._anonymous_bullets[identity] = _AnonymousBulletTrack(
+                    identity=identity,
+                    engine_id=point.engine_id,
+                    frame=frame,
+                    x=point.x,
+                    y=point.y,
+                    radius=point.radius,
+                    vx=0.0,
+                    vy=0.0,
+                    birth_frame=frame,
+                    birth_x=point.x,
+                    birth_y=point.y,
+                )
+            self._anonymous_bullet_frame = frame
+            # The first visible set contains bullets of unknown age, so it is
+            # deliberately a tracking baseline rather than a birth event.
+            return []
+
+        elapsed = frame - previous_frame
+        maximum_error = max(8.0, 8.0 * elapsed)
+        radius_tolerance = 1.5
+        previous_by_id: dict[Any, list[_AnonymousBulletTrack]] = {}
+        for track in previous:
+            if track.engine_id is not None:
+                previous_by_id.setdefault(track.engine_id, []).append(track)
+
+        id_candidates: list[tuple[float, int, int]] = []
+        for point_index, point in enumerate(points):
+            if point.engine_id is None:
+                continue
+            for track in previous_by_id.get(point.engine_id, ()):
+                predicted_x, predicted_y = self._anonymous_predicted_position(
+                    track,
+                    elapsed,
+                )
+                distance = math.hypot(point.x - predicted_x, point.y - predicted_y)
+                if (
+                    distance <= maximum_error
+                    and abs(point.radius - track.radius)
+                    <= max(radius_tolerance, 0.25 * point.radius)
+                ):
+                    id_candidates.append((distance, point_index, track.identity))
+        stable_denominator = max(1, min(len(points), len(previous)))
+        stable_id_mode = len(id_candidates) >= 0.5 * stable_denominator
+
+        candidates = id_candidates if stable_id_mode else []
+        if not stable_id_mode and points and previous:
+            cell_size = maximum_error
+            grid: dict[tuple[int, int], list[_AnonymousBulletTrack]] = {}
+            for track in previous:
+                predicted_x, predicted_y = self._anonymous_predicted_position(
+                    track,
+                    elapsed,
+                )
+                cell = (
+                    math.floor(predicted_x / cell_size),
+                    math.floor(predicted_y / cell_size),
+                )
+                grid.setdefault(cell, []).append(track)
+            for point_index, point in enumerate(points):
+                cell_x = math.floor(point.x / cell_size)
+                cell_y = math.floor(point.y / cell_size)
+                for offset_x in (-1, 0, 1):
+                    for offset_y in (-1, 0, 1):
+                        for track in grid.get(
+                            (cell_x + offset_x, cell_y + offset_y),
+                            (),
+                        ):
+                            predicted_x, predicted_y = (
+                                self._anonymous_predicted_position(track, elapsed)
+                            )
+                            distance = math.hypot(
+                                point.x - predicted_x,
+                                point.y - predicted_y,
+                            )
+                            if (
+                                distance <= maximum_error
+                                and abs(point.radius - track.radius)
+                                <= max(radius_tolerance, 0.25 * point.radius)
+                            ):
+                                candidates.append((
+                                    distance,
+                                    point_index,
+                                    track.identity,
+                                ))
+
+        matched_points: dict[int, _AnonymousBulletTrack] = {}
+        matched_tracks: set[int] = set()
+        previous_by_identity = {value.identity: value for value in previous}
+        for _distance, point_index, track_identity in sorted(candidates):
+            if point_index in matched_points or track_identity in matched_tracks:
+                continue
+            matched_points[point_index] = previous_by_identity[track_identity]
+            matched_tracks.add(track_identity)
+
+        current: dict[int, _AnonymousBulletTrack] = {}
+        births: list[_AnonymousBulletTrack] = []
+        for point_index, point in enumerate(points):
+            old = matched_points.get(point_index)
+            if old is None:
+                identity = self._next_anonymous_bullet_identity
+                self._next_anonymous_bullet_identity += 1
+                track = _AnonymousBulletTrack(
+                    identity=identity,
+                    engine_id=point.engine_id,
+                    frame=frame,
+                    x=point.x,
+                    y=point.y,
+                    radius=point.radius,
+                    vx=0.0,
+                    vy=0.0,
+                    birth_frame=frame,
+                    birth_x=point.x,
+                    birth_y=point.y,
+                )
+                births.append(track)
+            else:
+                track = _AnonymousBulletTrack(
+                    identity=old.identity,
+                    engine_id=point.engine_id,
+                    frame=frame,
+                    x=point.x,
+                    y=point.y,
+                    radius=point.radius,
+                    vx=(point.x - old.x) / elapsed,
+                    vy=(point.y - old.y) / elapsed,
+                    family_identity=old.family_identity,
+                    birth_frame=old.birth_frame,
+                    birth_x=old.birth_x,
+                    birth_y=old.birth_y,
+                    birth_angle=old.birth_angle,
+                )
+                self._record_spawn_motion(track)
+            current[track.identity] = track
+        self._anonymous_bullets = current
+        self._anonymous_bullet_frame = frame
+        return births
+
+    @staticmethod
+    def _anchor_points(observation: Mapping[str, Any]) -> list[tuple[float, float]]:
+        result: list[tuple[float, float]] = []
+        for source in ("enemies", "nontjt_enemies"):
+            records = observation.get(source)
+            if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+                continue
+            for record in records:
+                if not isinstance(record, Mapping):
+                    continue
+                x = _number(record.get("x"))
+                y = _number(record.get("y"))
+                if x is not None and y is not None:
+                    result.append((x, y))
+        return result
+
+    def _spawn_family_match_score(
+        self,
+        family: _SpawnFamily,
+        event: _SpawnEvent,
+    ) -> float | None:
+        previous = family.events[-1]
+        elapsed = event.frame - previous.frame
+        if elapsed <= 0 or elapsed > 3 * self.config.spawn_prediction_max_period_frames:
+            return None
+        radius_error = abs(event.radius - previous.radius)
+        if radius_error > max(1.0, 0.25 * max(event.radius, previous.radius)):
+            return None
+        previous_offset_radius = math.hypot(previous.offset_x, previous.offset_y)
+        offset_radius = math.hypot(event.offset_x, event.offset_y)
+        offset_error = abs(offset_radius - previous_offset_radius)
+        if offset_error > max(6.0, 0.18 * max(offset_radius, previous_offset_radius)):
+            return None
+
+        anchor_vx = 0.0
+        anchor_vy = 0.0
+        if len(family.events) >= 2:
+            before = family.events[-2]
+            anchor_elapsed = previous.frame - before.frame
+            if anchor_elapsed > 0:
+                anchor_vx = (previous.anchor_x - before.anchor_x) / anchor_elapsed
+                anchor_vy = (previous.anchor_y - before.anchor_y) / anchor_elapsed
+        anchor_error = math.hypot(
+            event.anchor_x - previous.anchor_x - anchor_vx * elapsed,
+            event.anchor_y - previous.anchor_y - anchor_vy * elapsed,
+        )
+        if anchor_error > max(16.0, 8.0 * elapsed):
+            return None
+
+        interval_error = 0.0
+        angle_error = 0.0
+        if len(family.events) >= 2:
+            recent_events = family.events[-6:]
+            intervals = [
+                second.frame - first.frame
+                for first, second in zip(recent_events, recent_events[1:])
+            ]
+            period = statistics.median(intervals)
+            slot_count = max(1, int(round(elapsed / period)))
+            if slot_count > self.config.spawn_missed_emission_limit + 1:
+                return None
+            interval_error = abs(elapsed - slot_count * period)
+            if interval_error > max(1.0, 0.2 * period):
+                return None
+            if min(offset_radius, previous_offset_radius) >= 8.0:
+                before = family.events[-2]
+                before_angle = math.atan2(before.offset_y, before.offset_x)
+                previous_angle = math.atan2(previous.offset_y, previous.offset_x)
+                previous_elapsed = previous.frame - before.frame
+                angular_rate = self._wrapped_angle(
+                    previous_angle - before_angle,
+                ) / max(1, previous_elapsed)
+                expected_angle = previous_angle + angular_rate * elapsed
+                angle = math.atan2(event.offset_y, event.offset_x)
+                angle_error = abs(self._wrapped_angle(angle - expected_angle))
+                if angle_error > math.radians(35.0):
+                    return None
+        return (
+            offset_error
+            + 0.25 * anchor_error
+            + 2.0 * interval_error
+            + max(offset_radius, 8.0) * angle_error
+        )
+
+    def _assign_spawn_events(
+        self,
+        frame: int,
+        births: Sequence[_AnonymousBulletTrack],
+        anchors: Sequence[tuple[float, float]],
+    ) -> None:
+        if not births or not anchors:
+            return
+        used_families: set[int] = set()
+        for track in births:
+            anchor_x, anchor_y = min(
+                anchors,
+                key=lambda value: math.hypot(track.x - value[0], track.y - value[1]),
+            )
+            anchor_distance = math.hypot(track.x - anchor_x, track.y - anchor_y)
+            if anchor_distance > self.config.spawn_anchor_association_radius:
+                continue
+            event = _SpawnEvent(
+                frame=frame,
+                anchor_x=anchor_x,
+                anchor_y=anchor_y,
+                offset_x=track.x - anchor_x,
+                offset_y=track.y - anchor_y,
+                radius=track.radius,
+                track_identity=track.identity,
+            )
+            candidates = [
+                (score, family)
+                for family in self._spawn_families
+                if family.identity not in used_families
+                and (score := self._spawn_family_match_score(family, event))
+                is not None
+            ]
+            if candidates:
+                _score, family = min(candidates, key=lambda value: value[0])
+            else:
+                family = _SpawnFamily(self._next_spawn_family_identity)
+                self._next_spawn_family_identity += 1
+                self._spawn_families.append(family)
+            family.events.append(event)
+            family.events = family.events[-16:]
+            family.motion_samples.append(_SpawnMotionSample(
+                age=0,
+                x=0.0,
+                y=0.0,
+                radial_basis=anchor_distance >= 8.0,
+            ))
+            family.motion_samples = family.motion_samples[-2048:]
+            used_families.add(family.identity)
+            track.family_identity = family.identity
+            track.birth_frame = frame
+            track.birth_x = track.x
+            track.birth_y = track.y
+            track.birth_angle = (
+                math.atan2(event.offset_y, event.offset_x)
+                if anchor_distance >= 8.0 else
+                None
+            )
+
+    def _spawn_family_model(
+        self,
+        family: _SpawnFamily,
+    ) -> _SpawnFamilyModel | None:
+        sample_count = self.config.spawn_family_min_samples
+        events = family.events[-max(sample_count + 2, 8):]
+        if len(events) < sample_count:
+            return None
+        intervals = [
+            second.frame - first.frame
+            for first, second in zip(events, events[1:])
+        ]
+        period = float(statistics.median(intervals))
+        if (
+            period <= 0.0
+            or period > self.config.spawn_prediction_max_period_frames
+            or max(abs(value - period) for value in intervals)
+            > max(0.35, 0.12 * period)
+        ):
+            return None
+
+        anchor_rates = [
+            (
+                (second.anchor_x - first.anchor_x) / (second.frame - first.frame),
+                (second.anchor_y - first.anchor_y) / (second.frame - first.frame),
+            )
+            for first, second in zip(events, events[1:])
+        ]
+        anchor_vx = float(statistics.median(value[0] for value in anchor_rates))
+        anchor_vy = float(statistics.median(value[1] for value in anchor_rates))
+        offset_radii = [math.hypot(value.offset_x, value.offset_y) for value in events]
+        offset_radius = float(statistics.median(offset_radii))
+        radial_error = max(abs(value - offset_radius) for value in offset_radii)
+        if radial_error > max(4.0, 0.12 * offset_radius):
+            return None
+        projectile_radius = float(statistics.median(value.radius for value in events))
+        if max(abs(value.radius - projectile_radius) for value in events) > max(
+            1.0,
+            0.25 * projectile_radius,
+        ):
+            return None
+
+        angular_rate = 0.0
+        offset_angle: float | None = None
+        offset_x = float(statistics.median(value.offset_x for value in events))
+        offset_y = float(statistics.median(value.offset_y for value in events))
+        phase_error_distance = 0.0
+        if offset_radius >= 8.0:
+            angles = [math.atan2(value.offset_y, value.offset_x) for value in events]
+            angular_rates = [
+                self._wrapped_angle(second_angle - first_angle) / interval
+                for first_angle, second_angle, interval in zip(
+                    angles,
+                    angles[1:],
+                    intervals,
+                )
+            ]
+            angular_rate = float(statistics.median(angular_rates))
+            phase_errors = [
+                abs(self._wrapped_angle(
+                    second_angle - first_angle - angular_rate * interval,
+                ))
+                for first_angle, second_angle, interval in zip(
+                    angles,
+                    angles[1:],
+                    intervals,
+                )
+            ]
+            if max(phase_errors, default=0.0) > math.radians(20.0):
+                return None
+            offset_angle = angles[-1]
+            phase_error_distance = offset_radius * max(phase_errors, default=0.0)
+        else:
+            center_errors = [
+                math.hypot(value.offset_x - offset_x, value.offset_y - offset_y)
+                for value in events
+            ]
+            if max(center_errors, default=0.0) > 4.0:
+                return None
+            radial_error = max(radial_error, max(center_errors, default=0.0))
+        return _SpawnFamilyModel(
+            period=period,
+            anchor_vx=anchor_vx,
+            anchor_vy=anchor_vy,
+            offset_radius=offset_radius,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            offset_angle=offset_angle,
+            angular_rate=angular_rate,
+            projectile_radius=projectile_radius,
+            uncertainty=max(radial_error, phase_error_distance),
+        )
+
+    @staticmethod
+    def _spawn_motion_point(
+        family: _SpawnFamily,
+        age: int,
+        radial_basis: bool,
+    ) -> tuple[float, float] | None:
+        samples = [
+            value for value in family.motion_samples
+            if value.age == age and value.radial_basis is radial_basis
+        ]
+        if age == 0:
+            return 0.0, 0.0
+        if len(samples) < 2:
+            return None
+        return (
+            float(statistics.median(value.x for value in samples)),
+            float(statistics.median(value.y for value in samples)),
+        )
+
+    def _spawn_forecasts(
+        self,
+        frame: int,
+        anchors: Sequence[tuple[float, float]],
+    ) -> tuple[PredictedThreat, ...]:
+        if not self.config.spawn_prediction_enabled or not anchors:
+            return ()
+        control_frame = frame + self.config.observation_delay
+        if control_frame <= frame:
+            return ()
+        result: list[PredictedThreat] = []
+        for family in self._spawn_families:
+            model = self._spawn_family_model(family)
+            if model is None:
+                continue
+            last = family.events[-1]
+            expected = last.frame + model.period
+            missed = 0
+            while expected <= frame + 0.25:
+                missed += 1
+                expected += model.period
+            if missed >= self.config.spawn_missed_emission_limit:
+                continue
+
+            projected_anchor = (
+                last.anchor_x + model.anchor_vx * (frame - last.frame),
+                last.anchor_y + model.anchor_vy * (frame - last.frame),
+            )
+            current_anchor = min(
+                anchors,
+                key=lambda value: math.hypot(
+                    value[0] - projected_anchor[0],
+                    value[1] - projected_anchor[1],
+                ),
+            )
+            if math.hypot(
+                current_anchor[0] - projected_anchor[0],
+                current_anchor[1] - projected_anchor[1],
+            ) > max(24.0, 8.0 * max(1, frame - last.frame)):
+                continue
+
+            while expected <= control_frame + 0.25:
+                spawn_frame = int(round(expected))
+                if spawn_frame <= frame:
+                    expected += model.period
+                    continue
+                event_anchor_x = (
+                    current_anchor[0] + model.anchor_vx * (spawn_frame - frame)
+                )
+                event_anchor_y = (
+                    current_anchor[1] + model.anchor_vy * (spawn_frame - frame)
+                )
+                radial_basis = model.offset_angle is not None
+                angle = None
+                if radial_basis:
+                    angle = (
+                        (model.offset_angle or 0.0)
+                        + model.angular_rate * (spawn_frame - last.frame)
+                    )
+                    spawn_x = event_anchor_x + model.offset_radius * math.cos(angle)
+                    spawn_y = event_anchor_y + model.offset_radius * math.sin(angle)
+                else:
+                    spawn_x = event_anchor_x + model.offset_x
+                    spawn_y = event_anchor_y + model.offset_y
+
+                age = control_frame - spawn_frame
+
+                def world_motion(sample_age: int) -> tuple[float, float] | None:
+                    value = self._spawn_motion_point(
+                        family,
+                        sample_age,
+                        radial_basis,
+                    )
+                    if value is None or angle is None:
+                        return value
+                    cosine = math.cos(angle)
+                    sine = math.sin(angle)
+                    return (
+                        cosine * value[0] - sine * value[1],
+                        sine * value[0] + cosine * value[1],
+                    )
+
+                motion0 = world_motion(age) or (0.0, 0.0)
+                motion1 = world_motion(age + 1)
+                motion2 = world_motion(age + 2)
+                vx = 0.0
+                vy = 0.0
+                ax = 0.0
+                ay = 0.0
+                acceleration_horizon = 0
+                motion_horizon = 0
+                if motion1 is not None:
+                    delta_x = motion1[0] - motion0[0]
+                    delta_y = motion1[1] - motion0[1]
+                    vx, vy = delta_x, delta_y
+                    motion_horizon = self.config.horizon_frames
+                    if motion2 is not None:
+                        ax = motion2[0] - 2.0 * motion1[0] + motion0[0]
+                        ay = motion2[1] - 2.0 * motion1[1] + motion0[1]
+                        vx -= 0.5 * ax
+                        vy -= 0.5 * ay
+                        acceleration_horizon = min(
+                            6,
+                            self.config.horizon_frames,
+                        )
+                result.append(PredictedThreat(
+                    key=f"spawn-forecast:{family.identity}:{spawn_frame}",
+                    source="spawn_forecast_inferred",
+                    object_id=None,
+                    x=spawn_x + motion0[0],
+                    y=spawn_y + motion0[1],
+                    vx=vx,
+                    vy=vy,
+                    radius=(
+                        model.projectile_radius
+                        + self.config.spawn_prediction_uncertainty
+                        + model.uncertainty
+                    ),
+                    radius_rate=0.0,
+                    source_frame=frame,
+                    observation_delay=self.config.observation_delay,
+                    radius_rate_horizon=0,
+                    motion_horizon=motion_horizon,
+                    ax=ax,
+                    ay=ay,
+                    acceleration_horizon=acceleration_horizon,
+                ))
+                expected += model.period
+        return tuple(sorted(result, key=lambda value: value.key))
+
+    def _launch_prediction(
+        self,
+        *,
+        frame: int,
+        x: float,
+        y: float,
+        radius: float,
+        first_frame: int,
+        orientation: float | None,
+    ) -> tuple[float, float, int] | None:
+        """Infer a delayed launch from episode-local visible transitions."""
+
+        if not self.config.launch_prediction_enabled:
+            return None
+        radius_tolerance = max(0.75, 0.25 * radius)
+        eligible = [
+            sample
+            for sample in self._launch_samples
+            if frame - sample.frame <= self.config.launch_template_max_age_frames
+            and abs(sample.radius - radius) <= radius_tolerance
+        ]
+
+        def finish(
+            vx: float,
+            vy: float,
+            samples: Sequence[_LaunchSample],
+        ) -> tuple[float, float, int] | None:
+            if math.hypot(vx, vy) < self.config.gap_minimum_speed:
+                return None
+            stationary_frames = int(round(statistics.median(
+                sample.stationary_frames for sample in samples
+            )))
+            observed_age = max(0, frame - first_frame)
+            # A launch template is only a warning before its learned deadline.
+            # If the visible projectile remains stationary beyond that point,
+            # the current instance has already falsified the template.
+            if observed_age > stationary_frames:
+                return None
+            return vx, vy, max(0, stationary_frames - observed_age)
+
+        oriented = [
+            sample for sample in eligible
+            if orientation is not None and sample.orientation is not None
+            and math.hypot(sample.vx, sample.vy)
+            >= self.config.gap_minimum_speed
+        ][-64:]
+        best_oriented: list[_LaunchSample] = []
+        best_oriented_key = (0, -1)
+        for anchor in reversed(oriented[-8:]):
+            anchor_speed = math.hypot(anchor.vx, anchor.vy)
+            anchor_offset = math.atan2(anchor.vy, anchor.vx) - math.radians(
+                anchor.orientation or 0.0
+            )
+            consistent = []
+            for sample in oriented:
+                speed = math.hypot(sample.vx, sample.vy)
+                offset = math.atan2(sample.vy, sample.vx) - math.radians(
+                    sample.orientation or 0.0
+                )
+                offset_error = abs(math.atan2(
+                    math.sin(offset - anchor_offset),
+                    math.cos(offset - anchor_offset),
+                ))
+                speed_tolerance = max(0.75, 0.35 * max(speed, anchor_speed))
+                if (
+                    offset_error <= math.radians(15.0)
+                    and abs(speed - anchor_speed) <= speed_tolerance
+                ):
+                    consistent.append(sample)
+            key = (
+                len(consistent),
+                max((sample.frame for sample in consistent), default=-1),
+            )
+            if key > best_oriented_key:
+                best_oriented_key = key
+                best_oriented = consistent
+        if len(best_oriented) >= self.config.launch_template_min_samples:
+            weights = [
+                1.0 / (1.0 + max(0, frame - sample.frame) / 60.0)
+                for sample in best_oriented
+            ]
+            weight_sum = sum(weights)
+            mean_speed = sum(
+                weight * math.hypot(sample.vx, sample.vy)
+                for weight, sample in zip(weights, best_oriented)
+            ) / weight_sum
+            offset_sin = 0.0
+            offset_cos = 0.0
+            for weight, sample in zip(weights, best_oriented):
+                offset = math.atan2(sample.vy, sample.vx) - math.radians(
+                    sample.orientation or 0.0
+                )
+                offset_sin += weight * math.sin(offset)
+                offset_cos += weight * math.cos(offset)
+            direction = math.radians(orientation or 0.0) + math.atan2(
+                offset_sin,
+                offset_cos,
+            )
+            predicted = finish(
+                mean_speed * math.cos(direction),
+                mean_speed * math.sin(direction),
+                best_oriented,
+            )
+            if predicted is not None:
+                return predicted
+
+        maximum_distance = self.config.launch_template_position_radius
+        candidates = [
+            (
+                math.hypot(sample.x - x, sample.y - y),
+                sample,
+            )
+            for sample in eligible
+            if math.hypot(sample.x - x, sample.y - y) <= maximum_distance
+        ]
+        if len(candidates) < self.config.launch_template_min_samples:
+            return None
+        candidates.sort(key=lambda value: (value[0], -value[1].frame))
+        anchor = candidates[0][1]
+        anchor_speed = math.hypot(anchor.vx, anchor.vy)
+        if anchor_speed < self.config.gap_minimum_speed:
+            return None
+        direction_cosine = math.cos(math.radians(30.0))
+        consistent: list[tuple[float, _LaunchSample]] = []
+        for distance, sample in candidates:
+            speed = math.hypot(sample.vx, sample.vy)
+            if speed < self.config.gap_minimum_speed:
+                continue
+            direction_match = (
+                sample.vx * anchor.vx + sample.vy * anchor.vy
+            ) / (speed * anchor_speed)
+            speed_tolerance = max(0.75, 0.35 * max(speed, anchor_speed))
+            if (
+                direction_match >= direction_cosine
+                and abs(speed - anchor_speed) <= speed_tolerance
+            ):
+                consistent.append((distance, sample))
+            if len(consistent) >= 7:
+                break
+        if len(consistent) < self.config.launch_template_min_samples:
+            return None
+
+        weights = [1.0 / (4.0 + distance) for distance, _ in consistent]
+        weight_sum = sum(weights)
+        vx = sum(
+            weight * sample.vx
+            for weight, (_, sample) in zip(weights, consistent)
+        ) / weight_sum
+        vy = sum(
+            weight * sample.vy
+            for weight, (_, sample) in zip(weights, consistent)
+        ) / weight_sum
+        return finish(vx, vy, [sample for _, sample in consistent])
+
     def update(self, observation: Mapping[str, Any]) -> tuple[PredictedThreat, ...]:
         observation = _unwrap_observation(observation)
         self._fallback_frame += 1
         frame = _frame(observation, self._fallback_frame)
+        if (
+            self.last_frame is not None
+            and frame == self.last_frame
+            and self._last_result is not None
+        ):
+            return self._last_result
         if self.last_frame is not None and frame < self.last_frame:
             self.reset()
             self._fallback_frame = frame
@@ -1324,6 +2293,7 @@ class VisibleTrackEstimator:
         delay = self.config.observation_delay
 
         source_records: list[tuple[str, Sequence[Any]]] = []
+        enemy_bullet_records: Sequence[Any] = ()
         fallback_lasers: list[Mapping[str, Any]] = []
         for source in _OBJECT_ARRAYS:
             records = observation.get(source)
@@ -1336,6 +2306,8 @@ class VisibleTrackEstimator:
                 else:
                     ordinary.append(record)
             source_records.append((source, ordinary))
+            if source == "enemy_bullets":
+                enemy_bullet_records = ordinary
 
         laser_records = observation.get("lasers")
         if not isinstance(laser_records, Sequence) or isinstance(laser_records, (str, bytes)):
@@ -1409,9 +2381,85 @@ class VisibleTrackEstimator:
                     (radius - previous.radius) / elapsed
                     if continuous and elapsed > 0 else 0.0
                 )
-                current = _Track(frame, x, y, radius, vx, vy, radius_rate)
+                orientation = _number(record.get("rot"))
+                first_frame = (
+                    previous.first_frame if continuous and previous is not None else frame
+                )
+                speed = math.hypot(vx, vy)
+                previous_speed = (
+                    math.hypot(previous.vx, previous.vy)
+                    if continuous and previous is not None else
+                    0.0
+                )
+                launch_transition = (
+                    source == "enemy_bullets"
+                    and continuous
+                    and previous is not None
+                    and previous_speed <= 0.25
+                    and speed >= self.config.gap_minimum_speed
+                )
+                ax = 0.0
+                ay = 0.0
+                acceleration_streak = 0
+                if (
+                    self.config.motion_dynamics_enabled
+                    and continuous
+                    and previous is not None
+                    and elapsed > 0
+                    and not launch_transition
+                ):
+                    candidate_ax = (vx - previous.vx) / elapsed
+                    candidate_ay = (vy - previous.vy) / elapsed
+                    if math.hypot(candidate_ax, candidate_ay) >= 0.002:
+                        consistent_acceleration = (
+                            previous.acceleration_streak > 0
+                            and math.hypot(
+                                candidate_ax - previous.ax,
+                                candidate_ay - previous.ay,
+                            ) <= self.config.motion_acceleration_tolerance
+                        )
+                        ax = candidate_ax
+                        ay = candidate_ay
+                        acceleration_streak = (
+                            previous.acceleration_streak + 1
+                            if consistent_acceleration else
+                            1
+                        )
+                current = _Track(
+                    frame,
+                    x,
+                    y,
+                    radius,
+                    vx,
+                    vy,
+                    radius_rate,
+                    first_frame,
+                    orientation,
+                    ax,
+                    ay,
+                    acceleration_streak,
+                )
                 self._tracks[key] = current
                 seen.add(key)
+                if (
+                    launch_transition
+                    and previous is not None
+                    and frame - previous.first_frame >= self.config.decision_interval
+                ):
+                    self._launch_samples.append(_LaunchSample(
+                        frame=frame,
+                        x=previous.x,
+                        y=previous.y,
+                        radius=previous.radius,
+                        vx=vx,
+                        vy=vy,
+                        # Motion may have started anywhere since the previous
+                        # sample. Use the last confirmed stationary frame as
+                        # the conservative launch boundary instead of waiting
+                        # until the first sampled displacement.
+                        stationary_frames=previous.frame - previous.first_frame,
+                        orientation=previous.orientation,
+                    ))
                 motion_horizon = (
                     self.config.nonbullet_motion_horizon
                     if source in {"enemies", "nontjt_enemies", "lasers"} else
@@ -1420,6 +2468,44 @@ class VisibleTrackEstimator:
                 predicted_radius_rate = radius_rate
                 radius_rate_horizon = self.config.radius_rate_horizon
                 predicted_radius = radius
+                threat_vx = vx
+                threat_vy = vy
+                threat_ax = ax
+                threat_ay = ay
+                acceleration_horizon = min(
+                    motion_horizon,
+                    2 * acceleration_streak * self.config.decision_interval,
+                )
+                motion_start_delay = 0
+                launch_motion_inferred = False
+                if source == "enemy_bullets" and speed <= 0.25:
+                    launch = self._launch_prediction(
+                        frame=frame,
+                        x=x,
+                        y=y,
+                        radius=radius,
+                        first_frame=first_frame,
+                        orientation=orientation,
+                    )
+                    if launch is not None:
+                        threat_vx, threat_vy, remaining_stationary = launch
+                        motion_before_control = max(
+                            0,
+                            delay - remaining_stationary,
+                        )
+                        motion_start_delay = max(
+                            0,
+                            remaining_stationary - delay,
+                        )
+                        predicted_radius += self.config.launch_prediction_uncertainty
+                        launch_motion_inferred = True
+                        threat_ax = 0.0
+                        threat_ay = 0.0
+                        acceleration_horizon = 0
+                    else:
+                        motion_before_control = delay
+                else:
+                    motion_before_control = delay
                 if (
                     source == "indestructibles"
                     and self.config.region_dynamics_memory is not None
@@ -1449,14 +2535,39 @@ class VisibleTrackEstimator:
                         radius_rate_horizon = 0
                     elif radius_rate > 0.1:
                         predicted_radius_rate = max(radius_rate, step)
+                moving_before_control = min(
+                    motion_before_control,
+                    motion_horizon,
+                )
+                acceleration_before_control = min(
+                    moving_before_control,
+                    acceleration_horizon,
+                )
+                acceleration_scale = acceleration_before_control * (
+                    moving_before_control - 0.5 * acceleration_before_control
+                )
+                predicted_x = (
+                    x + threat_vx * moving_before_control
+                    + threat_ax * acceleration_scale
+                )
+                predicted_y = (
+                    y + threat_vy * moving_before_control
+                    + threat_ay * acceleration_scale
+                )
+                threat_vx += threat_ax * acceleration_before_control
+                threat_vy += threat_ay * acceleration_before_control
+                acceleration_horizon = max(
+                    0,
+                    acceleration_horizon - acceleration_before_control,
+                )
                 visible.append(PredictedThreat(
                     key=key,
                     source=source,
                     object_id=record.get("id", ordinal),
-                    x=x + vx * min(delay, motion_horizon),
-                    y=y + vy * min(delay, motion_horizon),
-                    vx=vx,
-                    vy=vy,
+                    x=predicted_x,
+                    y=predicted_y,
+                    vx=threat_vx,
+                    vy=threat_vy,
                     radius=max(
                         0.1,
                         predicted_radius
@@ -1467,7 +2578,21 @@ class VisibleTrackEstimator:
                     observation_delay=delay,
                     radius_rate_horizon=radius_rate_horizon,
                     motion_horizon=motion_horizon,
+                    motion_start_delay=motion_start_delay,
+                    launch_motion_inferred=launch_motion_inferred,
+                    ax=threat_ax,
+                    ay=threat_ay,
+                    acceleration_horizon=acceleration_horizon,
                 ))
+
+        if self.config.spawn_prediction_enabled and delay > 0:
+            anchors = self._anchor_points(observation)
+            births = self._update_anonymous_bullets(
+                frame,
+                enemy_bullet_records,
+            )
+            self._assign_spawn_events(frame, births, anchors)
+            visible.extend(self._spawn_forecasts(frame, anchors))
 
         oldest = frame - self.config.stale_track_frames
         self._tracks = {
@@ -1475,8 +2600,22 @@ class VisibleTrackEstimator:
             for key, track in self._tracks.items()
             if key in seen or track.frame >= oldest
         }
+        launch_oldest = frame - self.config.launch_template_max_age_frames
+        self._launch_samples = [
+            sample for sample in self._launch_samples
+            if sample.frame >= launch_oldest
+        ][-512:]
+        for family in self._spawn_families:
+            family.events = [
+                event for event in family.events
+                if event.frame >= launch_oldest
+            ]
+        self._spawn_families = [
+            family for family in self._spawn_families if family.events
+        ][-256:]
         self._previous_visible = seen
-        return tuple(visible)
+        self._last_result = tuple(visible)
+        return self._last_result
 
 
 class EngineMPC:
@@ -1489,8 +2628,20 @@ class EngineMPC:
         self.reset()
 
     def reset(self) -> None:
+        """Clear all observation-derived state for a new native episode."""
+
+        self._reset_transient_state()
+
+    def on_stage_boundary(self) -> None:
+        """Discard geometry and plans that cannot cross a native stage boundary."""
+
+        self._reset_transient_state()
+
+    def _reset_transient_state(self) -> None:
         self.estimator.reset()
         self._last_source_frame: int | None = None
+        self._cached_threat_source_frame: int | None = None
+        self._cached_threats: tuple[PredictedThreat, ...] | None = None
         self._last_decision_frame: int | None = None
         self._decision: MPCDecision | None = None
         dynamics_memory = self.config.region_dynamics_memory
@@ -1512,12 +2663,38 @@ class EngineMPC:
         self._region_topology = _RegionTopologyMemory()
         self._committed_plan: tuple[Action, ...] = ()
         self._committed_plan_is_region = False
+        self._committed_plan_is_gap = False
         self._committed_plan_evacuating = False
         self._committed_plan_key: tuple[Any, ...] | None = None
+        self._committed_gap: _GapCorridor | None = None
+        self._committed_gap_frame: int | None = None
         self._last_action: Action | None = None
         self._previous_action: Action | None = None
         self._direction_started_frame: int | None = None
         self._active_gap_key: str | None = None
+        self._active_gap: _GapCorridor | None = None
+        self._active_gap_frame: int | None = None
+
+    def _observed_threats(
+        self,
+        observation: Mapping[str, Any],
+    ) -> tuple[PredictedThreat, ...]:
+        """Consume each delayed source frame exactly once."""
+
+        source_hint = observation.get("episode_frame", observation.get("frame"))
+        if (
+            not isinstance(source_hint, bool)
+            and isinstance(source_hint, int)
+            and source_hint == self._cached_threat_source_frame
+            and self._cached_threats is not None
+        ):
+            return self._cached_threats
+        threats = self.estimator.update(observation)
+        source_frame = self.estimator.last_frame
+        assert source_frame is not None
+        self._cached_threat_source_frame = source_frame
+        self._cached_threats = threats
+        return threats
 
     @staticmethod
     def _player(observation: Mapping[str, Any], delay: int) -> tuple[float, float, float, float, float]:
@@ -1572,17 +2749,34 @@ class EngineMPC:
         x: float,
         y: float,
         bounds: tuple[float, float, float, float],
+        player_radius: float = 0.0,
     ) -> float:
         left, right, bottom, top = bounds
-        horizontal = max(0.0, min(x - left, right - x))
-        vertical = max(0.0, min(y - bottom, top - y))
-        return math.hypot(horizontal, vertical)
+        return max(
+            0.0,
+            min(x - left, right - x, y - bottom, top - y) - player_radius,
+        )
 
     def _corner_shortfall(self, clearance: float) -> float:
         return self.config.corner_reserve_weight * max(
             0.0,
             self.config.corner_reserve_target - clearance,
         )
+
+    def _maneuver_clearance(
+        self,
+        x: float,
+        y: float,
+        bounds: tuple[float, float, float, float],
+        player_radius: float = 0.0,
+    ) -> float:
+        """Return edge reserve while allowing a deliberate bottom anchor."""
+
+        left, right, bottom, top = bounds
+        distances = [x - left, right - x, top - y]
+        if not self.config.bottom_anchor_enabled:
+            distances.append(y - bottom)
+        return max(0.0, min(distances) - player_radius)
 
     @staticmethod
     def _direction(action: Action | None) -> tuple[int, int] | None:
@@ -1610,6 +2804,13 @@ class EngineMPC:
             ):
                 penalty += self.config.direction_reverse_penalty
             if (
+                direction != (0, 0)
+                and previous_direction != (0, 0)
+                and action.move_x * previous.move_x
+                + action.move_y * previous.move_y < 0
+            ):
+                penalty += self.config.direction_sharp_turn_penalty
+            if (
                 two_ago is not None
                 and direction == self._direction(two_ago)
                 and direction != previous_direction
@@ -1618,6 +2819,14 @@ class EngineMPC:
         elif action.slow != previous.slow:
             penalty += self.config.speed_switch_penalty
         return penalty
+
+    def _action_motion_penalty(self, action: Action) -> float:
+        if action.move_x == 0 and action.move_y == 0:
+            return 0.0
+        return (
+            self.config.moving_action_penalty
+            + (0.0 if action.slow else self.config.fast_action_penalty)
+        )
 
     def _clearance_reward(
         self,
@@ -1878,6 +3087,25 @@ class EngineMPC:
             if widths[side][widest_index] < 0.0:
                 return None
             target_x = targets[side][widest_index]
+        elif self.config.region_nearest_waypoint_enabled:
+            open_targets = [
+                target
+                for target, width in zip(
+                    targets[side],
+                    widths[side],
+                    strict=True,
+                )
+                if width >= 0.0
+            ]
+            if not open_targets:
+                return None
+            # Rows pass the player one at a time. Aim for the nearest currently
+            # usable exterior waypoint and let the live beam advance it as the
+            # next row arrives; targeting the union's extreme edge causes a
+            # needless full-speed boundary sprint and subsequent reversal.
+            target_x = (
+                max(open_targets) if side == "left" else min(open_targets)
+            )
         else:
             target_x = (
                 min(targets[side]) if side == "left" else max(targets[side])
@@ -1923,6 +3151,7 @@ class EngineMPC:
             value
             for value in threats
             if value.source == "enemy_bullets"
+            and value.acceleration_horizon == 0
             and math.hypot(value.vx, value.vy) >= self.config.gap_minimum_speed
         ]
         if len(eligible) < self.config.gap_minimum_group_size:
@@ -2099,7 +3328,7 @@ class EngineMPC:
                 end_frame - block_start,
             )
             best: tuple[
-                tuple[float, float, float, int],
+                tuple[float, float, float, float, float, int],
                 tuple[tuple[float, float], ...],
                 Action,
             ] | None = None
@@ -2117,8 +3346,19 @@ class EngineMPC:
                     candidate.append((x, y))
                 endpoint_u = x * normal_x + y * normal_y
                 movement = math.hypot(x - current_x, y - current_y)
+                outside = outside_distance(x, y)
+                remaining_frames = max(
+                    0,
+                    deadline_frame - (block_start + block_length),
+                )
+                deadline_unreachable = float(
+                    outside > speed * remaining_frames + 1e-6
+                )
+                hold_shortfall, style_penalty = self._gap_plan_style((*plan, action))
                 score = (
-                    outside_distance(x, y),
+                    deadline_unreachable,
+                    hold_shortfall,
+                    outside + style_penalty,
                     movement,
                     abs(endpoint_u - center_u),
                     action_index,
@@ -2149,6 +3389,45 @@ class EngineMPC:
                 for index in range(end_frame)
             )
         return path_x, path_y, travel_frames, settled, tuple(plan)
+
+    def _gap_plan_style(
+        self,
+        plan: Sequence[Action],
+    ) -> tuple[float, float]:
+        """Score human movement style without weakening gap feasibility checks."""
+
+        previous = self._last_action
+        two_ago = self._previous_action
+        if (
+            previous is not None
+            and self._direction_started_frame is not None
+            and self._last_source_frame is not None
+        ):
+            held_frames = max(
+                0,
+                self._last_source_frame - self._direction_started_frame,
+            )
+        else:
+            held_frames = self.config.minimum_direction_hold_frames
+        hold_shortfall = 0.0
+        style_penalty = 0.0
+        for action in plan:
+            direction_changed = (
+                previous is not None
+                and self._direction(action) != self._direction(previous)
+            )
+            if direction_changed:
+                hold_shortfall += max(
+                    0,
+                    self.config.minimum_direction_hold_frames - held_frames,
+                )
+                held_frames = self.config.decision_interval
+            else:
+                held_frames += self.config.decision_interval
+            style_penalty += self._transition_penalty(action, previous, two_ago)
+            style_penalty += self._action_motion_penalty(action)
+            two_ago, previous = previous, action
+        return hold_shortfall, style_penalty
 
     def _gap_detour_entry_path(
         self,
@@ -2208,6 +3487,8 @@ class EngineMPC:
         state_travel = np.asarray([
             0.0 if initially_inside else math.inf
         ], dtype=np.float64)
+        state_hold_shortfall = np.zeros(1, dtype=np.float64)
+        state_style_penalty = np.zeros(1, dtype=np.float64)
         state_plans = np.empty((1, 0), dtype=np.int16)
         state_path_x = np.empty((1, 0), dtype=np.float64)
         state_path_y = np.empty((1, 0), dtype=np.float64)
@@ -2290,6 +3571,20 @@ class EngineMPC:
                 state_path_y[parent],
                 block_path_y,
             ), axis=1)
+            style = [
+                self._gap_plan_style(tuple(
+                    self.actions[int(value)] for value in plan
+                ))
+                for plan in expanded_plans
+            ]
+            expanded_hold_shortfall = np.asarray(
+                [value[0] for value in style],
+                dtype=np.float64,
+            )
+            expanded_style_penalty = np.asarray(
+                [value[1] for value in style],
+                dtype=np.float64,
+            )
             endpoint_distance = np.hypot(
                 current_x - target[0],
                 current_y - target[1],
@@ -2298,7 +3593,8 @@ class EngineMPC:
                 action_index[keepable],
                 endpoint_distance[keepable],
                 -expanded_margin[keepable],
-                outside[keepable],
+                outside[keepable] + expanded_style_penalty[keepable],
+                expanded_hold_shortfall[keepable],
             ))]
 
             selected: list[int] = []
@@ -2341,12 +3637,19 @@ class EngineMPC:
             state_y = current_y[selected_array]
             state_margin = expanded_margin[selected_array]
             state_travel = expanded_travel[selected_array]
+            state_hold_shortfall = expanded_hold_shortfall[selected_array]
+            state_style_penalty = expanded_style_penalty[selected_array]
             state_plans = expanded_plans[selected_array]
             state_path_x = expanded_path_x[selected_array]
             state_path_y = expanded_path_y[selected_array]
 
         final_distance = np.hypot(state_x - target[0], state_y - target[1])
-        selected = int(np.lexsort((final_distance, -state_margin))[0])
+        selected = int(np.lexsort((
+            final_distance,
+            -state_margin,
+            state_style_penalty,
+            state_hold_shortfall,
+        ))[0])
         plan = tuple(
             self.actions[int(value)] for value in state_plans[selected]
         )
@@ -2443,20 +3746,37 @@ class EngineMPC:
         motion_horizon = np.asarray([
             value.motion_horizon for value in threats
         ], dtype=np.float64)[None, :]
+        motion_start_delay = np.asarray([
+            value.motion_start_delay for value in threats
+        ], dtype=np.float64)[None, :]
         radius_horizon = np.asarray([
             value.radius_rate_horizon for value in threats
         ], dtype=np.float64)[None, :]
-        motion_frames = np.minimum(frames, motion_horizon)
+        acceleration_horizon = np.asarray([
+            value.acceleration_horizon for value in threats
+        ], dtype=np.float64)[None, :]
+        motion_frames = np.minimum(
+            np.maximum(0.0, frames - motion_start_delay),
+            motion_horizon,
+        )
+        acceleration_frames = np.minimum(motion_frames, acceleration_horizon)
+        acceleration_scale = acceleration_frames * (
+            motion_frames - 0.5 * acceleration_frames
+        )
         radius_frames = np.minimum(frames, radius_horizon)
         future_x = (
             np.asarray([value.x for value in threats], dtype=np.float64)[None, :]
             + motion_frames
             * np.asarray([value.vx for value in threats], dtype=np.float64)[None, :]
+            + acceleration_scale
+            * np.asarray([value.ax for value in threats], dtype=np.float64)[None, :]
         )
         future_y = (
             np.asarray([value.y for value in threats], dtype=np.float64)[None, :]
             + motion_frames
             * np.asarray([value.vy for value in threats], dtype=np.float64)[None, :]
+            + acceleration_scale
+            * np.asarray([value.ay for value in threats], dtype=np.float64)[None, :]
         )
         future_radius = np.maximum(
             0.1,
@@ -2644,8 +3964,23 @@ class EngineMPC:
                 clamped_u = clamped_x * normal_x + clamped_y * normal_y
                 if abs(clamped_u - center_at_arrival) > 0.5 * minimum_usable_width:
                     continue
+                source_frame = max(
+                    (value.source_frame for value in group.members),
+                    default=0,
+                )
+                intent_key = self._gap_intent_key(
+                    normal_x=normal_x,
+                    normal_y=normal_y,
+                    center_u=center_at_arrival,
+                    arrival_frames=arrival_frames,
+                    source_frame=source_frame,
+                )
                 corridors.append(_GapCorridor(
-                    key=f"{group.key}:gap:{lower.key}>{upper.key}",
+                    key=(
+                        "gap:"
+                        + ":".join(str(value) for value in intent_key)
+                        + f":{lower.key}>{upper.key}"
+                    ),
                     group_key=group.key,
                     center_x=clamped_x,
                     center_y=clamped_y,
@@ -2656,6 +3991,7 @@ class EngineMPC:
                     normal_x=normal_x,
                     normal_y=normal_y,
                     member_count=len(group.members),
+                    intent_key=intent_key,
                 ))
         return groups, tuple(sorted(
             corridors,
@@ -2665,6 +4001,92 @@ class EngineMPC:
                 value.key,
             ),
         ))
+
+    def _gap_intent_key(
+        self,
+        *,
+        normal_x: float,
+        normal_y: float,
+        center_u: float,
+        arrival_frames: float,
+        source_frame: int,
+    ) -> tuple[int, int, int]:
+        """Quantize observable geometry into an episode-local gap identity."""
+
+        direction_step = math.radians(self.config.gap_direction_tolerance_degrees)
+        center_step = max(
+            self.config.gap_minimum_usable_width,
+            self.config.beam_cell_size,
+            2.0 * self.config.track_displacement_tolerance
+            * self.config.decision_interval,
+        )
+        phase_step = max(
+            self.config.decision_interval,
+            self.config.gap_sample_interval,
+        )
+        return (
+            int(round(math.atan2(normal_y, normal_x) / direction_step)),
+            int(round(center_u / center_step)),
+            int(round((source_frame + arrival_frames) / phase_step)),
+        )
+
+    def _gap_intent_match_score(
+        self,
+        previous: _GapCorridor,
+        current: _GapCorridor,
+        previous_frame: int | None,
+        current_frame: int,
+    ) -> tuple[float, float, float] | None:
+        """Match the same physical opening despite small membership churn."""
+
+        direction_cosine = math.cos(math.radians(
+            self.config.gap_direction_tolerance_degrees,
+        ))
+        normal_alignment = (
+            previous.normal_x * current.normal_x
+            + previous.normal_y * current.normal_y
+        )
+        if normal_alignment < direction_cosine:
+            return None
+        previous_u = (
+            previous.center_x * previous.normal_x
+            + previous.center_y * previous.normal_y
+        )
+        current_u = (
+            current.center_x * previous.normal_x
+            + current.center_y * previous.normal_y
+        )
+        center_delta = abs(current_u - previous_u)
+        tracking_slack = (
+            self.config.track_displacement_tolerance
+            * (self.config.observation_delay + self.config.decision_interval)
+        )
+        overlap_limit = (
+            0.5 * (previous.usable_width + current.usable_width)
+            + tracking_slack
+        )
+        if center_delta > overlap_limit:
+            return None
+        elapsed = (
+            self.config.decision_interval
+            if previous_frame is None else
+            max(0, current_frame - previous_frame)
+        )
+        phase_error = abs(
+            current.arrival_frames - (previous.arrival_frames - elapsed)
+        )
+        phase_slack = (
+            self.config.gap_sample_interval
+            + self.config.observation_delay
+            + self.config.decision_interval
+        )
+        if phase_error > phase_slack:
+            return None
+        return (
+            0.0 if previous.intent_key == current.intent_key else 1.0,
+            center_delta,
+            phase_error,
+        )
 
     def _stationary_nonregion_margin(
         self,
@@ -2705,6 +4127,8 @@ class EngineMPC:
     ]:
         if not self.config.gap_prediction_enabled:
             self._active_gap_key = None
+            self._active_gap = None
+            self._active_gap_frame = None
             return (), (), None, "inactive"
         groups, corridors = self._gap_corridors(player, bounds, threats)
         px, py = player[:2]
@@ -2716,7 +4140,11 @@ class EngineMPC:
             if coverage.get(value.group_key, 0.0)
             >= self.config.gap_group_coverage_fraction
         ]
-        previous_active_key = self._active_gap_key
+        previous_active = self._active_gap
+        current_frame = max(
+            (value.source_frame for value in threats),
+            default=(self._last_source_frame or 0),
+        )
 
         def normal_distance(value: _GapCorridor) -> float:
             return abs(
@@ -2726,7 +4154,13 @@ class EngineMPC:
 
         def entry_width(value: _GapCorridor) -> float:
             if (
-                value.key == previous_active_key
+                previous_active is not None
+                and self._gap_intent_match_score(
+                    previous_active,
+                    value,
+                    self._active_gap_frame,
+                    current_frame,
+                ) is not None
                 or normal_distance(value) <= 0.5 * value.usable_width
             ):
                 return value.usable_width
@@ -2809,13 +4243,26 @@ class EngineMPC:
             certified[value.key] = result
             return result
 
-        active_geometry = next(
-            (
-                value for value in candidates
-                if value.key == previous_active_key and coarse_reachable(value)
-            ),
-            None,
-        )
+        active_geometry: _GapCorridor | None = None
+        if previous_active is not None:
+            matching = [
+                (score, value)
+                for value in candidates
+                if coarse_reachable(value)
+                and (
+                    score := self._gap_intent_match_score(
+                        previous_active,
+                        value,
+                        self._active_gap_frame,
+                        current_frame,
+                    )
+                ) is not None
+            ]
+            if matching:
+                active_geometry = min(
+                    matching,
+                    key=lambda item: (*item[0], corridor_key(item[1])),
+                )[1]
         active = certify(active_geometry) if active_geometry is not None else None
         if active is not None and active.path_margin < required_margin:
             active = None
@@ -2849,8 +4296,10 @@ class EngineMPC:
             certified.get(value.key, value) for value in corridors
         )
         if not needs_gap or active is None:
-            leaving = previous_active_key is not None
+            leaving = previous_active is not None
             self._active_gap_key = None
+            self._active_gap = None
+            self._active_gap_frame = None
             return (
                 groups,
                 corridors,
@@ -2858,7 +4307,11 @@ class EngineMPC:
                 "exit" if leaving else "observe" if corridors else "inactive",
             )
 
-        self._active_gap_key = active.key
+        self._active_gap_key = "gap:" + ":".join(
+            str(value) for value in active.intent_key
+        )
+        self._active_gap = active
+        self._active_gap_frame = current_frame
         mode = (
             "hold"
             if normal_distance(active) <= max(1.0, 0.5 * active.usable_width) else
@@ -2901,7 +4354,7 @@ class EngineMPC:
         }
 
         row_y = [sum(item.y for item in row) / len(row) for row in rows]
-        px, py, player_radius, speed = player[:4]
+        px, py, player_radius, speed, focus_speed = player
         left, right, bottom, top = bounds
         side_forecast = self._region_side_forecast(rows, player, bounds)
         preferred_y = self._preferred_y(bounds)
@@ -3069,15 +4522,6 @@ class EngineMPC:
         clearance = player_radius + self.config.portal_clearance
         guard_frames = float(self.config.decision_interval) + 2.0
 
-        def travel_frames(x: float, y: float) -> float:
-            dx = abs(x - px)
-            dy = abs(y - py)
-            diagonal = min(dx, dy)
-            return (
-                diagonal / max(0.1, speed * _SQRT_HALF)
-                + (max(dx, dy) - diagonal) / max(0.1, speed)
-            )
-
         def path_margin(
             waypoints: Sequence[tuple[float, float]],
         ) -> tuple[float, int]:
@@ -3158,15 +4602,29 @@ class EngineMPC:
                 ((portal_x, target_y),)
             )
             margin, immediate_travel = path_margin(route)
+            focus_immediate_travel = self._region_travel_frames(
+                (px, py),
+                route,
+                focus_speed,
+            )
             target_y_final = (
                 row_y[target_index] + maximum_radius + clearance
             )
             remaining_vertical = max(0.0, target_y_final - target_y)
             route_travel = immediate_travel + remaining_vertical / max(0.1, speed)
+            focus_route_travel = (
+                focus_immediate_travel
+                + remaining_vertical / max(0.1, focus_speed)
+            )
             deadline_slack = (
                 -math.inf
                 if close_frames is None else
                 close_frames - route_travel - guard_frames
+            )
+            focus_deadline_slack = (
+                -math.inf
+                if close_frames is None else
+                close_frames - focus_route_travel - guard_frames
             )
             side_name = (
                 "left" if ":side:left" in portal else
@@ -3186,8 +4644,10 @@ class EngineMPC:
                 "approach_y": approach_y,
                 "close_frames": close_frames,
                 "deadline_slack": deadline_slack,
+                "focus_deadline_slack": focus_deadline_slack,
                 "path_margin": margin,
                 "travel": float(immediate_travel),
+                "focus_travel": float(focus_immediate_travel),
                 "lateral": abs(portal_x - px) / max(0.1, speed),
             })
 
@@ -3318,6 +4778,11 @@ class EngineMPC:
                 aligned = abs(px - corridor_x) <= speed * self.config.decision_interval
                 route = ((corridor_x, band_y),)
                 margin, alignment_travel = path_margin(route)
+                focus_alignment_travel = self._region_travel_frames(
+                    (px, py),
+                    route,
+                    focus_speed,
+                )
                 boundary_deadline = min(
                     side_boundary_close_frames(
                         row[0] if side == "left" else row[-1],
@@ -3345,8 +4810,14 @@ class EngineMPC:
                         if effective_deadline is None else
                         effective_deadline - alignment_travel - guard_frames
                     ),
+                    "focus_deadline_slack": (
+                        -math.inf
+                        if effective_deadline is None else
+                        effective_deadline - focus_alignment_travel - guard_frames
+                    ),
                     "path_margin": margin,
                     "travel": float(alignment_travel),
+                    "focus_travel": float(focus_alignment_travel),
                     "lateral": abs(corridor_x - px) / max(0.1, speed),
                 })
 
@@ -3368,6 +4839,11 @@ class EngineMPC:
             else:
                 route = ((side_forecast.x, band_y),)
                 margin, phase_travel = path_margin(route)
+                focus_phase_travel = self._region_travel_frames(
+                    (px, py),
+                    route,
+                    focus_speed,
+                )
                 phase_deadline = (
                     side_forecast.preposition_lead_frames
                     + 0.5 * expansion_duration
@@ -3386,8 +4862,12 @@ class EngineMPC:
                     "approach_y": band_y,
                     "close_frames": phase_deadline,
                     "deadline_slack": phase_deadline - phase_travel - guard_frames,
+                    "focus_deadline_slack": (
+                        phase_deadline - focus_phase_travel - guard_frames
+                    ),
                     "path_margin": margin,
                     "travel": float(phase_travel),
+                    "focus_travel": float(focus_phase_travel),
                     "lateral": abs(side_forecast.x - px) / max(0.1, speed),
                 }
                 portal_candidates.append(phase_candidate)
@@ -3412,6 +4892,7 @@ class EngineMPC:
                 target_component=target_component,
                 portal=None,
                 deadline_slack=-math.inf,
+                focus_deadline_slack=-math.inf,
             )
 
         def candidate_key(candidate: Mapping[str, Any]) -> tuple[float, ...]:
@@ -3532,6 +5013,11 @@ class EngineMPC:
             )
             retained_route = ((retained_x, band_y),)
             retained_margin, retained_travel = path_margin(retained_route)
+            retained_focus_travel = self._region_travel_frames(
+                (px, py),
+                retained_route,
+                focus_speed,
+            )
             retained_deadline = self._frames_until_region_expansion()
             if retained_deadline is None:
                 retained_deadline = float(self.config.horizon_frames)
@@ -3553,8 +5039,12 @@ class EngineMPC:
                 "deadline_slack": (
                     retained_deadline - retained_travel - guard_frames
                 ),
+                "focus_deadline_slack": (
+                    retained_deadline - retained_focus_travel - guard_frames
+                ),
                 "path_margin": retained_margin,
                 "travel": float(retained_travel),
+                "focus_travel": float(retained_focus_travel),
                 "lateral": abs(retained_x - px) / max(0.1, speed),
             }
             portal_candidates.append(retained_candidate)
@@ -3579,6 +5069,7 @@ class EngineMPC:
             None if raw_close_frames is None else float(raw_close_frames)
         )
         deadline_slack = float(selected["deadline_slack"])
+        focus_deadline_slack = float(selected["focus_deadline_slack"])
         selected_target_component = str(selected["target_component"])
         if (
             remembered_exterior in {"exterior:left", "exterior:right"}
@@ -3610,31 +5101,60 @@ class EngineMPC:
             and math.isfinite(close_frames)
             and flow_wait >= close_frames
         )
+        planning_window = (
+            self.config.horizon_frames
+            + self.config.region_urgency_lead_frames
+        )
+        focus_deadline_active = (
+            self.config.region_focus_deadline_enabled
+            and focus_deadline_slack >= 0.0
+        )
+        style_deadline_slack = (
+            focus_deadline_slack
+            if focus_deadline_active else
+            deadline_slack
+        )
+        deadline_in_planning_window = (
+            math.isfinite(style_deadline_slack)
+            and style_deadline_slack <= planning_window
+        )
+        position_deadzone = max(0.1, focus_speed) * self.config.decision_interval
+        outside_position_deadzone = (
+            abs(float(selected["x"]) - px) > position_deadzone
+        )
         topology_urgent = (
             target_rows_ahead > 1
             and self._region_phase.phase in {"expanding", "maximum_hold"}
         )
         side_preposition = (
             selected["persistent"]
-            and selected["lateral"] > self.config.decision_interval
+            and outside_position_deadzone
         )
-        if (
-            selected["corridor"] and not selected["aligned"]
+        if current_component == selected_target_component:
+            navigation_mode = "settle"
+        elif flow_wait <= 0.0 or deadline_slack <= 0.0:
+            navigation_mode = "evacuate"
+        elif deadline_in_planning_window and (
+            selected["corridor"] and outside_position_deadzone
             or topology_urgent and side_preposition
             or selected["persistent"] and selected["path_margin"] < 0.0
         ):
             navigation_mode = "preposition"
-        elif flow_wait <= 0.0 or deadline_slack <= 0.0:
-            navigation_mode = "evacuate"
-        elif flow_requires_early_crossing:
-            latest_departure = max(0.0, deadline_slack)
+        elif deadline_in_planning_window and flow_requires_early_crossing:
+            latest_departure = max(0.0, style_deadline_slack)
+            selected_travel = float(
+                selected["focus_travel"]
+                if focus_deadline_active else
+                selected["travel"]
+            )
             navigation_mode = (
                 "preposition"
-                if selected["lateral"] >= latest_departure else
+                if (
+                    outside_position_deadzone
+                    and selected_travel >= latest_departure
+                ) else
                 "hold"
             )
-        elif current_component == self._region_topology.target_component:
-            navigation_mode = "settle"
         else:
             navigation_mode = "hold"
 
@@ -3651,10 +5171,22 @@ class EngineMPC:
             if crossing else
             selected["approach_y"]
             if navigation_mode == "preposition" else
+            bottom
+            if (
+                self.config.bottom_anchor_enabled
+                and navigation_mode == "settle"
+                and current_component in {"exterior:left", "exterior:right"}
+            ) else
             band_y
         )
+        anchor_x = (
+            float(selected["x"])
+            if navigation_mode in {"preposition", "evacuate"}
+            and outside_position_deadzone else
+            px
+        )
         return _RegionAnchor(
-            x=min(max(float(selected["x"]), left), right),
+            x=min(max(anchor_x, left), right),
             y=min(max(float(anchor_y), bottom), top),
             crossing=crossing,
             path_margin=float(selected["path_margin"]),
@@ -3665,7 +5197,49 @@ class EngineMPC:
             target_component=selected_target_component,
             portal=str(selected["portal"]),
             deadline_slack=deadline_slack,
+            focus_deadline_slack=focus_deadline_slack,
         )
+
+    @staticmethod
+    def _region_travel_frames(
+        start: tuple[float, float],
+        waypoints: Sequence[tuple[float, float]],
+        speed: float,
+    ) -> float:
+        """Return action-axis travel time through ordered region waypoints."""
+
+        current_x, current_y = start
+        elapsed = 0.0
+        for waypoint_x, waypoint_y in waypoints:
+            dx = abs(waypoint_x - current_x)
+            dy = abs(waypoint_y - current_y)
+            diagonal = min(dx, dy)
+            elapsed += math.ceil(
+                diagonal / max(0.1, speed * _SQRT_HALF)
+                + (max(dx, dy) - diagonal) / max(0.1, speed)
+            )
+            current_x, current_y = waypoint_x, waypoint_y
+        return elapsed
+
+    def _region_speed_mismatch(
+        self,
+        action: Action,
+        anchor: _RegionAnchor | None,
+    ) -> float:
+        """Prefer focus movement unless only full speed can meet the deadline."""
+
+        if (
+            not self.config.region_focus_deadline_enabled
+            or anchor is None
+            or anchor.navigation_mode not in {"preposition", "evacuate"}
+            or anchor.current_component == anchor.target_component
+        ):
+            return 0.0
+        moving = action.move_x != 0 or action.move_y != 0
+        focus_reachable = anchor.focus_deadline_slack >= 0.0
+        if focus_reachable:
+            return float(moving and not action.slow)
+        return float(not moving or action.slow)
 
     def _diverse_keep(
         self,
@@ -3680,11 +5254,8 @@ class EngineMPC:
         if region_anchor is not None:
             configured_limit = max(configured_limit, self.config.region_beam_width)
         limit = min(configured_limit, len(order))
-        if region_anchor is None:
-            return np.asarray(order[:limit], dtype=np.int64)
-
         selected: list[int] = []
-        seen: set[tuple[int, int, int]] = set()
+        seen: set[tuple[int, ...]] = set()
         per_action = np.zeros(len(self.actions), dtype=np.int32)
         quota = max(1, limit // len(self.actions))
         scale = self.config.beam_cell_size
@@ -3696,6 +5267,12 @@ class EngineMPC:
                 int(round(float(x[index]) / scale)),
                 int(round(float(y[index]) / scale)),
             )
+            if gap_anchor is not None:
+                normal_progress = (
+                    (float(x[index]) - gap_anchor.center_x) * gap_anchor.normal_x
+                    + (float(y[index]) - gap_anchor.center_y) * gap_anchor.normal_y
+                )
+                cell = (*cell, int(round(normal_progress / scale)))
             if cell in seen or per_action[action_index] >= quota:
                 continue
             seen.add(cell)
@@ -3713,6 +5290,14 @@ class EngineMPC:
                     int(round(float(x[index]) / scale)),
                     int(round(float(y[index]) / scale)),
                 )
+                if gap_anchor is not None:
+                    normal_progress = (
+                        (float(x[index]) - gap_anchor.center_x)
+                        * gap_anchor.normal_x
+                        + (float(y[index]) - gap_anchor.center_y)
+                        * gap_anchor.normal_y
+                    )
+                    cell = (*cell, int(round(normal_progress / scale)))
                 if index in chosen or cell in seen:
                     continue
                 seen.add(cell)
@@ -3751,7 +5336,8 @@ class EngineMPC:
             return False
         if (
             math.isfinite(region_anchor.deadline_slack)
-            and region_anchor.deadline_slack <= self.config.horizon_frames
+            and region_anchor.deadline_slack
+            <= self.config.horizon_frames + self.config.region_urgency_lead_frames
         ):
             return True
 
@@ -3767,7 +5353,7 @@ class EngineMPC:
         )
         return (
             frames_until_expansion - travel_frames
-            <= self.config.horizon_frames
+            <= self.config.horizon_frames + self.config.region_urgency_lead_frames
         )
 
     @staticmethod
@@ -3860,6 +5446,15 @@ class EngineMPC:
             threat_motion_horizon = np.asarray(
                 [value.motion_horizon for value in threats], dtype=np.float64,
             )
+            threat_motion_start_delay = np.asarray(
+                [value.motion_start_delay for value in threats], dtype=np.float64,
+            )
+            threat_ax = np.asarray([value.ax for value in threats], dtype=np.float64)
+            threat_ay = np.asarray([value.ay for value in threats], dtype=np.float64)
+            threat_acceleration_horizon = np.asarray(
+                [value.acceleration_horizon for value in threats],
+                dtype=np.float64,
+            )
             threat_is_region = np.asarray(
                 [value.source == "indestructibles" for value in threats],
                 dtype=np.bool_,
@@ -3873,14 +5468,26 @@ class EngineMPC:
                 dtype=np.float64,
             )[:, None]
             motion_frames = np.minimum(
-                future_frames,
+                np.maximum(
+                    0.0,
+                    future_frames - threat_motion_start_delay[None, :],
+                ),
                 threat_motion_horizon[None, :],
+            )
+            acceleration_frames = np.minimum(
+                motion_frames,
+                threat_acceleration_horizon[None, :],
+            )
+            acceleration_scale = acceleration_frames * (
+                motion_frames - 0.5 * acceleration_frames
             )
             future_threat_x = (
                 threat_x[None, :] + threat_vx[None, :] * motion_frames
+                + threat_ax[None, :] * acceleration_scale
             )
             future_threat_y = (
                 threat_y[None, :] + threat_vy[None, :] * motion_frames
+                + threat_ay[None, :] * acceleration_scale
             )
             future_radius = np.maximum(
                 0.1,
@@ -3904,6 +5511,10 @@ class EngineMPC:
                 0, dtype=np.float64,
             )
             threat_motion_horizon = np.empty(0, dtype=np.float64)
+            threat_motion_start_delay = np.empty(0, dtype=np.float64)
+            threat_ax = threat_ay = threat_acceleration_horizon = np.empty(
+                0, dtype=np.float64,
+            )
             threat_is_region = np.empty(0, dtype=np.bool_)
             future_threat_x = future_threat_y = future_radius = np.empty(
                 (self.config.horizon_frames, 0),
@@ -3979,6 +5590,19 @@ class EngineMPC:
                 self.config.direction_reverse_penalty
                 * reversed_direction.astype(np.float64)
             )
+            sharp_turn = (
+                changed_direction
+                & ((move_x[action_indices] != 0.0) | (move_y[action_indices] != 0.0))
+                & ((move_x[safe_prior] != 0.0) | (move_y[safe_prior] != 0.0))
+                & (
+                    move_x[action_indices] * move_x[safe_prior]
+                    + move_y[action_indices] * move_y[safe_prior] < 0.0
+                )
+            )
+            motion_penalty += (
+                self.config.direction_sharp_turn_penalty
+                * sharp_turn.astype(np.float64)
+            )
             has_two_prior = two_prior_indices >= 0
             safe_two_prior = np.maximum(two_prior_indices, 0)
             aba = (
@@ -3998,6 +5622,18 @@ class EngineMPC:
             motion_penalty += (
                 self.config.speed_switch_penalty
                 * changed_speed.astype(np.float64)
+            )
+            moving = (
+                (move_x[action_indices] != 0.0)
+                | (move_y[action_indices] != 0.0)
+            )
+            motion_penalty += (
+                self.config.moving_action_penalty
+                * moving.astype(np.float64)
+            )
+            motion_penalty += (
+                self.config.fast_action_penalty
+                * (moving & ~action_slow[action_indices]).astype(np.float64)
             )
             plans = np.concatenate(
                 (plans, action_indices[:, None].astype(np.int8)),
@@ -4105,9 +5741,14 @@ class EngineMPC:
                         earliest_collision > self.config.horizon_frames
                     )
                     earliest_collision[first_hit] = absolute_frame
+                edge_distances = (
+                    (x - left, right - x, top - y)
+                    if self.config.bottom_anchor_enabled else
+                    (x - left, right - x, y - bottom, top - y)
+                )
                 clearance = np.maximum(
                     0.0,
-                    np.minimum.reduce((x - left, right - x, y - bottom, top - y)),
+                    np.minimum.reduce(edge_distances) - player_radius,
                 )
                 boundary_penalty += self.config.boundary_weight / (1.0 + clearance)
                 boundary_penalty += self.config.boundary_weight * (
@@ -4118,9 +5759,17 @@ class EngineMPC:
                         np.abs(x - region_anchor.x) + np.abs(y - region_anchor.y)
                     )
             if segment_start == 0:
-                immediate_corner_clearance = np.hypot(
-                    np.minimum(x - left, right - x),
-                    np.minimum(y - bottom, top - y),
+                immediate_distances = (
+                    (x - left, right - x, top - y)
+                    if self.config.bottom_anchor_enabled else
+                    (x - left, right - x, y - bottom, top - y)
+                )
+                immediate_corner_clearance = np.minimum.reduce(
+                    immediate_distances,
+                )
+                immediate_corner_clearance = np.maximum(
+                    0.0,
+                    immediate_corner_clearance - player_radius,
                 )
             collided = collision_frames > 0
             collision_order = -earliest_collision
@@ -4137,6 +5786,15 @@ class EngineMPC:
                 alignment = self.config.region_anchor_weight * (
                     np.abs(x - region_anchor.x) + np.abs(y - region_anchor.y)
                 )
+            if gap_anchor is not None:
+                gap_normal_distance = np.maximum(
+                    0.0,
+                    np.abs(
+                        (x - gap_anchor.center_x) * gap_anchor.normal_x
+                        + (y - gap_anchor.center_y) * gap_anchor.normal_y
+                    ) - 0.5 * gap_anchor.usable_width,
+                )
+                alignment += self.config.gap_anchor_weight * gap_normal_distance
             if region_anchor is None:
                 margin_shortfall = np.maximum(
                     0.0,
@@ -4146,9 +5804,15 @@ class EngineMPC:
                     0.0,
                     self.config.danger_margin_target - minimum_margin,
                 )
-                corner_clearance = np.hypot(
-                    np.minimum(x - left, right - x),
-                    np.minimum(y - bottom, top - y),
+                corner_distances = (
+                    (x - left, right - x, top - y)
+                    if self.config.bottom_anchor_enabled else
+                    (x - left, right - x, y - bottom, top - y)
+                )
+                corner_clearance = np.minimum.reduce(corner_distances)
+                corner_clearance = np.maximum(
+                    0.0,
+                    corner_clearance - player_radius,
                 )
                 margin_shortfall += self.config.corner_reserve_weight * np.maximum(
                     0.0,
@@ -4254,6 +5918,15 @@ class EngineMPC:
                     np.abs(x[matches] - region_anchor.x)
                     + np.abs(y[matches] - region_anchor.y)
                 )
+            if gap_anchor is not None:
+                gap_normal_distance = np.maximum(
+                    0.0,
+                    np.abs(
+                        (x[matches] - gap_anchor.center_x) * gap_anchor.normal_x
+                        + (y[matches] - gap_anchor.center_y) * gap_anchor.normal_y
+                    ) - 0.5 * gap_anchor.usable_width,
+                )
+                alignment += self.config.gap_anchor_weight * gap_normal_distance
             collided = collision_frames[matches] > 0
             if region_anchor is None:
                 margin_shortfall = np.maximum(
@@ -4327,24 +6000,6 @@ class EngineMPC:
             selected = matches[int(order[0])]
             earliest = int(earliest_collision[selected])
             selected_alignment = float(alignment[int(order[0])])
-            if gap_anchor is not None:
-                immediate_path = self._path(
-                    action,
-                    player[:2],
-                    player[3],
-                    player[4],
-                    bounds,
-                    self.config.decision_interval,
-                    self.config.decision_interval,
-                )
-                immediate_x, immediate_y, _ = immediate_path[-1]
-                selected_alignment += self.config.gap_anchor_weight * (
-                    self._gap_center_space_distance(
-                        immediate_x,
-                        immediate_y,
-                        gap_anchor,
-                    )
-                )
             evaluations.append(CandidateEvaluation(
                 action=replace(action, spell=False),
                 collided=bool(collision_frames[selected] > 0),
@@ -4497,7 +6152,12 @@ class EngineMPC:
                 collision_frames += 1
                 if earliest_collision is None:
                     earliest_collision = future_frame
-            clearance = max(0.0, min(x - left, right - x, y - bottom, top - y))
+            clearance = self._maneuver_clearance(
+                x,
+                y,
+                bounds,
+                player_radius,
+            )
             boundary_penalty += self.config.boundary_weight / (1.0 + clearance)
             if clamped:
                 boundary_penalty += self.config.boundary_weight
@@ -4535,19 +6195,170 @@ class EngineMPC:
             minimum_margin=minimum_margin,
             boundary_penalty=boundary_penalty,
             boss_alignment=alignment,
-            motion_penalty=self._transition_penalty(
-                action,
-                self._last_action,
-                self._previous_action,
+            motion_penalty=(
+                self._transition_penalty(
+                    action,
+                    self._last_action,
+                    self._previous_action,
+                )
+                + self._action_motion_penalty(action)
             ),
             minimum_nonregion_margin=minimum_nonregion_margin,
             minimum_region_margin=minimum_region_margin,
-            immediate_corner_clearance=self._corner_clearance(
+            immediate_corner_clearance=self._maneuver_clearance(
                 path[self.config.decision_interval][0],
                 path[self.config.decision_interval][1],
                 bounds,
+                player_radius,
             ),
         )
+
+    def _evaluate_plan(
+        self,
+        plan: Sequence[Action],
+        player: tuple[float, float, float, float, float],
+        bounds: tuple[float, float, float, float],
+        threats: Sequence[PredictedThreat],
+        boss_x: float | None,
+        region_anchor: _RegionAnchor | None = None,
+        gap_anchor: _GapCorridor | None = None,
+    ) -> CandidateEvaluation:
+        """Evaluate one exact block plan against the latest visible forecast."""
+
+        if not plan:
+            raise ValueError("action plan must be nonempty")
+        px, py, player_radius, speed, focus_speed = player
+        left, right, bottom, top = bounds
+        preferred_y = self._preferred_y(bounds)
+        x, y = px, py
+        minimum_margin = math.inf
+        minimum_nonregion_margin = math.inf
+        minimum_region_margin = math.inf
+        collision_frames = 0
+        earliest_collision: int | None = None
+        boundary_penalty = 0.0
+        motion_penalty = 0.0
+        future_frame = 0
+        immediate_x, immediate_y = x, y
+        prior = self._last_action
+        two_prior = self._previous_action
+
+        for action in plan:
+            motion_penalty += self._transition_penalty(action, prior, two_prior)
+            motion_penalty += self._action_motion_penalty(action)
+            two_prior, prior = prior, action
+            magnitude = focus_speed if action.slow else speed
+            if action.move_x != 0 and action.move_y != 0:
+                magnitude *= _SQRT_HALF
+            velocity_x = action.move_x * magnitude
+            velocity_y = action.move_y * magnitude
+            for _ in range(self.config.decision_interval):
+                if future_frame >= self.config.horizon_frames:
+                    break
+                raw_x = x + velocity_x
+                raw_y = y + velocity_y
+                x = min(max(raw_x, left), right)
+                y = min(max(raw_y, bottom), top)
+                future_frame += 1
+                if future_frame == self.config.decision_interval:
+                    immediate_x, immediate_y = x, y
+
+                frame_collision = False
+                for threat in threats:
+                    tx, ty, threat_radius = self._threat_at(threat, future_frame)
+                    margin = (
+                        math.hypot(x - tx, y - ty)
+                        - player_radius
+                        - threat_radius
+                    )
+                    minimum_margin = min(minimum_margin, margin)
+                    if threat.source == "indestructibles":
+                        minimum_region_margin = min(
+                            minimum_region_margin,
+                            margin,
+                        )
+                    else:
+                        minimum_nonregion_margin = min(
+                            minimum_nonregion_margin,
+                            margin,
+                        )
+                    frame_collision = frame_collision or margin <= 0.0
+                if frame_collision:
+                    collision_frames += 1
+                    if earliest_collision is None:
+                        earliest_collision = future_frame
+
+                clearance = self._maneuver_clearance(
+                    x,
+                    y,
+                    bounds,
+                    player_radius,
+                )
+                boundary_penalty += self.config.boundary_weight / (1.0 + clearance)
+                if x != raw_x or y != raw_y:
+                    boundary_penalty += self.config.boundary_weight
+                if region_anchor is not None:
+                    boundary_penalty += self.config.region_path_weight * (
+                        abs(x - region_anchor.x) + abs(y - region_anchor.y)
+                    )
+            if future_frame >= self.config.horizon_frames:
+                break
+
+        if region_anchor is None:
+            alignment = (
+                0.0 if boss_x is None else
+                self.config.boss_alignment_weight * abs(x - boss_x)
+            )
+            alignment += self.config.vertical_anchor_weight * abs(y - preferred_y)
+        else:
+            alignment = self.config.region_anchor_weight * (
+                abs(x - region_anchor.x) + abs(y - region_anchor.y)
+            )
+        if gap_anchor is not None:
+            alignment += self.config.gap_anchor_weight * (
+                self._gap_center_space_distance(x, y, gap_anchor)
+            )
+        return CandidateEvaluation(
+            action=replace(plan[0], spell=False),
+            collided=collision_frames > 0,
+            collision_frames=collision_frames,
+            earliest_collision_frame=earliest_collision,
+            minimum_margin=minimum_margin,
+            boundary_penalty=boundary_penalty,
+            boss_alignment=alignment,
+            motion_penalty=motion_penalty,
+            minimum_nonregion_margin=minimum_nonregion_margin,
+            minimum_region_margin=minimum_region_margin,
+            immediate_corner_clearance=self._maneuver_clearance(
+                immediate_x,
+                immediate_y,
+                bounds,
+                player_radius,
+            ),
+        )
+
+    def _plan_endpoint(
+        self,
+        plan: Sequence[Action],
+        player: tuple[float, float, float, float, float],
+        bounds: tuple[float, float, float, float],
+    ) -> tuple[float, float]:
+        x, y, _player_radius, speed, focus_speed = player
+        left, right, bottom, top = bounds
+        frames = 0
+        for action in plan:
+            magnitude = focus_speed if action.slow else speed
+            if action.move_x != 0 and action.move_y != 0:
+                magnitude *= _SQRT_HALF
+            velocity_x = action.move_x * magnitude
+            velocity_y = action.move_y * magnitude
+            for _ in range(self.config.decision_interval):
+                if frames >= self.config.horizon_frames:
+                    return x, y
+                x = min(max(x + velocity_x, left), right)
+                y = min(max(y + velocity_y, bottom), top)
+                frames += 1
+        return x, y
 
     def _apply_direction_hold(
         self,
@@ -4655,9 +6466,17 @@ class EngineMPC:
             corner_escape = (
                 incumbent.immediate_corner_clearance
                 < self.config.corner_reserve_target
-                and selected.immediate_corner_clearance
-                - incumbent.immediate_corner_clearance
-                >= self.config.switch_margin_gain
+                and (
+                    selected.immediate_corner_clearance
+                    - incumbent.immediate_corner_clearance
+                    >= self.config.switch_margin_gain
+                    or (
+                        incumbent.immediate_corner_clearance
+                        <= self.config.emergency_margin
+                        and selected.immediate_corner_clearance
+                        > incumbent.immediate_corner_clearance + 1e-6
+                    )
+                )
             )
         else:
             ordinary_margin_gain = (
@@ -4723,6 +6542,62 @@ class EngineMPC:
         # must not be replaced by a stale committed action.
         return False
 
+    def _apply_sharp_turn_neutral_beat(
+        self,
+        selected_index: int,
+        evaluations: Sequence[CandidateEvaluation],
+        region_anchor: _RegionAnchor | None,
+        gap_entry_action: Action | None,
+    ) -> int:
+        """Insert one safe neutral block before a moving obtuse turn."""
+
+        if not self.config.sharp_turn_neutral_beat_enabled:
+            return selected_index
+        if self._last_action is None:
+            return selected_index
+        selected = evaluations[selected_index]
+        previous_direction = self._direction(self._last_action)
+        selected_direction = self._direction(selected.action)
+        assert previous_direction is not None
+        assert selected_direction is not None
+        if (
+            previous_direction == (0, 0)
+            or selected_direction == (0, 0)
+            or selected_direction[0] * previous_direction[0]
+            + selected_direction[1] * previous_direction[1] >= 0
+        ):
+            return selected_index
+
+        # Certified gap entry already contains its own neutral beat whenever
+        # the deadline permits one. Do not invalidate that certificate here.
+        if gap_entry_action is not None:
+            return selected_index
+        if (
+            region_anchor is not None
+            and math.isfinite(region_anchor.deadline_slack)
+            and region_anchor.deadline_slack <= self.config.decision_interval
+        ):
+            return selected_index
+
+        neutral_index = next(
+            index
+            for index, value in enumerate(evaluations)
+            if self._direction(value.action) == (0, 0)
+        )
+        neutral = evaluations[neutral_index]
+        if neutral.collided:
+            return selected_index
+        if region_anchor is None:
+            if neutral.minimum_margin < self.config.danger_margin_target:
+                return selected_index
+        elif (
+            neutral.minimum_nonregion_margin < self.config.danger_margin_target
+            or neutral.minimum_region_margin
+            < self.config.region_safe_margin_target
+        ):
+            return selected_index
+        return neutral_index
+
     def _compute(
         self,
         observation: Mapping[str, Any],
@@ -4756,6 +6631,40 @@ class EngineMPC:
             if gap_anchor is not None and gap_mode == "enter" else
             None
         )
+        gap_plan_certified = False
+        if (
+            region_anchor is None
+            and gap_anchor is not None
+            and gap_entry_action is not None
+            and gap_anchor.entry_plan
+        ):
+            certified_evaluation = self._evaluate_plan(
+                gap_anchor.entry_plan,
+                player,
+                bounds,
+                threats,
+                boss_x,
+                None,
+                gap_anchor,
+            )
+            if (
+                not certified_evaluation.collided
+                and certified_evaluation.minimum_margin
+                >= self.config.gap_path_minimum_margin
+            ):
+                certified_index = next(
+                    index
+                    for index, value in enumerate(evaluations)
+                    if value.action.discrete == gap_entry_action.discrete
+                )
+                evaluation_values = list(evaluations)
+                evaluation_values[certified_index] = certified_evaluation
+                evaluations = tuple(evaluation_values)
+                gap_plan_certified = True
+            else:
+                # Never steer toward a corridor when its exact executable plan
+                # disagrees with the latest full-threat safety check.
+                gap_entry_action = None
 
         def key(index: int) -> tuple[float, ...]:
             value = evaluations[index]
@@ -4782,6 +6691,10 @@ class EngineMPC:
             gap_entry_mismatch = float(
                 gap_entry_action is not None
                 and value.action.discrete != gap_entry_action.discrete
+            )
+            region_speed_mismatch = self._region_speed_mismatch(
+                value.action,
+                region_anchor,
             )
             if region_anchor is None:
                 return (
@@ -4814,6 +6727,7 @@ class EngineMPC:
                         self.config.danger_margin_target
                         - value.minimum_nonregion_margin,
                     ),
+                    region_speed_mismatch,
                     preference,
                     max(
                         0.0,
@@ -4852,6 +6766,7 @@ class EngineMPC:
                     - value.minimum_nonregion_margin,
                 ),
                 float(value.collision_frames),
+                region_speed_mismatch,
                 preference,
                 -earliest,
                 -value.minimum_nonregion_margin,
@@ -4870,6 +6785,12 @@ class EngineMPC:
             source_frame,
             gap_anchor,
         )
+        selected_index = self._apply_sharp_turn_neutral_beat(
+            selected_index,
+            evaluations,
+            region_anchor,
+            gap_entry_action,
+        )
         selected_plan = (
             gap_anchor.entry_plan
             if (
@@ -4879,6 +6800,13 @@ class EngineMPC:
                 and gap_anchor is not None
             ) else
             action_plans[selected_index]
+        )
+        gap_plan_certified = bool(
+            gap_plan_certified
+            and gap_entry_action is not None
+            and evaluations[selected_index].action.discrete
+            == gap_entry_action.discrete
+            and selected_plan
         )
         return MPCDecision(
             action=replace(evaluations[selected_index].action, spell=False),
@@ -4917,6 +6845,11 @@ class EngineMPC:
             region_deadline_slack=(
                 region_anchor.deadline_slack if region_anchor is not None else None
             ),
+            region_focus_deadline_slack=(
+                region_anchor.focus_deadline_slack
+                if region_anchor is not None else
+                None
+            ),
             planned_actions=selected_plan,
             using_committed_plan=False,
             committed_plan_immediate_margin=None,
@@ -4942,6 +6875,7 @@ class EngineMPC:
                 None if gap_anchor is None else gap_anchor.lifetime_frames
             ),
             gap_navigation_mode=gap_mode,
+            gap_plan_certified=gap_plan_certified,
         )
 
     def _immediate_action_margin(
@@ -4973,12 +6907,12 @@ class EngineMPC:
 
     def select(self, observation: Mapping[str, Any]) -> MPCDecision:
         observation = _unwrap_observation(observation)
-        threats = self.estimator.update(observation)
+        threats = self._observed_threats(observation)
         source_frame = self.estimator.last_frame
         assert source_frame is not None
         if self._last_source_frame is not None and source_frame < self._last_source_frame:
             self.reset()
-            threats = self.estimator.update(observation)
+            threats = self._observed_threats(observation)
             source_frame = self.estimator.last_frame
             assert source_frame is not None
         self._last_source_frame = source_frame
@@ -4997,86 +6931,187 @@ class EngineMPC:
                 proposed.region_current_component,
                 proposed.region_target_component,
                 proposed.region_portal,
+                (
+                    None
+                    if proposed.region_focus_deadline_slack is None else
+                    self.config.region_focus_deadline_enabled
+                    and proposed.region_focus_deadline_slack >= 0.0
+                ),
                 proposed.gap_navigation_mode,
                 proposed.gap_selected_center,
             )
-            committed_action = (
-                self._committed_plan[0]
-                if (
-                    self._committed_plan_is_region
-                    and self._committed_plan
-                    and self._committed_plan_key == proposed_plan_key
-                    and proposed.region_anchor is not None
-                ) else
-                None
+            gap_committed_evaluation: CandidateEvaluation | None = None
+            gap_intent_compatible = (
+                self._committed_gap is None
+                or self._active_gap is None
+                or self._gap_intent_match_score(
+                    self._committed_gap,
+                    self._active_gap,
+                    self._committed_gap_frame,
+                    source_frame,
+                ) is not None
             )
-            committed_margin = (
-                None
-                if committed_action is None else
-                self._immediate_action_margin(
+            if (
+                self._committed_plan_is_gap
+                and self._committed_plan
+                and proposed.region_anchor is None
+                and gap_intent_compatible
+            ):
+                player = self._player(observation, self.config.observation_delay)
+                bounds = self._bounds(observation, player[2])
+                current_gap = self._active_gap or self._committed_gap
+                gap_committed_evaluation = self._evaluate_plan(
+                    self._committed_plan,
+                    player,
+                    bounds,
+                    threats,
+                    self._boss_x(observation, self.config.observation_delay),
+                    gap_anchor=current_gap,
+                )
+                endpoint_in_current_gap = True
+                if self._active_gap is not None:
+                    endpoint = self._plan_endpoint(
+                        self._committed_plan,
+                        player,
+                        bounds,
+                    )
+                    endpoint_in_current_gap = (
+                        self._gap_center_space_distance(
+                            endpoint[0],
+                            endpoint[1],
+                            self._active_gap,
+                        ) <= 1e-6
+                    )
+                if (
+                    gap_committed_evaluation.collided
+                    or gap_committed_evaluation.minimum_margin
+                    < self.config.gap_path_minimum_margin
+                    or not endpoint_in_current_gap
+                ):
+                    gap_committed_evaluation = None
+
+            if gap_committed_evaluation is not None:
+                committed_action = self._committed_plan[0]
+                committed_margin = self._immediate_action_margin(
                     committed_action,
                     observation,
                     threats,
                 )
-            )
-            committed_evaluation = (
-                None
-                if committed_action is None else
-                next(
-                    value
-                    for value in proposed.evaluations
+                evaluation_values = list(proposed.evaluations)
+                evaluation_index = next(
+                    index
+                    for index, value in enumerate(evaluation_values)
                     if value.action.discrete == committed_action.discrete
                 )
-            )
-            if (
-                committed_action is not None
-                and self._committed_plan_evacuating == proposed.region_evacuating
-                and self._committed_action_respects_direction_hold(
-                    committed_action,
-                    proposed.action,
-                    source_frame,
-                )
-                and committed_margin is not None
-                and committed_margin >= self.config.region_safe_margin_target
-                and committed_evaluation is not None
-                and committed_evaluation.minimum_nonregion_margin
-                >= self.config.safe_margin_target
-                and (
-                    (
-                        not committed_evaluation.collided
-                        and committed_evaluation.minimum_region_margin
-                        >= self.config.region_safe_margin_target
-                    )
-                    or (
-                        committed_evaluation.collided
-                        and committed_evaluation.earliest_collision_frame is not None
-                        and committed_evaluation.earliest_collision_frame
-                        >= self.config.horizon_frames - self.config.decision_interval
-                    )
-                )
-            ):
+                evaluation_values[evaluation_index] = gap_committed_evaluation
                 self._decision = replace(
                     proposed,
                     action=replace(committed_action, spell=False),
+                    evaluations=tuple(evaluation_values),
                     planned_actions=self._committed_plan,
                     using_committed_plan=True,
                     committed_plan_immediate_margin=committed_margin,
                     committed_plan_current_horizon_margin=(
-                        committed_evaluation.minimum_margin
+                        gap_committed_evaluation.minimum_margin
                     ),
+                    gap_plan_certified=True,
                 )
                 self._committed_plan = self._committed_plan[1:]
+                if self._active_gap is not None:
+                    self._committed_gap = self._active_gap
+                    self._committed_gap_frame = source_frame
             else:
-                self._decision = proposed
-                self._committed_plan_is_region = proposed.region_anchor is not None
-                self._committed_plan_evacuating = proposed.region_evacuating
-                self._committed_plan_key = (
-                    proposed_plan_key if self._committed_plan_is_region else None
+                committed_action = (
+                    self._committed_plan[0]
+                    if (
+                        self._committed_plan_is_region
+                        and self._committed_plan
+                        and self._committed_plan_key == proposed_plan_key
+                        and proposed.region_anchor is not None
+                    ) else
+                    None
                 )
-                self._committed_plan = (
-                    proposed.planned_actions[1:]
-                    if self._committed_plan_is_region else ()
+                committed_margin = (
+                    None
+                    if committed_action is None else
+                    self._immediate_action_margin(
+                        committed_action,
+                        observation,
+                        threats,
+                    )
                 )
+                committed_evaluation = (
+                    None
+                    if committed_action is None else
+                    next(
+                        value
+                        for value in proposed.evaluations
+                        if value.action.discrete == committed_action.discrete
+                    )
+                )
+                if (
+                    committed_action is not None
+                    and self._committed_plan_evacuating == proposed.region_evacuating
+                    and self._committed_action_respects_direction_hold(
+                        committed_action,
+                        proposed.action,
+                        source_frame,
+                    )
+                    and committed_margin is not None
+                    and committed_margin >= self.config.region_safe_margin_target
+                    and committed_evaluation is not None
+                    and committed_evaluation.minimum_nonregion_margin
+                    >= self.config.safe_margin_target
+                    and (
+                        (
+                            not committed_evaluation.collided
+                            and committed_evaluation.minimum_region_margin
+                            >= self.config.region_safe_margin_target
+                        )
+                        or (
+                            committed_evaluation.collided
+                            and committed_evaluation.earliest_collision_frame is not None
+                            and committed_evaluation.earliest_collision_frame
+                            >= self.config.horizon_frames - self.config.decision_interval
+                        )
+                    )
+                ):
+                    self._decision = replace(
+                        proposed,
+                        action=replace(committed_action, spell=False),
+                        planned_actions=self._committed_plan,
+                        using_committed_plan=True,
+                        committed_plan_immediate_margin=committed_margin,
+                        committed_plan_current_horizon_margin=(
+                            committed_evaluation.minimum_margin
+                        ),
+                    )
+                    self._committed_plan = self._committed_plan[1:]
+                else:
+                    self._decision = proposed
+                    self._committed_plan_is_region = proposed.region_anchor is not None
+                    self._committed_plan_is_gap = bool(
+                        not self._committed_plan_is_region
+                        and proposed.gap_plan_certified
+                        and len(proposed.planned_actions) > 1
+                    )
+                    self._committed_plan_evacuating = proposed.region_evacuating
+                    self._committed_plan_key = (
+                        proposed_plan_key if self._committed_plan_is_region else None
+                    )
+                    self._committed_plan = (
+                        proposed.planned_actions[1:]
+                        if (
+                            self._committed_plan_is_region
+                            or self._committed_plan_is_gap
+                        ) else ()
+                    )
+                    self._committed_gap = (
+                        self._active_gap if self._committed_plan_is_gap else None
+                    )
+                    self._committed_gap_frame = (
+                        source_frame if self._committed_plan_is_gap else None
+                    )
             self._remember_action(self._decision.action, source_frame)
             self._last_decision_frame = source_frame
             return self._decision
@@ -5136,6 +7171,11 @@ class EngineMPC:
                     "radius_rate": threat.radius_rate,
                     "radius_rate_horizon": threat.radius_rate_horizon,
                     "motion_horizon": threat.motion_horizon,
+                    "motion_start_delay": threat.motion_start_delay,
+                    "launch_motion_inferred": threat.launch_motion_inferred,
+                    "ax": threat.ax,
+                    "ay": threat.ay,
+                    "acceleration_horizon": threat.acceleration_horizon,
                 }
                 for threat in decision.threats
             ],
@@ -5146,12 +7186,12 @@ class EngineMPC:
         """Update visible tracks and external phase memory without beam search."""
 
         observation = _unwrap_observation(observation)
-        threats = self.estimator.update(observation)
+        threats = self._observed_threats(observation)
         source_frame = self.estimator.last_frame
         assert source_frame is not None
         if self._last_source_frame is not None and source_frame < self._last_source_frame:
             self.reset()
-            threats = self.estimator.update(observation)
+            threats = self._observed_threats(observation)
             source_frame = self.estimator.last_frame
             assert source_frame is not None
         self._last_source_frame = source_frame

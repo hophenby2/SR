@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,7 @@ import pytest
 from stg_lab.engine_matrix import (
     EngineEpisodeTarget,
     EngineMatrixConfig,
+    _canonical_bytes,
     _episode_evidence,
     available_engine_profiles,
     controller_config_for_profile,
@@ -35,6 +37,18 @@ def catalog() -> dict:
             {"stage": "Stage 1@Lunatic", "stage_index": 1},
         ],
     }}
+
+
+def test_canonical_trace_serialization_nulls_unbounded_diagnostics() -> None:
+    encoded = _canonical_bytes({
+        "finite": 12.5,
+        "diagnostics": [math.inf, -math.inf, math.nan],
+    })
+
+    assert json.loads(encoded) == {
+        "finite": 12.5,
+        "diagnostics": [None, None, None],
+    }
 
 
 def policy_checkpoint_metadata(tmp_path: Path) -> dict:
@@ -77,6 +91,7 @@ def test_catalog_selection_preserves_order_and_rejects_missing_cases() -> None:
 def test_controller_profiles_bind_explicit_clearance_targets() -> None:
     config = EngineMatrixConfig(horizon_frames=36, observation_delay=0)
     current = controller_config_for_profile("current", config)
+    humanlike = controller_config_for_profile("humanlike", config)
     general = controller_config_for_profile("general", config)
     legacy = controller_config_for_profile("legacy-clearance-12-1", config)
     novice = controller_config_for_profile("bullet-group-novice", config)
@@ -84,6 +99,7 @@ def test_controller_profiles_bind_explicit_clearance_targets() -> None:
     expert = controller_config_for_profile("bullet-group-expert", config)
     assert available_engine_profiles() == (
         "current",
+        "humanlike",
         "general",
         "legacy-clearance-12-1",
         "bullet-group-novice",
@@ -104,6 +120,19 @@ def test_controller_profiles_bind_explicit_clearance_targets() -> None:
     ) == (9, 36.0, 6.0)
     assert (legacy.safe_margin_target, legacy.region_safe_margin_target) == (12.0, 1.0)
     assert expert == current
+    assert current.beam_width == 512
+    assert current.beam_cell_size == 8.0
+    assert humanlike.bottom_anchor_enabled is True
+    assert (humanlike.beam_width, humanlike.region_beam_width) == (256, 256)
+    assert humanlike.preferred_y_fraction == 0.0
+    assert humanlike.region_safe_margin_target == 12.0
+    assert humanlike.region_urgency_lead_frames == 60
+    assert humanlike.region_nearest_waypoint_enabled is True
+    assert humanlike.minimum_direction_hold_frames == 6
+    assert humanlike.direction_sharp_turn_penalty == 12.0
+    assert humanlike.sharp_turn_neutral_beat_enabled is False
+    assert humanlike.moving_action_penalty == 1.0
+    assert humanlike.fast_action_penalty == 6.0
     assert (
         novice.gap_minimum_group_size,
         intermediate.gap_minimum_group_size,

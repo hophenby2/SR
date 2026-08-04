@@ -79,9 +79,14 @@ function GetFPS() return 47.5 end
 function GetnObj() return 123 end
 
 KeyState = {}
+replayReader = nil
 function GetInput()
-    for name, code in pairs(setting.keys) do
-        KeyState[name] = GetKeyState(code)
+    if replayReader then
+        replayReader:Next(KeyState)
+    else
+        for name, code in pairs(setting.keys) do
+            KeyState[name] = GetKeyState(code)
+        end
     end
 end
 local native_get_input = GetInput
@@ -94,10 +99,10 @@ function FrameFunc()
         stage.current_stage = stage.next_stage
         stage.next_stage = nil
     end
-    if GetKeyState(setting.keys.left) then player_object.x = player_object.x - 1 end
-    if GetKeyState(setting.keys.right) then player_object.x = player_object.x + 1 end
-    if GetKeyState(setting.keys.up) then player_object.y = player_object.y + 1 end
-    if GetKeyState(setting.keys.down) then player_object.y = player_object.y - 1 end
+    if KeyState.left then player_object.x = player_object.x - 1 end
+    if KeyState.right then player_object.x = player_object.x + 1 end
+    if KeyState.up then player_object.y = player_object.y + 1 end
+    if KeyState.down then player_object.y = player_object.y - 1 end
     stage.current_stage.timer = (stage.current_stage.timer or 0) + 1
     return false
 end
@@ -128,8 +133,17 @@ function Serialize(value)
     return "serialized-lstg-var"
 end
 
+local replay_initial_states = {}
+function DeSerialize(value)
+    local state = replay_initial_states[value]
+    check(type(state) == "table", "replay deserialized an unknown initial state")
+    return state
+end
+
 local saved_replays = {}
 local saved_replay_bytes = {}
+local loaded_replay_infos = {}
+local loaded_replay_frames = {}
 local replay_frame_data_position = 32
 local replay_file_length_adjustment = 0
 local replay_save_failures = 0
@@ -188,6 +202,30 @@ plus = {
     end,
     ReplayManager = {},
 }
+local function new_replay_frame_reader(path, offset, count)
+    local frames = loaded_replay_frames[path]
+    check(type(frames) == "table", "replay reader opened an unknown frame stream")
+    check(#frames == count, "replay reader count did not match metadata")
+    local reader = { index = 0, closed = false, offset = offset, count = count }
+    function reader:Next(state)
+        if self.index >= self.count then return false end
+        self.index = self.index + 1
+        for _, name in ipairs({
+                "up", "down", "left", "right", "slow", "shoot", "spell", "special",
+            }) do
+            state[name] = false
+        end
+        for name, value in pairs(frames[self.index]) do
+            state[name] = value == true
+        end
+        return true
+    end
+    function reader:Close() self.closed = true end
+    return reader
+end
+plus.ReplayFrameReader = setmetatable({}, {
+    __call = function(_, ...) return new_replay_frame_reader(...) end,
+})
 function plus.ReplayManager.SaveReplayInfo(path, data)
     replay_save_calls[path] = (replay_save_calls[path] or 0) + 1
     if replay_save_failures > 0 then
@@ -205,6 +243,9 @@ function plus.ReplayManager.ReadReplayInfo(path)
     if replay_read_failures > 0 then
         replay_read_failures = replay_read_failures - 1
         error("injected ReadReplayInfo failure")
+    end
+    if loaded_replay_infos[path] then
+        return loaded_replay_infos[path]
     end
     local data = saved_replays[path]
     check(data ~= nil, "replay verification read an unknown path")
@@ -227,20 +268,65 @@ function plus.ReplayManager.ReadReplayInfo(path)
     }
 end
 
-local spell_stage = { stage_name = "Spell Practice@Spell Practice", is_menu = false, timer = 0 }
-local stage4 = { stage_name = "Stage 4@Lunatic", is_menu = false, timer = 0 }
-local full_stage = { stage_name = "Stage 5@Lunatic", is_menu = false, timer = 0 }
 local menu_stage = { stage_name = "menu", is_menu = true, timer = 0 }
+local campaign_group = {
+    name = "Lunatic",
+    title = "menu",
+    item_init = { lifeleft = 2, bomb = 3, power = 100, faith = 0 },
+}
+local spell_stage = { stage_name = "Spell Practice@Spell Practice", is_menu = false, timer = 0 }
+local stage1 = {
+    stage_name = "Stage 1@Lunatic", is_menu = false, timer = 0,
+    group = campaign_group, number = 1,
+    item_init = { lifeleft = 7, bomb = 3, power = 0, faith = 0 },
+}
+local stage2 = {
+    stage_name = "Stage 2@Lunatic", is_menu = false, timer = 0,
+    group = campaign_group, number = 2,
+    item_init = { lifeleft = 7, bomb = 3, power = 0, faith = 0 },
+}
+local stage3 = {
+    stage_name = "Stage 3@Lunatic", is_menu = false, timer = 0,
+    group = campaign_group, number = 3,
+    item_init = { lifeleft = 7, bomb = 3, power = 0, faith = 0 },
+}
+local stage4 = {
+    stage_name = "Stage 4@Lunatic", is_menu = false, timer = 0,
+    group = campaign_group, number = 4,
+    item_init = { lifeleft = 7, bomb = 3, power = 0, faith = 0 },
+}
+local full_stage = {
+    stage_name = "Stage 5@Lunatic", is_menu = false, timer = 0,
+    group = campaign_group, number = 5,
+    item_init = { lifeleft = 7, bomb = 3, power = 300, faith = 50000 },
+}
+campaign_group.stages = { stage1, stage2, stage3, stage4, full_stage }
+campaign_group.number = #campaign_group.stages
 stage = {
     stages = {
         ["Spell Practice@Spell Practice"] = spell_stage,
+        ["Stage 1@Lunatic"] = stage1,
+        ["Stage 2@Lunatic"] = stage2,
+        ["Stage 3@Lunatic"] = stage3,
         ["Stage 4@Lunatic"] = stage4,
         ["Stage 5@Lunatic"] = full_stage,
         ["menu"] = menu_stage,
     },
     current_stage = { stage_name = "menu", is_menu = true, timer = 0 },
 }
-function stage.Set(name)
+function stage.Set(name, mode, path)
+    if replayReader then
+        replayReader:Close()
+        replayReader = nil
+    end
+    if mode == "load" then
+        local info = plus.ReplayManager.ReadReplayInfo(path)
+        local replay_stage = info.stages[1]
+        replayReader = plus.ReplayFrameReader(
+            path, replay_stage.frameDataPosition, replay_stage.frameCount)
+        lstg.nextvar = DeSerialize(replay_stage.stageExtendInfo)
+        lstg.var.stage_name = replay_stage.stageName
+    end
     stage.next_stage = stage.stages[name]
 end
 
@@ -258,6 +344,8 @@ _editor_class = {
         },
     },
 }
+_sc_table = {}
+_sc_table[50] = { "okuu:Lunatic", "Lunatic 5 Boss #3", nil, 4, false }
 SR_SPELL_PRACTICE_CATALOG = {
     schema_version = 1,
     scenarios = {
@@ -275,6 +363,24 @@ SR_STAGE_TEST_CATALOG = {
     schema_version = 1,
     stages = {
         {
+            stage = "Stage 1@Lunatic",
+            difficulty = "Lunatic",
+            stage_index = 1,
+            label = "Lunatic Stage 1",
+        },
+        {
+            stage = "Stage 2@Lunatic",
+            difficulty = "Lunatic",
+            stage_index = 2,
+            label = "Lunatic Stage 2",
+        },
+        {
+            stage = "Stage 3@Lunatic",
+            difficulty = "Lunatic",
+            stage_index = 3,
+            label = "Lunatic Stage 3",
+        },
+        {
             stage = "Stage 4@Lunatic",
             difficulty = "Lunatic",
             stage_index = 4,
@@ -288,6 +394,21 @@ SR_STAGE_TEST_CATALOG = {
         },
     },
 }
+
+local player_init_calls = 0
+item = {}
+function item.PlayerInit()
+    player_init_calls = player_init_calls + 1
+    lstg.var.power = 100
+    lstg.var.lifeleft = 2
+    lstg.var.bomb = 3
+    lstg.var.faith = 0
+    lstg.var.graze = 0
+    lstg.var.score = 0
+    lstg.var.collectitem = { 0, 0, 0, 0, 0, 0 }
+    lstg.var.itembar = { 0, 0, 0 }
+    lstg.var.init_player_data = true
+end
 
 local encoded_values = {}
 local requests = {}
@@ -374,14 +495,22 @@ check(type(encoded_values[#encoded_values].process_nonce) == "string"
         and encoded_values[#encoded_values].process_nonce ~= "",
     "ping did not expose an engine-generated process nonce")
 check(encoded_values[#encoded_values].protocol == 2, "ping protocol version mismatch")
+local ping_has_campaign = false
+local ping_has_replay = false
+for _, command in ipairs(encoded_values[#encoded_values].commands) do
+    if command == "reset_campaign" then ping_has_campaign = true end
+    if command == "reset_replay" then ping_has_replay = true end
+end
+check(ping_has_campaign, "ping did not advertise reset_campaign")
+check(ping_has_replay, "ping did not advertise reset_replay")
 check(encoded_values[#encoded_values].runtime_identity.process_id == 1234,
     "ping did not expose the operating-system process id")
 instance:_handle_request({ id = 0, command = "catalog" })
 check(encoded_values[#encoded_values].id == 0 and encoded_values[#encoded_values].ok, "missing catalog response")
 check(encoded_values[#encoded_values].catalog.attack_count == 2, "catalog attack count mismatch")
 check(encoded_values[#encoded_values].catalog.attacks[2].card_index == 4, "catalog card index mismatch")
-check(encoded_values[#encoded_values].catalog.stage_count == 2, "catalog stage count mismatch")
-check(encoded_values[#encoded_values].catalog.stages[2].completion_reason == "stage_complete",
+check(encoded_values[#encoded_values].catalog.stage_count == 5, "catalog stage count mismatch")
+check(encoded_values[#encoded_values].catalog.stages[5].completion_reason == "stage_complete",
     "catalog stage completion contract mismatch")
 encoded_values = {}
 
@@ -454,6 +583,9 @@ check(SR_SAFETY_ZONE_CONTROLLER_STATE == controller_overlay_state,
     "step without overlay state discarded the previous controller state")
 FrameFunc()
 
+-- Simulate a fresh process: non-first generated stages do not call
+-- item.PlayerInit themselves, so reset_stage must create the complete schema.
+lstg.var = {}
 instance:_handle_request({
     id = 20, command = "reset_stage", stage = "Stage 4@Lunatic",
     seed = 77, player = "reimu_player",
@@ -476,6 +608,12 @@ check(encoded_values[#encoded_values].reset.episode_kind == "stage",
 check(encoded_values[#encoded_values].observation.stage.scenario == "Stage 4@Lunatic",
     "stage observation scenario mismatch")
 check(lstg.var.lifeleft == 4, "stage reset resource override was not applied")
+check(lstg.var.power == 0,
+    "isolated stage reset did not apply the registered stage resources")
+check(lstg.var.init_player_data == true and type(lstg.var.collectitem) == "table",
+    "fresh-process stage reset did not initialize player data")
+check(player_init_calls == 1,
+    "fresh-process stage reset did not call item.PlayerInit exactly once")
 check(player_object.colli == true, "stage reset did not restore player collision")
 check(player_object.group == GROUP_PLAYER, "stage reset did not restore player group")
 instance.seen_enemy = true
@@ -519,12 +657,150 @@ instance:_frame()
 check(instance.termination_reason == "engine_exit",
     "engine exit was incorrectly accepted as full-stage completion")
 instance.original_frame = saved_original_frame
+
+instance:_handle_request({
+    id = 230, command = "reset_campaign", difficulty = "Lunatic",
+    seed = 80, player = "reimu_player", replay_name = "unsupported-campaign",
+    options = {},
+})
+check(encoded_values[#encoded_values].id == 230
+        and encoded_values[#encoded_values].ok == false,
+    "campaign replay capture was accepted")
+check(string.find(encoded_values[#encoded_values].error,
+        "not supported for campaign", 1, true),
+    "campaign replay rejection returned the wrong error")
+
+instance:_handle_request({
+    id = 231, command = "reset_campaign", difficulty = "Lunatic",
+    seed = 80, player = "reimu_player", options = { hidden_route = true },
+})
+check(encoded_values[#encoded_values].id == 231
+        and encoded_values[#encoded_values].ok == false,
+    "campaign test options were accepted")
+check(string.find(encoded_values[#encoded_values].error,
+        "does not support option", 1, true),
+    "campaign option rejection returned the wrong error")
+
+lstg.var.hidden_route = true
+groups[GROUP_ENEMY] = { enemy_object }
+instance:_handle_request({
+    id = 232, command = "reset_campaign", difficulty = "Lunatic",
+    seed = 81, player = "reimu_player", options = {},
+})
+FrameFunc()
+local campaign_reset = encoded_values[#encoded_values]
+check(campaign_reset.id == 232 and campaign_reset.ok,
+    "campaign reset failed")
+check(campaign_reset.reset.episode_kind == "campaign"
+        and campaign_reset.reset.difficulty == "Lunatic"
+        and campaign_reset.reset.stage_index == 1
+        and campaign_reset.reset.stage_name == "Stage 1@Lunatic"
+        and campaign_reset.reset.stage_count == 5,
+    "campaign reset metadata mismatch")
+check(campaign_reset.observation.campaign.initial_hidden_route == false
+        and campaign_reset.observation.campaign.hidden_route == false,
+    "campaign reset did not clear stale hidden-route state")
+check(campaign_reset.observation.campaign.stage_active_content_seen == true,
+    "campaign did not observe initial-stage active content")
+check(getmetatable(campaign_reset.observation.campaign.completed_stages)
+        == fake_cjson.array_mt
+        and getmetatable(campaign_reset.observation.campaign.transitions)
+        == fake_cjson.array_mt,
+    "campaign histories must retain JSON array identity")
+
+-- Stand in for Stage 1's gameplay-earned route flag. The bridge must preserve
+-- it and all resources across native Stage 1-5 transitions.
+lstg.var.hidden_route = true
+lstg.var.lifeleft = 6
+local campaign_stage_names = {
+    "Stage 1@Lunatic", "Stage 2@Lunatic", "Stage 3@Lunatic",
+    "Stage 4@Lunatic", "Stage 5@Lunatic",
+}
+for stage_index = 1, 4 do
+    stage.Set(campaign_stage_names[stage_index + 1])
+    instance:_handle_request({
+        id = 232 + stage_index, command = "step",
+        action = { shoot = true }, ["repeat"] = 1,
+    })
+    FrameFunc()
+    local transition_observation = encoded_values[#encoded_values].observation
+    check(transition_observation.terminated == false,
+        "legal campaign transition terminated the episode")
+    check(transition_observation.campaign.stage_index == stage_index + 1
+            and transition_observation.campaign.stage_name
+                == campaign_stage_names[stage_index + 1]
+            and transition_observation.campaign.stages_completed == stage_index
+            and transition_observation.campaign.stage_transition_count == stage_index,
+        "campaign transition state mismatch")
+    check(transition_observation.campaign.resources.lifeleft == 6
+            and transition_observation.campaign.hidden_route == true,
+        "campaign transition did not preserve resources/hidden route")
+end
+
+stage.Set("menu")
+instance:_handle_request({
+    id = 237, command = "step", action = { shoot = true }, ["repeat"] = 1,
+})
+FrameFunc()
+local campaign_terminal = encoded_values[#encoded_values].observation
+check(campaign_terminal.terminated == true
+        and campaign_terminal.termination_reason == "campaign_complete",
+    "Stage 5 menu transition did not complete the campaign")
+check(campaign_terminal.campaign.campaign_complete == true
+        and campaign_terminal.campaign.stage_index == 5
+        and campaign_terminal.campaign.stage_name == "Stage 5@Lunatic"
+        and campaign_terminal.campaign.stages_completed == 5
+        and campaign_terminal.campaign.stage_transition_count == 5,
+    "campaign terminal state mismatch")
+for stage_index, completed in ipairs(campaign_terminal.campaign.completed_stages) do
+    check(completed.stage_index == stage_index
+            and completed.stage_name == campaign_stage_names[stage_index]
+            and completed.active_content_seen == true
+            and completed.resources.lifeleft == 6
+            and completed.hidden_route == true,
+        "campaign completed-stage report mismatch")
+end
+check(campaign_terminal.campaign.transitions[5].to_stage_index == 0
+        and campaign_terminal.campaign.transitions[5].to_stage_name == "menu",
+    "campaign final transition report mismatch")
+
+groups[GROUP_ENEMY] = {}
+instance:_handle_request({
+    id = 238, command = "reset_campaign", difficulty = "Lunatic",
+    seed = 82, player = "reimu_player", options = {},
+})
+FrameFunc()
+stage.Set("Stage 2@Lunatic")
+instance:_handle_request({
+    id = 239, command = "step", action = { shoot = true }, ["repeat"] = 1,
+})
+FrameFunc()
+check(encoded_values[#encoded_values].observation.termination_reason
+        == "campaign_stage_changed",
+    "campaign accepted a stage transition without active content")
+
+groups[GROUP_ENEMY] = { enemy_object }
+instance:_handle_request({
+    id = 240, command = "reset_campaign", difficulty = "Lunatic",
+    seed = 83, player = "reimu_player", options = {},
+})
+FrameFunc()
+stage.Set("Stage 3@Lunatic")
+instance:_handle_request({
+    id = 241, command = "step", action = { shoot = true }, ["repeat"] = 1,
+})
+FrameFunc()
+check(encoded_values[#encoded_values].observation.termination_reason
+        == "campaign_stage_changed",
+    "campaign accepted a non-successor stage transition")
+
 stage.current_stage = spell_stage
 instance.terminated = false
 instance.termination_reason = nil
 instance.episode_kind = "attack"
 instance.episode_scenario = "okuu:Lunatic"
 instance.expected_stage = "Spell Practice@Spell Practice"
+instance.campaign = nil
 groups[GROUP_ENEMY] = { enemy_object }
 
 RenderFunc()
@@ -830,6 +1106,170 @@ check(stage5_replay.stages[1].stageName == "Stage 5@Lunatic"
         and stage5_replay.stages[1].stagePlayer == "Reimu"
         and stage5_replay.stages[1].frameData:GetCount() == 1,
     "final-stage replay stage metadata mismatch")
+
+local function register_loaded_replay(path, overrides, frames, initial_state)
+    overrides = overrides or {}
+    local replay_stage = {
+        stageName = overrides.stageName or "Spell Practice@Spell Practice",
+        stageExtendInfo = overrides.stageExtendInfo or (path .. "-initial-state"),
+        randomSeed = overrides.randomSeed or 24962,
+        stagePlayer = overrides.stagePlayer or "Reimu",
+        frameCount = overrides.frameCount or #frames,
+        frameDataPosition = overrides.frameDataPosition or replay_frame_data_position,
+    }
+    local stages = overrides.stages or { replay_stage }
+    loaded_replay_infos[path] = {
+        fileVersion = overrides.fileVersion or 1,
+        gameName = overrides.gameName or "SR-master",
+        gameVersion = overrides.gameVersion or 1,
+        userName = overrides.userName or "HT",
+        group_finish = overrides.group_finish or 0,
+        stages = stages,
+    }
+    loaded_replay_frames[path] = frames
+    replay_initial_states[replay_stage.stageExtendInfo] = initial_state or {
+        sc_index = 50,
+        is_practice = true,
+        player_name = "reimu_player",
+        ran_seed = replay_stage.randomSeed,
+    }
+    saved_replay_bytes[path] = string.rep(
+        "\0", replay_stage.frameDataPosition + replay_stage.frameCount)
+end
+
+instance:_handle_request({ id = 380, command = "reset_replay" })
+check(encoded_values[#encoded_values].id == 380
+        and encoded_values[#encoded_values].ok == false
+        and string.find(encoded_values[#encoded_values].error,
+            "nonempty string", 1, true),
+    "reset_replay accepted a missing path")
+
+local version_path = "analysis/replay-version-2.rep"
+register_loaded_replay(version_path, { fileVersion = 2 }, { {} })
+instance:_handle_request({ id = 381, command = "reset_replay", path = version_path })
+check(encoded_values[#encoded_values].id == 381
+        and encoded_values[#encoded_values].ok == false
+        and string.find(encoded_values[#encoded_values].error,
+            "file version 1", 1, true),
+    "reset_replay accepted a non-v1 replay")
+
+local multi_path = "analysis/replay-multiple-stages.rep"
+local duplicate_stage = {
+    stageName = "Spell Practice@Spell Practice",
+    stageExtendInfo = "duplicate-stage",
+    randomSeed = 1,
+    stagePlayer = "Reimu",
+    frameCount = 1,
+    frameDataPosition = replay_frame_data_position + 1,
+}
+register_loaded_replay(multi_path, { stages = {
+    {
+        stageName = "Spell Practice@Spell Practice",
+        stageExtendInfo = "first-stage",
+        randomSeed = 1,
+        stagePlayer = "Reimu",
+        frameCount = 1,
+        frameDataPosition = replay_frame_data_position,
+    },
+    duplicate_stage,
+} }, { {} })
+instance:_handle_request({ id = 382, command = "reset_replay", path = multi_path })
+check(encoded_values[#encoded_values].id == 382
+        and encoded_values[#encoded_values].ok == false
+        and string.find(encoded_values[#encoded_values].error,
+            "exactly one stage", 1, true),
+    "reset_replay accepted a multi-stage replay")
+
+local full_stage_path = "analysis/replay-full-stage.rep"
+register_loaded_replay(
+    full_stage_path, { stageName = "Stage 5@Lunatic" }, { {} })
+instance:_handle_request({
+    id = 383, command = "reset_replay", path = full_stage_path,
+})
+check(encoded_values[#encoded_values].id == 383
+        and encoded_values[#encoded_values].ok == false
+        and string.find(encoded_values[#encoded_values].error,
+            "Spell Practice@Spell Practice", 1, true),
+    "reset_replay accepted a non-Spell-Practice replay")
+
+local playback_path = "analysis/human-boss3.rep"
+register_loaded_replay(playback_path, {
+    randomSeed = 10292,
+    frameDataPosition = 64,
+    gameName = "SR-master",
+    userName = "HT",
+}, {
+    { right = true, shoot = true },
+    { left = true, slow = true, shoot = true },
+    { up = true, shoot = true },
+})
+groups[GROUP_ENEMY] = { enemy_object }
+player_object.death = 0
+local playback_start_x = player_object.x
+instance:_handle_request({
+    id = 384, command = "reset_replay", path = playback_path,
+})
+check(instance.pending and instance.episode_kind == "replay",
+    "reset_replay did not create a pending replay episode")
+FrameFunc()
+local replay_reset_response = encoded_values[#encoded_values]
+local replay_metadata = replay_reset_response.reset.replay
+check(replay_reset_response.id == 384 and replay_reset_response.ok,
+    "valid replay reset failed")
+check(replay_reset_response.reset.episode_kind == "replay"
+        and replay_metadata.path == playback_path
+        and replay_metadata.file_version == 1
+        and replay_metadata.game_name == "SR-master"
+        and replay_metadata.user_name == "HT"
+        and replay_metadata.random_seed == 10292
+        and replay_metadata.frame_count == 3
+        and replay_metadata.frame_bytes_verified == 3
+        and replay_metadata.file_size == 67
+        and replay_metadata.crc32 == "00000000",
+    "replay reset metadata mismatch")
+check(replay_metadata.scenario == "okuu:Lunatic"
+        and replay_metadata.card_index == 4
+        and replay_metadata.spell_practice_index == 50,
+    "legacy spell-practice replay identity was not resolved")
+check(seed_value == 10292 and stage.IsReplay == true,
+    "replay reset did not restore the recorded seed and replay mode")
+check(replayReader.index == 1 and KeyState.right and KeyState.shoot
+        and player_object.x == playback_start_x + 1,
+    "replayReader did not override neutral input on the reset frame")
+
+local responses_before_replay_step = #encoded_values
+instance:_handle_request({
+    id = 385, command = "step",
+    action = { move_x = 1, move_y = -1, slow = false, shoot = false },
+    ["repeat"] = 10,
+})
+check(instance.action.move_x == 0 and instance.action.move_y == 0
+        and instance.action.shoot == false,
+    "replay step did not neutralize client-authored input")
+FrameFunc()
+check(#encoded_values == responses_before_replay_step
+        and replayReader.index == 2 and KeyState.left and KeyState.slow
+        and KeyState.shoot and player_object.x == playback_start_x,
+    "neutral replay step was not overridden by the second recorded input")
+FrameFunc()
+local replay_terminal = encoded_values[#encoded_values]
+check(replay_terminal.id == 385 and replay_terminal.ok
+        and replay_terminal.observation.terminated == true
+        and replay_terminal.observation.termination_reason == "replay_exhausted"
+        and replay_terminal.observation.episode_frame == 3
+        and replayReader.index == 3 and KeyState.up and KeyState.shoot,
+    "replay did not stop exactly after its declared final input frame")
+
+local hit_path = "analysis/human-boss3-hit.rep"
+register_loaded_replay(hit_path, { randomSeed = 123 }, { { shoot = true } })
+instance:_handle_request({ id = 386, command = "reset_replay", path = hit_path })
+player_object.death = 1
+FrameFunc()
+local replay_hit = encoded_values[#encoded_values]
+check(replay_hit.id == 386 and replay_hit.ok
+        and replay_hit.observation.termination_reason == "player_hit",
+    "specific replay outcome did not take priority over final-frame exhaustion")
+player_object.death = 0
 
 SR_SAFETY_ZONE_CONTROLLER_STATE = { revision = 99 }
 instance:_disconnect("closed")

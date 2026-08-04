@@ -844,6 +844,70 @@ def test_engine_test_runs_live_catalog_benchmark(monkeypatch, tmp_path, capsys) 
     assert json.loads(capsys.readouterr().out)["passed"] is True
 
 
+def test_engine_replay_analyze_connects_and_writes_report(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab import engine, engine_replay_analysis
+
+    connected = {}
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            connected["closed"] = True
+
+    def fake_connect(host, port, *, timeout):
+        connected.update(host=host, port=port, timeout=timeout)
+        return FakeClient()
+
+    def fake_analyze(client, **kwargs):
+        calls.update(client=client, **kwargs)
+        return {
+            "schema_version": 1,
+            "analysis_complete": True,
+            "frames_analyzed": 2592,
+        }
+
+    monkeypatch.setattr(engine.EngineClient, "connect", fake_connect)
+    monkeypatch.setattr(
+        engine_replay_analysis,
+        "run_engine_replay_analysis",
+        fake_analyze,
+    )
+    output = tmp_path / "slot2-analysis.json"
+    assert cli.main([
+        "engine-replay-analyze",
+        "--host", "127.0.0.2",
+        "--port", "25002",
+        "--timeout", "7.5",
+        "--replay", "Z:\\replays\\slot2.rep",
+        "--max-frames", "5000",
+        "--timeline-every", "3",
+        "--region-grid-cell-size", "8",
+        "--render",
+        "--render-every", "2",
+        "--output", str(output),
+    ]) == 0
+
+    assert connected == {
+        "host": "127.0.0.2",
+        "port": 25002,
+        "timeout": 7.5,
+        "closed": True,
+    }
+    assert calls["replay_path"] == "Z:\\replays\\slot2.rep"
+    assert calls["config"].max_frames == 5000
+    assert calls["config"].timeline_every == 3
+    assert calls["config"].region_grid_cell_size == 8.0
+    assert calls["config"].render is True
+    assert calls["config"].render_every == 2
+    assert json.loads(output.read_text())["analysis_complete"] is True
+    assert json.loads(capsys.readouterr().out)["frames_analyzed"] == 2592
+
+
 def test_engine_mpc_matrix_resolves_catalog_and_profiles(
     monkeypatch, tmp_path, capsys,
 ) -> None:
@@ -918,6 +982,61 @@ def test_engine_mpc_matrix_resolves_catalog_and_profiles(
     )
     assert calls["matrix"]["config"].max_frames == 9000
     assert json.loads(output.read_text())["passed"] is True
+    assert json.loads(capsys.readouterr().out)["passed"] is True
+
+
+def test_engine_mpc_campaign_has_only_memory_free_controller_inputs(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab import engine, engine_mpc_campaign
+
+    connected = {}
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            connected["closed"] = True
+
+    def fake_connect(host, port, *, timeout):
+        connected.update(host=host, port=port, timeout=timeout)
+        return FakeClient()
+
+    def fake_campaign(client, **kwargs):
+        calls.update(client=client, **kwargs)
+        return {"schema_version": 1, "passed": True, "success": True}
+
+    monkeypatch.setattr(engine.EngineClient, "connect", fake_connect)
+    monkeypatch.setattr(engine_mpc_campaign, "run_engine_mpc_campaign", fake_campaign)
+    output = tmp_path / "campaign.json"
+    assert cli.main([
+        "engine-mpc-campaign",
+        "--host", "127.0.0.2",
+        "--port", "25001",
+        "--timeout", "6.5",
+        "--difficulty", "Normal",
+        "--seed", "19",
+        "--profile", "general",
+        "--max-frames", "90000",
+        "--horizon-frames", "60",
+        "--observation-delay", "5",
+        "--output", str(output),
+    ]) == 0
+
+    assert connected == {
+        "host": "127.0.0.2",
+        "port": 25001,
+        "timeout": 6.5,
+        "closed": True,
+    }
+    assert calls["difficulty"] == "Normal"
+    assert calls["seed"] == 19
+    assert calls["config"].max_frames == 90000
+    assert calls["controller"].config.region_dynamics_memory is None
+    payload = json.loads(output.read_text())
+    assert payload["profile"] == "general"
     assert json.loads(capsys.readouterr().out)["passed"] is True
 
 

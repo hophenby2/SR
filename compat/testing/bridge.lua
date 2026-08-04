@@ -35,8 +35,8 @@ local TEST_MODE_STARTUP_ACCEPT_TIMEOUT = 30
 
 local ACTION_NAMES = { "move_x", "move_y", "slow", "shoot", "spell" }
 local COMMAND_NAMES = {
-    "ping", "catalog", "reset", "reset_stage", "step", "observe",
-    "display", "save_replay", "close", "shutdown",
+    "ping", "catalog", "reset", "reset_stage", "reset_campaign", "reset_replay",
+    "step", "observe", "display", "save_replay", "close", "shutdown",
 }
 local RUNTIME_SOURCE_FILES = {
     "root.lua",
@@ -373,6 +373,8 @@ function Instance:_disconnect(reason)
     self.expected_stage = nil
     self.expected_stage_successor = nil
     self.expected_stage_menu = false
+    self.campaign = nil
+    self.replay_playback = nil
     if reason and reason ~= "closed" then
         self:_log("client disconnected: " .. tostring(reason))
     end
@@ -969,6 +971,314 @@ local function stage_completion_contract(stage_entry)
     return nil, successor_count == 0 and current_index == maximum_index
 end
 
+local CAMPAIGN_STAGE_COUNT = 5
+local RESOURCE_NAMES = { "lifeleft", "bomb", "power", "faith", "graze", "score" }
+
+local function resource_snapshot(vars)
+    local result = {}
+    for _, key in ipairs(RESOURCE_NAMES) do
+        local value = number_or_nil(type(vars) == "table" and vars[key] or nil)
+        if value ~= nil then
+            result[key] = value
+        end
+    end
+    return result
+end
+
+local function initialize_full_stage_player_data(stage_entry, isolated_stage)
+    local item_library = rawget(_G, "item")
+    local initializer = type(item_library) == "table" and item_library.PlayerInit or nil
+    if type(initializer) ~= "function" then
+        return nil, "item.PlayerInit is unavailable for full-stage reset"
+    end
+    local ok, init_error = pcall(initializer)
+    if not ok then
+        return nil, "item.PlayerInit failed: " .. tostring(init_error)
+    end
+    if type(lstg) ~= "table" or type(lstg.var) ~= "table"
+            or lstg.var.init_player_data ~= true then
+        return nil, "item.PlayerInit did not initialize player data"
+    end
+
+    -- A direct Stage 2-5 reset bypasses _init_item's first-stage branch. Match
+    -- stage practice's resource initialization for an isolated reset, while a
+    -- campaign uses the native group's starting resources.
+    local stage_object = type(stage) == "table" and type(stage.stages) == "table"
+        and stage.stages[stage_entry.stage] or nil
+    local group = type(stage_object) == "table" and stage_object.group or nil
+    local initial_values = isolated_stage and stage_object.item_init
+        or (type(group) == "table" and group.item_init or nil)
+    if type(initial_values) == "table" then
+        for key, value in pairs(initial_values) do
+            lstg.var[key] = value
+        end
+    end
+    return true
+end
+
+local function resolve_campaign(difficulty)
+    if type(difficulty) ~= "string" or difficulty == "" then
+        return nil, "difficulty must name a registered Stage 1-5 campaign"
+    end
+    local source = rawget(_G, "SR_STAGE_TEST_CATALOG")
+    local entries = type(source) == "table" and source.stages or nil
+    if type(entries) ~= "table" then
+        return nil, "SR stage-test catalog is not registered"
+    end
+
+    local ordered = {}
+    local count = 0
+    local campaign_group = nil
+    local menu_name = nil
+    for _, entry in ipairs(entries) do
+        if type(entry) == "table" and entry.difficulty == difficulty then
+            local stage_index = integer(entry.stage_index, nil, 1)
+            local stage_name = string_value(entry.stage)
+            if not stage_index or not stage_name then
+                return nil, "campaign catalog contains an invalid stage entry"
+            end
+            if stage_index > CAMPAIGN_STAGE_COUNT then
+                return nil, "campaign catalog must contain exactly Stage 1-5"
+            end
+            if ordered[stage_index] then
+                return nil, "campaign catalog contains duplicate stage index "
+                    .. tostring(stage_index)
+            end
+            local stage_object = type(stage) == "table" and type(stage.stages) == "table"
+                and stage.stages[stage_name] or nil
+            if type(stage_object) ~= "table" then
+                return nil, "stage catalog entry is not registered: " .. stage_name
+            end
+            local group = type(stage_object.group) == "table" and stage_object.group or nil
+            if not group then
+                return nil, "campaign stage has no registered stage group: " .. stage_name
+            end
+            if campaign_group and campaign_group ~= group then
+                return nil, "campaign stages do not share one native stage group"
+            end
+            campaign_group = group
+            if menu_name and menu_name ~= group.title then
+                return nil, "campaign stages do not share one menu target"
+            end
+            menu_name = string_value(group.title)
+            ordered[stage_index] = entry
+            count = count + 1
+        end
+    end
+    if count ~= CAMPAIGN_STAGE_COUNT then
+        return nil, "campaign catalog must contain exactly Stage 1-5 for " .. difficulty
+    end
+    for stage_index = 1, CAMPAIGN_STAGE_COUNT do
+        if not ordered[stage_index] then
+            return nil, "campaign catalog is missing Stage " .. tostring(stage_index)
+        end
+    end
+    local menu_stage = menu_name and type(stage) == "table"
+        and type(stage.stages) == "table"
+        and stage.stages[menu_name] or nil
+    if not menu_name or type(menu_stage) ~= "table" or menu_stage.is_menu ~= true then
+        return nil, "campaign stage group has no registered menu target"
+    end
+    return {
+        difficulty = difficulty,
+        entries = ordered,
+        stage_count = CAMPAIGN_STAGE_COUNT,
+        menu_name = menu_name,
+    }
+end
+
+local function campaign_options_error(options)
+    if type(options) ~= "table" then
+        return "campaign options must be an object"
+    end
+    for key in pairs(options) do
+        return "campaign reset does not support option: " .. tostring(key)
+    end
+end
+
+local SPELL_PRACTICE_STAGE = "Spell Practice@Spell Practice"
+
+local function replay_practice_identity()
+    local vars = type(lstg) == "table" and type(lstg.nextvar) == "table"
+        and lstg.nextvar or nil
+    if type(vars) ~= "table" then
+        return nil, nil, nil
+    end
+    local practice = vars.sc_pr_data
+    if type(practice) == "table" then
+        return string_value(practice.class_name),
+            integer(practice.scene_index, nil, 1), nil
+    end
+    local practice_index = integer(vars.sc_index, nil, 1)
+    local practice_table = rawget(_G, "_sc_table")
+    local entry = practice_index and type(practice_table) == "table"
+        and practice_table[practice_index] or nil
+    if type(entry) == "table" then
+        return string_value(entry[1]), integer(entry[4], nil, 1), practice_index
+    end
+    return nil, nil, practice_index
+end
+
+local function close_replay_reader()
+    local reader = rawget(_G, "replayReader")
+    if type(reader) == "table" and type(reader.Close) == "function" then
+        pcall(reader.Close, reader)
+    end
+    rawset(_G, "replayReader", nil)
+end
+
+function Instance:_reset_replay(request)
+    local path = request.path
+    if type(path) ~= "string" or path == "" then
+        return nil, "replay path must be a nonempty string"
+    end
+    if string.find(path, "\0", 1, true) then
+        return nil, "replay path must not contain NUL"
+    end
+    local replay_reader_type = type(plus) == "table"
+        and type(plus.ReplayFrameReader) or nil
+    if type(plus) ~= "table" or type(plus.ReplayManager) ~= "table"
+            or type(plus.ReplayManager.ReadReplayInfo) ~= "function"
+            or (replay_reader_type ~= "function" and replay_reader_type ~= "table") then
+        return nil, "THlib replay reader is unavailable"
+    end
+    if type(stage) ~= "table" or type(stage.Set) ~= "function"
+            or type(stage.stages) ~= "table"
+            or type(stage.stages[SPELL_PRACTICE_STAGE]) ~= "table" then
+        return nil, "Spell Practice stage is not registered"
+    end
+
+    local read_ok, replay_info = pcall(plus.ReplayManager.ReadReplayInfo, path)
+    if not read_ok or type(replay_info) ~= "table" then
+        return nil, "failed to read replay metadata: " .. tostring(replay_info)
+    end
+    if replay_info.fileVersion ~= 1 then
+        return nil, "replay must use STGR file version 1"
+    end
+    if type(replay_info.stages) ~= "table" or #replay_info.stages ~= 1
+            or type(replay_info.stages[1]) ~= "table" then
+        return nil, "replay must contain exactly one stage"
+    end
+    local stage_info = replay_info.stages[1]
+    if stage_info.stageName ~= SPELL_PRACTICE_STAGE then
+        return nil, "replay stage must be " .. SPELL_PRACTICE_STAGE
+    end
+    if type(stage_info.stageExtendInfo) ~= "string"
+            or stage_info.stageExtendInfo == "" then
+        return nil, "replay Spell Practice initial state is missing"
+    end
+    local frame_count = stage_info.frameCount
+    if type(frame_count) ~= "number" or frame_count < 1
+            or frame_count ~= math.floor(frame_count) then
+        return nil, "replay must contain at least one input frame"
+    end
+    local seed = stage_info.randomSeed
+    if type(seed) ~= "number" or seed < 0 or seed > 0xFFFFFFFF
+            or seed ~= math.floor(seed) then
+        return nil, "replay random seed is invalid"
+    end
+    local frame_verification, frame_error = verify_replay_frame_data(
+        path, replay_info.stages)
+    if not frame_verification then
+        return nil, "replay frame data verification failed: " .. tostring(frame_error)
+    end
+    local checksum, checksum_error = crc32_file(path)
+    if not checksum then
+        return nil, "replay checksum failed: " .. tostring(checksum_error)
+    end
+    if self.replay_capture then
+        local _, replay_error = self:_finish_replay_capture(false, "reset")
+        if replay_error then
+            return nil, "failed to finalize preceding replay: " .. replay_error
+        end
+    end
+
+    self.campaign = nil
+    self.replay_playback = nil
+    if type(ext) == "table" then
+        ext.pop_pause_menu = false
+        ext.pause_menu_order = nil
+        ext.rep_over = false
+        if type(ext.pause_menu) == "table" then
+            ext.pause_menu.kill = true
+            if type(task) == "table" and type(task.Clear) == "function" then
+                pcall(task.Clear, ext.pause_menu)
+            end
+        end
+    end
+    stage.IsSCpractice = nil
+    stage.IsReplay = true
+    local switch_ok, switch_error = pcall(
+        stage.Set, SPELL_PRACTICE_STAGE, "load", path)
+    if not switch_ok then
+        close_replay_reader()
+        stage.IsReplay = nil
+        return nil, "failed to load replay stage: " .. tostring(switch_error)
+    end
+    if type(rawget(_G, "replayReader")) ~= "table" then
+        close_replay_reader()
+        stage.IsReplay = nil
+        return nil, "THlib did not activate replayReader"
+    end
+
+    local scenario, card_index, practice_index = replay_practice_identity()
+    if not scenario or not card_index then
+        close_replay_reader()
+        stage.IsReplay = nil
+        return nil, "replay Spell Practice initial state is not registered"
+    end
+    local editor_classes = rawget(_G, "_editor_class")
+    local boss_class = type(editor_classes) == "table"
+        and editor_classes[scenario] or nil
+    if type(boss_class) ~= "table" or type(boss_class.cards) ~= "table"
+            or type(boss_class.cards[card_index]) ~= "table" then
+        close_replay_reader()
+        stage.IsReplay = nil
+        return nil, "replay Spell Practice card is not registered"
+    end
+    self:_seed(seed)
+
+    local metadata = {
+        schema_version = 1,
+        path = path,
+        file_version = replay_info.fileVersion,
+        game_name = string_value(replay_info.gameName),
+        game_version = integer(replay_info.gameVersion, nil, 0),
+        group_finish = integer(replay_info.group_finish, nil, 0),
+        user_name = string_value(replay_info.userName),
+        stage_name = stage_info.stageName,
+        stage_player = string_value(stage_info.stagePlayer),
+        random_seed = seed,
+        frame_count = frame_count,
+        frame_data_position = stage_info.frameDataPosition,
+        frame_bytes_verified = frame_verification.frame_bytes,
+        file_size = frame_verification.file_size,
+        crc32 = checksum,
+        scenario = scenario,
+        card_index = card_index,
+        spell_practice_index = practice_index,
+    }
+    self.episode_frame = 0
+    self.terminated = false
+    self.termination_reason = nil
+    self.seen_enemy = false
+    self.expected_stage = SPELL_PRACTICE_STAGE
+    self.expected_stage_successor = nil
+    self.expected_stage_menu = false
+    self.episode_kind = "replay"
+    self.episode_scenario = scenario
+    self.pending_options = nil
+    self.replay_playback = metadata
+    return {
+        episode_kind = "replay",
+        scenario = scenario,
+        card_index = card_index,
+        seed = seed,
+        player = metadata.stage_player,
+        replay = metadata,
+    }
+end
+
 function Instance:_reset(request)
     local options = type(request.options) == "table" and request.options or {}
     local replay_name, replay_name_error = normalized_replay_name(request.replay_name)
@@ -1000,6 +1310,8 @@ function Instance:_reset(request)
         return nil, "Spell Practice stage is not registered"
     end
 
+    self.campaign = nil
+    self.replay_playback = nil
     lstg.var = lstg.var or {}
     lstg.var.player_name = player_name
     -- UI.lua treats numeric zero as truthy and indexes _sc_table[0].
@@ -1014,6 +1326,7 @@ function Instance:_reset(request)
         lstg.var.hidden_route = truthy(options.hidden_route)
     end
     stage.IsSCpractice = true
+    stage.IsReplay = nil
     if type(ext) == "table" then
         ext.pop_pause_menu = false
         ext.pause_menu_order = nil
@@ -1094,12 +1407,24 @@ function Instance:_reset_stage(request)
         return nil, "native replay capture supports only attacks and final stages"
     end
 
+    self.campaign = nil
+    self.replay_playback = nil
     lstg.var = lstg.var or {}
     lstg.var.player_name = player_name
     lstg.var.sc_index = nil
     lstg.var.sc_pr_data = nil
     lstg.var.is_practice = false
+    local initialized, initialize_error = initialize_full_stage_player_data(stage_entry, true)
+    if not initialized then
+        return nil, initialize_error
+    end
+    if options.hidden_route ~= nil then
+        lstg.var.hidden_route = truthy(options.hidden_route)
+    else
+        lstg.var.hidden_route = false
+    end
     stage.IsSCpractice = false
+    stage.IsReplay = nil
     if type(ext) == "table" then
         ext.pop_pause_menu = false
         ext.pause_menu_order = nil
@@ -1133,7 +1458,16 @@ function Instance:_reset_stage(request)
     self.expected_stage_menu = expected_stage_menu
     self.episode_kind = "stage"
     self.episode_scenario = request.stage
-    self.pending_options = options
+    -- Stage 1's generated init follows the full-group branch and would replace
+    -- the isolated defaults applied above. Reapply the registered stage values
+    -- after the reset frame, then layer explicit test options over them.
+    local stage_object = stage.stages[request.stage]
+    local pending_options = copy_table(
+        type(stage_object) == "table" and stage_object.item_init or nil)
+    for key, value in pairs(options) do
+        pending_options[key] = value
+    end
+    self.pending_options = pending_options
     return {
         episode_kind = "stage",
         stage = request.stage,
@@ -1142,6 +1476,105 @@ function Instance:_reset_stage(request)
         seed = seed,
         player = player_name,
         replay = replay,
+    }
+end
+
+function Instance:_reset_campaign(request)
+    if request.replay_name ~= nil then
+        return nil, "native replay capture is not supported for campaign episodes"
+    end
+    local options = request.options
+    if options == nil then
+        options = {}
+    end
+    local options_error = campaign_options_error(options)
+    if options_error then
+        return nil, options_error
+    end
+    local campaign_contract, campaign_error = resolve_campaign(request.difficulty)
+    if not campaign_contract then
+        return nil, campaign_error
+    end
+    local player_name = resolve_player(request.player)
+    if not player_name then
+        return nil, "unknown player: " .. tostring(request.player)
+    end
+    if type(stage) ~= "table" or type(stage.Set) ~= "function" then
+        return nil, "stage switching is unavailable"
+    end
+    if self.replay_capture then
+        local _, replay_error = self:_finish_replay_capture(false, "reset")
+        if replay_error then
+            return nil, "failed to finalize preceding replay: " .. replay_error
+        end
+    end
+
+    local first_entry = campaign_contract.entries[1]
+    lstg.var = lstg.var or {}
+    lstg.var.player_name = player_name
+    lstg.var.sc_index = nil
+    lstg.var.sc_pr_data = nil
+    lstg.var.is_practice = false
+    local initialized, initialize_error = initialize_full_stage_player_data(first_entry, false)
+    if not initialized then
+        return nil, initialize_error
+    end
+    -- This is the only bridge-authored route reset in a campaign. Native Stage
+    -- 1 and Stage 5 logic may update it, and it remains untouched thereafter.
+    lstg.var.hidden_route = false
+    stage.IsSCpractice = false
+    stage.IsReplay = nil
+    if type(ext) == "table" then
+        ext.pop_pause_menu = false
+        ext.pause_menu_order = nil
+        ext.rep_over = false
+        if type(ext.pause_menu) == "table" then
+            ext.pause_menu.kill = true
+            if type(task) == "table" and type(task.Clear) == "function" then
+                pcall(task.Clear, ext.pause_menu)
+            end
+        end
+    end
+
+    local first_stage_name = first_entry.stage
+    stage.Set(first_stage_name, "none")
+    local seed = self:_seed(request.seed)
+    self.episode_frame = 0
+    self.terminated = false
+    self.termination_reason = nil
+    self.seen_enemy = false
+    self.expected_stage = first_stage_name
+    self.expected_stage_successor = campaign_contract.entries[2].stage
+    self.expected_stage_menu = false
+    self.episode_kind = "campaign"
+    self.episode_scenario = campaign_contract.difficulty
+    self.pending_options = nil
+    self.replay_playback = nil
+    self.campaign = {
+        difficulty = campaign_contract.difficulty,
+        entries = campaign_contract.entries,
+        stage_count = campaign_contract.stage_count,
+        menu_name = campaign_contract.menu_name,
+        stage_index = 1,
+        stage_name = first_stage_name,
+        stages_completed = 0,
+        completed_stages = json_array(self.cjson),
+        active_content_seen = false,
+        stage_active_content_seen = false,
+        stage_transition_count = 0,
+        transitions = json_array(self.cjson),
+        initial_resources = resource_snapshot(lstg.var),
+        initial_hidden_route = false,
+        campaign_complete = false,
+    }
+    return {
+        episode_kind = "campaign",
+        difficulty = campaign_contract.difficulty,
+        stage_index = 1,
+        stage_name = first_stage_name,
+        stage_count = campaign_contract.stage_count,
+        seed = seed,
+        player = player_name,
     }
 end
 
@@ -1253,12 +1686,31 @@ function Instance:_handle_request(request)
         rawset(_G, "SR_SAFETY_ZONE_CONTROLLER_STATE", nil)
         self.action = normalize_action(nil)
         self.pending = { id = id, command = command, remaining = 1, reset = info }
+    elseif command == "reset_campaign" then
+        local info, err = self:_reset_campaign(request)
+        if not info then
+            self:_response(id, false, { error = err })
+            return
+        end
+        rawset(_G, "SR_SAFETY_ZONE_CONTROLLER_STATE", nil)
+        self.action = normalize_action(nil)
+        self.pending = { id = id, command = command, remaining = 1, reset = info }
+    elseif command == "reset_replay" then
+        local info, err = self:_reset_replay(request)
+        if not info then
+            self:_response(id, false, { error = err })
+            return
+        end
+        rawset(_G, "SR_SAFETY_ZONE_CONTROLLER_STATE", nil)
+        self.action = normalize_action(nil)
+        self.pending = { id = id, command = command, remaining = 1, reset = info }
     elseif command == "step" then
         if self.terminated then
             self:_response(id, false, { error = "episode is terminated; reset is required" })
             return
         end
-        self.action = normalize_action(request.action)
+        self.action = self.episode_kind == "replay"
+            and normalize_action(nil) or normalize_action(request.action)
         if type(request.controller_overlay_state) == "table" then
             rawset(
                 _G,
@@ -1468,6 +1920,32 @@ function Instance:_player_record()
     return result
 end
 
+function Instance:_campaign_record()
+    local campaign = self.campaign
+    if type(campaign) ~= "table" then
+        return nil
+    end
+    local vars = type(lstg) == "table" and lstg.var or {}
+    return {
+        schema_version = 1,
+        difficulty = campaign.difficulty,
+        stage_index = campaign.stage_index,
+        stage_name = campaign.stage_name,
+        stage_count = campaign.stage_count,
+        stages_completed = campaign.stages_completed,
+        completed_stages = campaign.completed_stages,
+        active_content_seen = campaign.active_content_seen == true,
+        stage_active_content_seen = campaign.stage_active_content_seen == true,
+        stage_transition_count = campaign.stage_transition_count,
+        transitions = campaign.transitions,
+        initial_resources = campaign.initial_resources,
+        resources = resource_snapshot(vars),
+        initial_hidden_route = campaign.initial_hidden_route == true,
+        hidden_route = truthy(vars.hidden_route),
+        campaign_complete = campaign.campaign_complete == true,
+    }
+end
+
 function Instance:collect_observation()
     local enemy_bullets, bullet_lasers = self:_collect_group(rawget(_G, "GROUP_ENEMY_BULLET") or 1, "enemy_bullet")
     local enemies, enemy_lasers = self:_collect_group(rawget(_G, "GROUP_ENEMY") or 2, "enemy")
@@ -1525,6 +2003,10 @@ function Instance:collect_observation()
     for _, key in ipairs({ "lifeleft", "bomb", "power", "faith", "graze", "score" }) do
         put_number(observation.resources, key, vars[key])
     end
+    local campaign = self:_campaign_record()
+    if campaign then
+        observation.campaign = campaign
+    end
     observation.counts = {
         enemy_bullets = #enemy_bullets,
         enemies = #enemies,
@@ -1574,13 +2056,96 @@ function Instance:_has_enemy_objects()
     return false
 end
 
+function Instance:_check_campaign_stop(observation)
+    local campaign = self.campaign
+    if type(campaign) ~= "table" then
+        return nil
+    end
+    local actual_stage = observation.stage.name
+    if actual_stage == campaign.stage_name then
+        if self:_has_enemy_objects() then
+            campaign.stage_active_content_seen = true
+            campaign.active_content_seen = true
+            self.seen_enemy = true
+        end
+        return nil
+    end
+
+    local stage_index = campaign.stage_index
+    local final_stage = stage_index == campaign.stage_count
+    local expected_name = final_stage and campaign.menu_name
+        or campaign.entries[stage_index + 1].stage
+    local reached_expected_stage = not final_stage
+        and actual_stage == expected_name
+        and observation.stage.is_menu ~= true
+    local reached_final_menu = final_stage
+        and actual_stage == expected_name
+        and observation.stage.is_menu == true
+    if not campaign.stage_active_content_seen
+            or (not reached_expected_stage and not reached_final_menu) then
+        return "campaign_stage_changed"
+    end
+
+    local vars = type(lstg) == "table" and lstg.var or {}
+    local resources = resource_snapshot(vars)
+    local hidden_route = truthy(vars.hidden_route)
+    campaign.stages_completed = campaign.stages_completed + 1
+    campaign.completed_stages[#campaign.completed_stages + 1] = {
+        stage_index = stage_index,
+        stage_name = campaign.stage_name,
+        completion_episode_frame = self.episode_frame,
+        active_content_seen = true,
+        resources = resources,
+        hidden_route = hidden_route,
+    }
+    campaign.stage_transition_count = campaign.stage_transition_count + 1
+    campaign.transitions[#campaign.transitions + 1] = {
+        from_stage_index = stage_index,
+        from_stage_name = campaign.stage_name,
+        to_stage_index = final_stage and 0 or stage_index + 1,
+        to_stage_name = actual_stage,
+        episode_frame = self.episode_frame,
+        active_content_seen = true,
+        resources = resources,
+        hidden_route = hidden_route,
+    }
+    if final_stage then
+        campaign.campaign_complete = true
+        return "campaign_complete"
+    end
+
+    campaign.stage_index = stage_index + 1
+    campaign.stage_name = expected_name
+    campaign.stage_active_content_seen = self:_has_enemy_objects()
+    if campaign.stage_active_content_seen then
+        campaign.active_content_seen = true
+        self.seen_enemy = true
+    end
+    self.expected_stage = expected_name
+    local next_entry = campaign.entries[campaign.stage_index + 1]
+    self.expected_stage_successor = next_entry and next_entry.stage or nil
+    self.expected_stage_menu = campaign.stage_index == campaign.stage_count
+    return nil
+end
+
 function Instance:_check_stop(observation)
+    local replay_exhausted = false
+    if self.episode_kind == "replay" then
+        local playback = self.replay_playback
+        if type(playback) ~= "table" or type(playback.frame_count) ~= "number" then
+            return "replay_invalid"
+        end
+        replay_exhausted = self.episode_frame >= playback.frame_count
+    end
     if self.config.max_episode_frames and self.episode_frame >= self.config.max_episode_frames then
         return "time_limit"
     end
     local player_state = observation.player
     if self.config.stop_on_player_hit and player_state and (player_state.death or 0) > 0 then
         return "player_hit"
+    end
+    if self.episode_kind == "campaign" then
+        return self:_check_campaign_stop(observation)
     end
     if self.config.stop_on_stage_change and self.expected_stage
             and observation.stage.name ~= self.expected_stage then
@@ -1602,6 +2167,9 @@ function Instance:_check_stop(observation)
     elseif self.episode_kind ~= "stage"
             and self.config.stop_on_no_enemies and self.seen_enemy then
         return "attack_complete"
+    end
+    if replay_exhausted then
+        return "replay_exhausted"
     end
 end
 
@@ -1634,6 +2202,9 @@ function Instance:_frame(...)
 
     local observation = self:collect_observation()
     local reason = self:_check_stop(observation)
+    if self.campaign then
+        observation.campaign = self:_campaign_record()
+    end
     if reason or engine_exit then
         self.terminated = true
         self.termination_reason = reason or "engine_exit"

@@ -569,6 +569,37 @@ The fitted Boss #3 memory is versioned at
 `models/region_dynamics_boss3_v2.json`; training commands may still write new
 candidate memories and provenance reports under ignored `artifacts/` paths.
 
+### Humanlike Boss #3 profile
+
+The memory-free `humanlike` profile was calibrated against the successful human
+`slot3.rep` without loading replay actions into the controller. Its final
+source fingerprint is
+`0a67effb8e54225e0bcc7209902cacd7068f17dc386c68bbde2394a22aac9a1e`.
+When a bottom-anchored player has already reached the target exterior region,
+`settle` now returns to the effective floor; preposition, evacuation, forced
+crossing, gap entry, collision, and deadline logic are unchanged.
+
+Native arm64 macOS headless seeds `20260730/31/32` all strictly completed with
+zero deaths, continuous fire, no spell, and verified replays. Replay lengths
+were `3291/3278/3301` and paths were `6178.90/6223.50/6582.41`. On seed
+`20260730`, the preceding v12-to-v14 change reduced path `6366.70 -> 6178.90`,
+moving time `73.06% -> 68.92%`, and increased bottom-clamped time
+`22.25% -> 34.82%`. It also fixed v12's seed-`20260732` hit at frame 2630.
+
+The successful human reference remains substantially smoother: path 4939.79,
+86.31% focused input, 168 moving turns, six turns of at least 90 degrees, and no
+obtuse or exact-reversal turns. v14 still has path 6178.90, 72.17% focused input,
+278 moving turns, 164 turns of at least 90 degrees, 79 obtuse turns, and 24
+exact reversals. It is a measured improvement and a 3/3 executed-seed result,
+not a human-level claim.
+
+Focused-speed region deadlines failed at frame 1917, and forced intermediate
+turn directions failed at frame 2270; both were region collisions with the boss
+still alive. The turn-bridge implementation was removed, and the existing
+focus-deadline and neutral-beat experiments remain disabled. See the
+human-behavior calibration section in `../../docs/stg_ai_testing.md` for replay
+metrics, report hashes, and the learned-policy follow-up boundary.
+
 Gap prediction is enabled by default; use `--gap-prediction` to state that
 choice explicitly or `--no-gap-prediction` for a same-controller ablation. It
 considers only `enemy_bullets`. Bullets with similar speed and parallel velocity
@@ -738,6 +769,57 @@ turns, ABA changes, and direction-hold durations. Optional trace files are
 bound into the summary by SHA-256. This is strict native-engine evidence but
 keeps `acceptance_claim=false`; it does not replace two-process deterministic
 `engine-accept` evidence.
+
+### Continuous memory-free Stage 1-5 campaign
+
+`engine-mpc-campaign` is the continuous counterpart to five isolated matrix
+stage resets. It sends exactly one `reset_campaign`, keeps the same `EngineMPC`
+instance while native gameplay advances from Stage 1 through Stage 5, and uses
+`observation.campaign.stage_transition_count` to clear scene-local tracks,
+delayed observations, region/gap state, and committed actions at the four
+intermediate boundaries. Campaign counters are lifecycle evidence and are
+removed before each MPC decision.
+
+```bash
+uv run stg-lab engine-mpc-campaign \
+  --host 127.0.0.1 --port 24816 \
+  --difficulty Lunatic --seed 20260804 \
+  --profile bullet-group-expert \
+  --max-frames 120000 --horizon-frames 60 --observation-delay 5 \
+  --no-render \
+  --output artifacts/no-memory-lunatic-campaign-seed20260804.json
+```
+
+The command deliberately has no region-memory, route, checkpoint, action-prefix,
+reset-option, or replay arguments. A pass requires the exact ordered five-stage
+campaign, active enemy content in every completed stage, the final native menu
+transition with `campaign_complete`, finite `death=0`, four controller boundary
+clears, every source equal to `live_mpc`, continuous fire, `spell=false`, and
+all external-memory report fields `null`. A frame limit, hit, skipped stage,
+missing active content, malformed campaign evidence, or any other termination
+fails. Native campaign replay is not supported because THlib requires a distinct
+stage record and serialized initial state for each stage.
+
+The runner captures the Python source-tree fingerprint both before reset and
+after termination. A source change during the live run invalidates the result,
+even if the native campaign otherwise completes. Each report also retains the
+last 24 authority observations and last eight delayed controller inputs from the
+terminal stage. This bounded window is diagnostic output only; it is never fed
+back into MPC state or carried across a stage boundary.
+
+Development was paused on 2026-08-04 with no current-source whole-campaign
+pass. The current Lunatic campaign v4 was hit in Stage 1 at total frame 11073
+with zero stage transitions. Earlier isolated Stage 1 Normal and Lunatic runs
+passed at frames 12838 and 12974, but used older source and are not composable
+with current results. Okuu Lunatic #4 remains a current strict pass at frame
+4295 with death 0; Koishi Normal #1 remains a strict failure in all current
+ablations. An anonymous visible-geometry spawn-family forecast exists as an
+unvalidated prototype and is not a Stage 1 fix. The detailed evidence, report
+hashes, failure analysis, and restart checklist are recorded under
+"2026-08-04 memory-free campaign pause point" in `docs/stg_ai_testing.md` and
+the equivalent Chinese section in `docs/stg_ai_testing_zh.md`. No optimization
+or native campaign should be resumed without explicitly starting a new work
+session from that checklist.
 
 For a visible native-engine run, use `--render --render-every 1` and launch
 LuaSTG with `SR_TEST_HEADLESS=0`, lockstep enabled, and `setting.vsync=true`.

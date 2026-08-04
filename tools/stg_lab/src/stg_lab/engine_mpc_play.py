@@ -29,6 +29,13 @@ _WINDOWS_RESERVED_REPLAY_BASENAMES = frozenset({
 })
 
 
+def _finite_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
 @dataclass(frozen=True, slots=True)
 class EngineMPCPlayConfig:
     max_frames: int = 7200
@@ -309,6 +316,46 @@ def _controller_observation(
     return controller_observation(delayed, current)
 
 
+@dataclass(slots=True)
+class _MaturedControllerObservationFeed:
+    """Feed each delayed source frame once while decisions stay less frequent."""
+
+    controller: EngineMPC
+    excluded_fields: tuple[str, ...] = ()
+    last_source_frame: int | None = None
+
+    def reset(self) -> None:
+        self.last_source_frame = None
+
+    def update(
+        self,
+        delayed: Mapping[str, Any],
+        current: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        observation = _controller_observation(delayed, current)
+        for field in self.excluded_fields:
+            observation.pop(field, None)
+        source_frame = _episode_frame(observation)
+        if source_frame is None:
+            raise EngineProtocolError(
+                "matured controller observation has no integer episode_frame"
+            )
+        if self.last_source_frame is not None:
+            if source_frame == self.last_source_frame:
+                return observation
+            if source_frame != self.last_source_frame + 1:
+                raise EngineProtocolError(
+                    "matured controller source frame did not advance by exactly one"
+                )
+        observed_source_frame = self.controller.observe(observation)
+        if observed_source_frame != source_frame:
+            raise EngineProtocolError(
+                "controller observed a different source frame than the runner supplied"
+            )
+        self.last_source_frame = source_frame
+        return observation
+
+
 def _effective_action(decision: MPCDecision) -> Action:
     return Action(
         move_x=decision.action.move_x,
@@ -414,6 +461,7 @@ def run_engine_mpc_play(
         [raw] * (config.observation_delay + 1),
         maxlen=config.observation_delay + 1,
     )
+    observation_feed = _MaturedControllerObservationFeed(controller)
     display = client.set_rendering(config.render, every=config.render_every)
     if display.get("render") is not config.render or display.get("every") != config.render_every:
         raise EngineProtocolError("engine did not apply the requested display state")
@@ -431,7 +479,7 @@ def run_engine_mpc_play(
 
     while raw.get("terminated") is not True and logical_frames < config.max_frames:
         delayed = delayed_observations[0]
-        controller_observation = _controller_observation(delayed, raw)
+        controller_observation = observation_feed.update(delayed, raw)
         start_frame = _episode_frame(raw)
         decision = controller.select(controller_observation)
         evaluation = _selected_evaluation(decision)
@@ -473,6 +521,7 @@ def run_engine_mpc_play(
                     "engine episode_frame did not advance by exactly one frame"
                 )
             delayed_observations.append(raw)
+            observation_feed.update(delayed_observations[0], raw)
             trace.push(raw)
             render_performance.push(raw)
             logical_frames += 1
@@ -493,10 +542,18 @@ def run_engine_mpc_play(
             "advanced_frames": advanced,
             "action": action.to_dict(),
             "predicted_threat_count": len(decision.threats),
+            "predicted_launch_motion_count": sum(
+                threat.launch_motion_inferred for threat in decision.threats
+            ),
+            "predicted_accelerating_threat_count": sum(
+                threat.acceleration_horizon > 0 for threat in decision.threats
+            ),
             "predicted_collision": evaluation.collided,
             "predicted_collision_frames": evaluation.collision_frames,
             "predicted_earliest_collision_frame": evaluation.earliest_collision_frame,
-            "predicted_minimum_margin": evaluation.minimum_margin,
+            "predicted_minimum_margin": _finite_or_none(
+                evaluation.minimum_margin,
+            ),
             "predicted_minimum_nonregion_margin": (
                 evaluation.minimum_nonregion_margin
                 if math.isfinite(evaluation.minimum_nonregion_margin) else
@@ -517,14 +574,19 @@ def run_engine_mpc_play(
                 {"x": decision.region_anchor[0], "y": decision.region_anchor[1]}
             ),
             "region_crossing": decision.region_crossing,
-            "region_path_margin": decision.region_path_margin,
+            "region_path_margin": _finite_or_none(decision.region_path_margin),
             "region_evacuating": decision.region_evacuating,
             "region_target_rows_ahead": decision.region_target_rows_ahead,
             "region_navigation_mode": decision.region_navigation_mode,
             "region_current_component": decision.region_current_component,
             "region_target_component": decision.region_target_component,
             "region_portal": decision.region_portal,
-            "region_deadline_slack": decision.region_deadline_slack,
+            "region_deadline_slack": _finite_or_none(
+                decision.region_deadline_slack,
+            ),
+            "region_focus_deadline_slack": _finite_or_none(
+                decision.region_focus_deadline_slack,
+            ),
             "region_phase": decision.region_phase,
             "region_phase_started_frame": decision.region_phase_started_frame,
             "region_learned_cycle_frames": decision.region_learned_cycle_frames,
@@ -544,10 +606,13 @@ def run_engine_mpc_play(
                 decision.gap_selected_lifetime_frames
             ),
             "gap_navigation_mode": decision.gap_navigation_mode,
+            "gap_plan_certified": decision.gap_plan_certified,
             "using_committed_plan": decision.using_committed_plan,
-            "committed_plan_immediate_margin": decision.committed_plan_immediate_margin,
+            "committed_plan_immediate_margin": _finite_or_none(
+                decision.committed_plan_immediate_margin,
+            ),
             "committed_plan_current_horizon_margin": (
-                decision.committed_plan_current_horizon_margin
+                _finite_or_none(decision.committed_plan_current_horizon_margin)
             ),
             "planned_actions": [
                 value.to_dict() for value in decision.planned_actions
@@ -721,6 +786,7 @@ def run_engine_mpc_play(
             "config": asdict(controller.config),
             "uses_raw_object_ids": True,
             "uses_raw_velocity_fields": True,
+            "uses_delayed_visible_orientation": True,
             "uses_class_names_or_script_timers_for_dodging": False,
         },
         "config": {
@@ -734,6 +800,7 @@ def run_engine_mpc_play(
             "control_inputs": [
                 "delayed_visible_positions",
                 "delayed_visible_collision_shapes",
+                "delayed_visible_orientation",
                 "visible_displacement_motion_estimates",
                 "own_visible_player_position",
                 "teacher_only_raw_object_ids_and_initial_velocity",

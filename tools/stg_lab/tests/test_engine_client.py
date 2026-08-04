@@ -92,6 +92,98 @@ def test_engine_client_stage_reset_request() -> None:
     assert response["observation"]["episode_frame"] == 0
 
 
+def test_engine_client_campaign_reset_request_has_no_replay_surface() -> None:
+    client_socket, server_socket = socket.socketpair()
+
+    def serve() -> None:
+        reader = server_socket.makefile("rb")
+        request = json.loads(reader.readline())
+        assert request == {
+            "id": 1,
+            "command": "reset_campaign",
+            "difficulty": "Lunatic",
+            "seed": 17,
+            "player": "reimu_player",
+            "options": {},
+        }
+        server_socket.sendall((json.dumps({
+            "id": 1,
+            "ok": True,
+            "reset": {"episode_kind": "campaign"},
+            "observation": {"episode_frame": 0},
+        }) + "\n").encode())
+        reader.close()
+        server_socket.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    with EngineClient(client_socket) as client:
+        response = client.reset_campaign("Lunatic", seed=17)
+    thread.join()
+    assert response["reset"]["episode_kind"] == "campaign"
+
+
+def test_engine_client_campaign_reset_rejects_nonempty_options() -> None:
+    client_socket, server_socket = socket.socketpair()
+    try:
+        with EngineClient(client_socket) as client:
+            try:
+                client.reset_campaign(
+                    "Lunatic",
+                    seed=17,
+                    options={"lifeleft": 99},
+                )
+            except ValueError as error:
+                assert str(error) == "campaign reset options must be empty"
+            else:  # pragma: no cover - assertion aid
+                raise AssertionError("campaign options were accepted")
+    finally:
+        server_socket.close()
+
+
+def test_engine_client_replay_reset_request() -> None:
+    client_socket, server_socket = socket.socketpair()
+
+    def serve() -> None:
+        reader = server_socket.makefile("rb")
+        request = json.loads(reader.readline())
+        assert request == {
+            "id": 1,
+            "command": "reset_replay",
+            "path": "Z:\\replays\\slot2.rep",
+        }
+        server_socket.sendall((json.dumps({
+            "id": 1,
+            "ok": True,
+            "reset": {"episode_kind": "replay", "frame_count": 10},
+            "observation": {"episode_frame": 1},
+        }) + "\n").encode())
+        reader.close()
+        server_socket.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    with EngineClient(client_socket) as client:
+        response = client.reset_replay("Z:\\replays\\slot2.rep")
+    thread.join()
+    assert response["reset"]["episode_kind"] == "replay"
+
+
+def test_engine_client_replay_reset_rejects_invalid_path() -> None:
+    client_socket, server_socket = socket.socketpair()
+    try:
+        with EngineClient(client_socket) as client:
+            for path in ("", "bad\x00path"):
+                try:
+                    client.reset_replay(path)
+                except ValueError:
+                    pass
+                else:  # pragma: no cover - assertion aid
+                    raise AssertionError("invalid replay path was accepted")
+    finally:
+        server_socket.close()
+
+
 def test_engine_client_attack_reset_sends_replay_name() -> None:
     client_socket, server_socket = socket.socketpair()
 

@@ -113,6 +113,170 @@ the engine reaches its unique registered same-difficulty successor. Stage 5
 completes only on a menu transition. A wrong stage transition, window/engine
 exit, player hit, or time limit is not `stage_complete`.
 
+Every full-stage reset calls THlib's `item.PlayerInit` and applies that stage's
+registered isolated/practice resource table before switching stages. This is required
+for a fresh process that enters generated Stage 2-5 directly: those stage init
+functions assume Stage 1 already initialized the complete player-data schema.
+It also makes isolated stage resets independent of earlier episodes in the same
+engine process. Unless `options.hidden_route` is supplied, an isolated stage
+reset clears stale hidden-route state.
+
+## Campaign Reset
+
+`reset_campaign` starts a continuous native Stage 1-5 run for one registered
+difficulty:
+
+```json
+{"id":9,"command":"reset_campaign","difficulty":"Lunatic","seed":42,"player":"reimu_player","options":{}}
+```
+
+The bridge validates that the live catalog contains exactly one registered,
+contiguous Stage 1-5 sequence whose stages share one native stage group and
+menu target. It initializes Stage 1 once with `stage.Set(..., "none")`; all
+later transitions must come from the game's own `stage.group.FinishStage()`.
+`lstg.var`, lives, bombs, power, faith, score, and gameplay-earned
+`hidden_route` state remain live across those transitions. The bridge clears
+`hidden_route` only at campaign start.
+
+Campaign `options` must be an empty object. `replay_name` is rejected because a
+valid THlib campaign replay needs a separate writer and initial-state record for
+each native stage; concatenating all five input streams into one stage record
+would create an invalid replay.
+
+The reset response identifies the first stage and fixed campaign size:
+
+```json
+{"id":9,"ok":true,"reset":{"episode_kind":"campaign","difficulty":"Lunatic","stage_index":1,"stage_name":"Stage 1@Lunatic","stage_count":5,"seed":42,"player":"reimu_player"},"observation":{}}
+```
+
+Campaign observations additionally contain this state (abridged after the
+Stage 1 to Stage 2 transition):
+
+```json
+{
+  "campaign":{
+    "schema_version":1,
+    "difficulty":"Lunatic",
+    "stage_index":2,
+    "stage_name":"Stage 2@Lunatic",
+    "stage_count":5,
+    "stages_completed":1,
+    "completed_stages":[{
+      "stage_index":1,
+      "stage_name":"Stage 1@Lunatic",
+      "completion_episode_frame":3600,
+      "active_content_seen":true,
+      "resources":{"lifeleft":2,"bomb":3,"power":245,"faith":1200,"graze":8,"score":10000},
+      "hidden_route":true
+    }],
+    "active_content_seen":true,
+    "stage_active_content_seen":false,
+    "stage_transition_count":1,
+    "transitions":[{
+      "from_stage_index":1,
+      "from_stage_name":"Stage 1@Lunatic",
+      "to_stage_index":2,
+      "to_stage_name":"Stage 2@Lunatic",
+      "episode_frame":3600,
+      "active_content_seen":true,
+      "resources":{"lifeleft":2,"bomb":3,"power":245,"faith":1200,"graze":8,"score":10000},
+      "hidden_route":true
+    }],
+    "initial_resources":{"lifeleft":2,"bomb":3,"power":100,"faith":0,"graze":0,"score":0},
+    "resources":{"lifeleft":2,"bomb":3,"power":245,"faith":1200,"graze":8,"score":10000},
+    "initial_hidden_route":false,
+    "hidden_route":true,
+    "campaign_complete":false
+  }
+}
+```
+
+The authoritative `GROUP_ENEMY`/`GROUP_NONTJT` pools must contain active
+content at least once in every stage before its transition is accepted. Legal
+Stage 1 to 2, 2 to 3, 3 to 4, and 4 to 5 transitions update the campaign state
+in the same `step` observation and do not terminate the episode. Clients can
+detect a boundary by an increment of `stage_transition_count` and clear only
+their scene-local geometry/tracks. A skipped, reversed, early, or unexpected
+transition terminates with `campaign_stage_changed`.
+
+The Stage 5 to native menu transition records the fifth completed stage and
+terminates with `campaign_complete`. At that terminal boundary
+`observation.stage.name` is the menu, while `campaign.stage_index=5` and
+`campaign.stage_name` retain the completed Stage 5 identity;
+`stages_completed=5`, `stage_transition_count=5`, and
+`campaign_complete=true`. A hit remains `player_hit`, the frame limit covers
+the entire continuous run and remains `time_limit`, and an engine/window exit
+remains `engine_exit`.
+
+## Replay Playback Reset
+
+`reset_replay` loads one existing native THlib replay for read-only analysis:
+
+```json
+{"id":10,"command":"reset_replay","path":"../slot3.rep"}
+```
+
+The path is interpreted by the LuaSTG process and may be relative to its working
+directory or absolute. The bridge is bound to localhost and treats its client as
+trusted; this command can read any path available to that process. It never
+writes, moves, or replaces the input replay.
+
+The bridge calls `plus.ReplayManager.ReadReplayInfo` and accepts only an `STGR`
+file-version-1 replay containing exactly one
+`Spell Practice@Spell Practice` stage and at least one input frame. It verifies
+the declared frame region through exact EOF before loading it with
+`stage.Set("Spell Practice@Spell Practice", "load", path)`. The serialized
+practice state must resolve either its direct `sc_pr_data` identity or its legacy
+global `sc_index` against the currently registered spell-practice table.
+
+The reset advances one logical frame, so the response observation is taken after
+the first recorded input byte has been consumed. Its metadata binds the loaded
+header and verified frame extent:
+
+```json
+{
+  "id":10,
+  "ok":true,
+  "reset":{
+    "episode_kind":"replay",
+    "scenario":"okuu:Lunatic",
+    "card_index":4,
+    "seed":10292,
+    "player":"Reimu",
+    "replay":{
+      "schema_version":1,
+      "path":"../slot3.rep",
+      "file_version":1,
+      "game_name":"SR-master",
+      "game_version":1,
+      "group_finish":0,
+      "user_name":"HT",
+      "stage_name":"Spell Practice@Spell Practice",
+      "stage_player":"Reimu",
+      "random_seed":10292,
+      "frame_count":3388,
+      "frame_data_position":834,
+      "frame_bytes_verified":3388,
+      "file_size":4222,
+      "crc32":"9fa7c77e",
+      "scenario":"okuu:Lunatic",
+      "card_index":4,
+      "spell_practice_index":50
+    }
+  },
+  "observation":{}
+}
+```
+
+For subsequent frames the client should send a neutral `step` action. THlib's
+active `replayReader` replaces `KeyState`, so client action fields cannot alter
+recorded movement, focus, shooting, or spell input. A repeat larger than the
+remaining replay is stopped at the terminal frame. Normal result reasons such
+as `player_hit`, `attack_complete`, and `stage_changed` take priority when
+observed; if no more specific result occurs, consuming the declared final input
+frame terminates with `replay_exhausted`. This endpoint supports only a single
+Spell Practice stage, not full-stage or campaign replay playback.
+
 ## Step
 
 ```json
@@ -134,8 +298,9 @@ least one enemy has been observed. That decision reads the authoritative,
 unfiltered `GROUP_ENEMY` and `GROUP_NONTJT` pools, not the visible observation
 arrays, because a live off-screen or temporarily hidden boss must not end an
 attack. Full-stage episodes ignore no-enemy gaps and apply the normal-successor
-contract above. A terminated episode rejects further `step` requests until
-`reset` or `reset_stage`.
+contract above. Campaign episodes apply the continuous state machine above. A
+terminated episode rejects further `step` requests until `reset`,
+`reset_stage`, `reset_campaign`, or `reset_replay`.
 
 ## Other Commands
 
@@ -164,7 +329,7 @@ operating-system/runtime identity:
   "protocol":2,
   "frame":0,
   "action_names":["move_x","move_y","slow","shoot","spell"],
-  "commands":["ping","catalog","reset","reset_stage","step","observe","display","close","shutdown"],
+  "commands":["ping","catalog","reset","reset_stage","reset_campaign","reset_replay","step","observe","display","save_replay","close","shutdown"],
   "session_id":"engine-v2-a",
   "process_nonce":"table: 0x01234567@1785312000.000000",
   "runtime_identity":{
@@ -231,6 +396,8 @@ The observation contains only primitive JSON values and these main fields:
 - `lasers`: a subset of the object arrays, with straight-laser geometry or
   bent-laser sampled points
 - `resources` and `counts`
+- `campaign`: continuous Stage 1-5 progress, transition/resource snapshots,
+  and hidden-route state; present only for campaign episodes
 
 Hidden, deleted, and off-playfield objects are omitted by default. Straight
 lasers are retained when their swept segment intersects the playfield, even if
@@ -242,9 +409,10 @@ their owning collision group.
 `enemy_bullets`, `enemies`, `nontjt_enemies`, `indestructibles`, and `lasers`
 are always JSON arrays, including when empty; every corresponding
 `counts.<name>` must equal the array length. Catalog `scenarios`, top-level
-`attacks`, nested scenario `attacks`, `stages`, and bent-laser `points`
-likewise retain array identity. This is an explicit wire contract: clients
-must reject an empty JSON object (`{}`) where an array (`[]`) is required.
+`attacks`, nested scenario `attacks`, `stages`, bent-laser `points`, and campaign
+`completed_stages`/`transitions` likewise retain array identity. This is an
+explicit wire contract: clients must reject an empty JSON object (`{}`) where
+an array (`[]`) is required.
 
 ## Environment
 
