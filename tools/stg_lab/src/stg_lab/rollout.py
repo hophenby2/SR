@@ -27,6 +27,7 @@ from .planning import PlanResult, SpatioTemporalPlanner
 from .policy import (
     PlayerProficiencyProfile,
     ProficiencyRuntime,
+    policy_action_scores,
     proficiency_vector,
     resolve_proficiency,
     safety_shield,
@@ -691,6 +692,7 @@ def _policy_behavior_action(
     shield: bool,
     runtime: ProficiencyRuntime | None = None,
     commit_runtime: bool = True,
+    action_selection: str = "joint",
 ) -> tuple[Action, Any | None]:
     profile = resolve_proficiency(
         runtime.profile if runtime is not None else "expert"
@@ -716,10 +718,11 @@ def _policy_behavior_action(
             hidden=hidden,
             latest_only=True,
         )
+    scores = policy_action_scores(logits, action_selection)
     preferred = (
-        runtime.preferred_action(logits, decision_interval=config.decision_interval)
+        runtime.preferred_action(scores, decision_interval=config.decision_interval)
         if runtime is not None else
-        Action.from_discrete(int(np.argmax(logits)))
+        Action.from_discrete(int(np.argmax(scores)))
     )
 
     def finish(action: Action) -> tuple[Action, Any | None]:
@@ -748,7 +751,7 @@ def _policy_behavior_action(
     if _action_endpoint_if_safe(environment, preferred, shield_horizon) is not None:
         return finish(preferred)
     allowed = imminent_safe_actions(environment, shield_horizon)
-    return finish(Action.from_discrete(safety_shield(logits, allowed)))
+    return finish(Action.from_discrete(safety_shield(scores, allowed)))
 
 
 def teacher_action_agreement(

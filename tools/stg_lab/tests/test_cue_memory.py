@@ -75,6 +75,7 @@ def test_archive_conversion_matches_online_provider_per_sample_without_backfill(
         [0.0, 0.0, 0.37, 0.08, 0.0, -0.64, 0.08],
         [41, 41, 41, 41, 99, 99, 99],
     )
+    demonstrations.correction_mask[2, -1] = True
     converted = cue_condition_demonstrations(
         demonstrations,
         scenario_by_episode={41: "stage5_boss3", 99: "stage5_boss3"},
@@ -95,6 +96,7 @@ def test_archive_conversion_matches_online_provider_per_sample_without_backfill(
         online.append(provider("stage5_boss3", visible))
 
     assert np.array_equal(converted.episode_ids, demonstrations.episode_ids)
+    assert np.array_equal(converted.correction_mask, demonstrations.correction_mask)
     assert np.array_equal(converted.memory[:, -1], np.stack(online))
     assert np.all(converted.memory[:2, :, 2:] == 0.0)
     assert np.all(converted.memory[4, :, 2:] == 0.0)

@@ -7,10 +7,17 @@ from types import SimpleNamespace
 import sys
 
 import numpy as np
+import pytest
 
 from stg_lab import cli
 from stg_lab.metrics import EpisodeMetrics
-from stg_lab.training import Demonstrations, TrainingMetrics
+from stg_lab.training import (
+    TEACHER_ACTION_EVALUATION_FIELDS,
+    TEACHER_ACTION_MINIMUM_MARGIN_INDEX,
+    TEACHER_ACTION_SELECTED_INDEX,
+    Demonstrations,
+    TrainingMetrics,
+)
 
 
 def demonstrations(episode_ids=(0, 1), *, steps: int = 2) -> Demonstrations:
@@ -139,6 +146,47 @@ def test_multi_scenario_collection_renumbers_episode_ids(monkeypatch) -> None:
     assert all(call[2]["shield"] is True for call in calls)
 
 
+def test_expand_previous_action_checkpoint_command_emits_audit_report(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    import stg_lab.training as training
+
+    source = tmp_path / "source.pt"
+    output = tmp_path / "expanded.pt"
+    report_path = tmp_path / "expanded.audit.json"
+    called = {}
+
+    def fake_expand(selected_source, selected_output):
+        called.update(source=selected_source, output=selected_output)
+        return {
+            "checkpoint": str(selected_output),
+            "parent_checkpoint": str(selected_source),
+            "initialization": (
+                "complete_policy_state_with_zero_initialized_previous_action_input"
+            ),
+        }
+
+    monkeypatch.setattr(
+        training,
+        "expand_checkpoint_with_previous_action_context",
+        fake_expand,
+    )
+
+    assert cli.main([
+        "expand-previous-action-checkpoint",
+        "--source", str(source),
+        "--output", str(output),
+        "--report", str(report_path),
+    ]) == 0
+
+    assert called == {"source": source, "output": output}
+    stdout_payload = json.loads(capsys.readouterr().out)
+    assert stdout_payload["checkpoint"] == str(output)
+    assert json.loads(report_path.read_text(encoding="utf-8")) == stdout_payload
+
+
 def test_train_consumes_demonstration_archive(monkeypatch, tmp_path, capsys) -> None:
     demos_path = tmp_path / "demos.npz"
     checkpoint = tmp_path / "policy.pt"
@@ -178,6 +226,10 @@ def test_train_consumes_demonstration_archive(monkeypatch, tmp_path, capsys) -> 
         "12",
         "--recurrent-size",
         "16",
+        "--local-feature-grid-size",
+        "8",
+        "--local-downsample-stages",
+        "2",
         "--inference-mode",
         "stream",
         "--device",
@@ -186,6 +238,8 @@ def test_train_consumes_demonstration_archive(monkeypatch, tmp_path, capsys) -> 
     assert called["output"] == checkpoint
     assert called["policy_config"].channels == 6
     assert called["policy_config"].feature_size == 12
+    assert called["policy_config"].local_feature_grid_size == 8
+    assert called["policy_config"].local_downsample_stages == 2
     assert called["policy_config"].memory_size == 4
     assert called["policy_config"].inference_mode == "stream"
     assert called["training_config"].epochs == 1
@@ -214,7 +268,21 @@ def test_stateful_train_disables_handwritten_inputs(monkeypatch, tmp_path, capsy
             output=output,
             training_data=training_data,
         )
-        return object(), [TrainingMetrics(1, 0.4, 0.5, 0.8, 0.1)]
+        return object(), [TrainingMetrics(
+            1,
+            0.4,
+            0.5,
+            0.8,
+            0.1,
+            train_safety_correction_pairwise_rank_loss=1.25,
+            validation_safety_correction_pairwise_rank_labels=3,
+            train_safety_correction_top1_rank_loss=0.625,
+            validation_safety_correction_top1_rank_labels=4,
+            train_safety_correction_minimal_edit_loss=0.75,
+            validation_safety_correction_minimal_edit_labels=2,
+            train_initial_policy_kl_loss=0.125,
+            validation_initial_policy_kl_labels=17,
+        )]
 
     monkeypatch.setattr(
         stateful_training,
@@ -234,11 +302,27 @@ def test_stateful_train_disables_handwritten_inputs(monkeypatch, tmp_path, capsy
         "--no-proficiency-conditioning",
         "--no-restore-best-validation",
         "--movement-onset-weight", "5",
+        "--movement-stop-weight", "3.5",
+        "--movement-speed-change-weight", "4.5",
         "--direction-change-weight", "2.5",
         "--exact-action-loss-weight", "0.25",
         "--direction-loss-weight", "1.0",
         "--speed-loss-weight", "0.2",
         "--direction-consistency-weight", "0.1",
+        "--action-consistency-weight", "0.15",
+        "--transition-action-rank-weight", "0.4",
+        "--transition-action-rank-margin", "1.5",
+        "--movement-onset-rank-weight", "0.7",
+        "--movement-speed-change-rank-weight", "0.6",
+        "--motion-boundary-rank-weight", "0.8",
+        "--motion-boundary-rank-margin", "1.25",
+        "--motion-boundary-rank-lookback", "2",
+        "--safety-correction-pairwise-rank-weight", "0.9",
+        "--safety-correction-pairwise-rank-margin", "0.4",
+        "--safety-correction-top1-rank-weight", "0.7",
+        "--safety-correction-top1-rank-margin", "0.35",
+        "--safety-correction-minimal-edit-weight", "1.1",
+        "--safety-correction-minimal-edit-margin", "0.3",
         "--future-visual-loss-weight", "0.35",
         "--future-visual-horizons", "2", "4", "8",
         "--episode-balanced",
@@ -253,11 +337,33 @@ def test_stateful_train_disables_handwritten_inputs(monkeypatch, tmp_path, capsy
     assert called["training_config"].validation_episode_ids == (1, 2)
     assert called["training_config"].restore_best_validation is False
     assert called["training_config"].movement_onset_weight == 5.0
+    assert called["training_config"].movement_stop_weight == 3.5
+    assert called["training_config"].movement_speed_change_weight == 4.5
     assert called["training_config"].direction_change_weight == 2.5
     assert called["training_config"].exact_action_loss_weight == 0.25
     assert called["training_config"].direction_loss_weight == 1.0
     assert called["training_config"].speed_loss_weight == 0.2
     assert called["training_config"].direction_consistency_weight == 0.1
+    assert called["training_config"].action_consistency_weight == 0.15
+    assert called["training_config"].transition_action_rank_weight == 0.4
+    assert called["training_config"].transition_action_rank_margin == 1.5
+    assert called["training_config"].movement_onset_rank_weight == 0.7
+    assert called["training_config"].movement_speed_change_rank_weight == 0.6
+    assert called["training_config"].motion_boundary_rank_weight == 0.8
+    assert called["training_config"].motion_boundary_rank_margin == 1.25
+    assert called["training_config"].motion_boundary_rank_lookback == 2
+    assert (
+        called["training_config"].safety_correction_pairwise_rank_weight
+        == 0.9
+    )
+    assert (
+        called["training_config"].safety_correction_pairwise_rank_margin
+        == 0.4
+    )
+    assert called["training_config"].safety_correction_top1_rank_weight == 0.7
+    assert called["training_config"].safety_correction_top1_rank_margin == 0.35
+    assert called["training_config"].safety_correction_minimal_edit_weight == 1.1
+    assert called["training_config"].safety_correction_minimal_edit_margin == 0.3
     assert called["training_config"].future_visual_loss_weight == 0.35
     assert called["training_config"].future_visual_horizons == (2, 4, 8)
     assert called["training_config"].episode_balanced is True
@@ -269,16 +375,61 @@ def test_stateful_train_disables_handwritten_inputs(monkeypatch, tmp_path, capsy
     assert summary["training_mode"] == "episode_stateful_tbptt"
     assert summary["stateful_loss_controls"] == {
         "movement_onset_weight": 5.0,
+        "movement_stop_weight": 3.5,
+        "movement_speed_change_weight": 4.5,
         "direction_change_weight": 2.5,
         "episode_balanced": True,
+        "policy_head_only": False,
         "exact_action_loss_weight": 0.25,
         "direction_loss_weight": 1.0,
         "speed_loss_weight": 0.2,
         "direction_consistency_weight": 0.1,
+        "action_consistency_weight": 0.15,
+        "transition_action_rank_weight": 0.4,
+        "transition_action_rank_margin": 1.5,
+        "movement_onset_rank_weight": 0.7,
+        "movement_onset_rank_margin": 1.5,
+        "movement_onset_rank_margin_source": (
+            "shared_transition_action_rank_margin"
+        ),
+        "movement_speed_change_rank_weight": 0.6,
+        "movement_speed_change_rank_margin": 1.5,
+        "movement_speed_change_rank_margin_source": (
+            "shared_transition_action_rank_margin"
+        ),
+        "motion_boundary_rank_weight": 0.8,
+        "motion_boundary_rank_margin": 1.25,
+        "motion_boundary_rank_lookback": 2,
+        "safety_correction_pairwise_rank_weight": 0.9,
+        "safety_correction_pairwise_rank_margin": 0.4,
+        "safety_correction_top1_rank_weight": 0.7,
+        "safety_correction_top1_rank_margin": 0.35,
+        "safety_correction_minimal_edit_weight": 1.1,
+        "safety_correction_minimal_edit_margin": 0.3,
         "previous_action_dropout_probability": 0.0,
         "future_visual_loss_weight": 0.35,
         "future_visual_horizons": [2, 4, 8],
     }
+    assert summary["final_metrics"][
+        "train_safety_correction_pairwise_rank_loss"
+    ] == 1.25
+    assert summary["final_metrics"][
+        "validation_safety_correction_pairwise_rank_labels"
+    ] == 3
+    assert summary["final_metrics"][
+        "train_safety_correction_top1_rank_loss"
+    ] == 0.625
+    assert summary["final_metrics"][
+        "validation_safety_correction_top1_rank_labels"
+    ] == 4
+    assert summary["final_metrics"][
+        "train_safety_correction_minimal_edit_loss"
+    ] == 0.75
+    assert summary["final_metrics"][
+        "validation_safety_correction_minimal_edit_labels"
+    ] == 2
+    assert summary["final_metrics"]["train_initial_policy_kl_loss"] == 0.125
+    assert summary["final_metrics"]["validation_initial_policy_kl_labels"] == 17
 
 
 def test_correction_only_train_routes_action_and_risk_supervision(
@@ -298,6 +449,7 @@ def test_correction_only_train_routes_action_and_risk_supervision(
         called.update(
             loaded=loaded,
             training_config=training_config,
+            training_data=training_data,
         )
         return object(), [TrainingMetrics(1, 0.4, 0.5, 0.8, 0.1)]
 
@@ -313,17 +465,24 @@ def test_correction_only_train_routes_action_and_risk_supervision(
         "--checkpoint", str(tmp_path / "corrections.pt"),
         "--stateful-tbptt",
         "--correction-only",
+        "--policy-head-only",
+        "--initial-policy-kl-weight", "2.0",
         "--epochs", "1",
         "--device", "cpu",
     ]) == 0
 
     assert called["training_config"].correction_only is True
+    assert called["training_config"].policy_head_only is True
+    assert called["training_config"].initial_policy_kl_weight == 2.0
+    assert called["training_data"]["policy_head_only"] is True
     np.testing.assert_array_equal(
         called["loaded"].supervision_mask,
         values.supervision_mask,
     )
     controls = json.loads(capsys.readouterr().out)["stateful_loss_controls"]
     assert controls["correction_only"] is True
+    assert controls["policy_head_only"] is True
+    assert controls["initial_policy_kl_weight"] == 2.0
     assert controls["action_supervision"] == "supervision_mask"
     assert controls["risk_supervision"] == "all_decisions"
 
@@ -342,6 +501,163 @@ def test_correction_only_train_requires_stateful_tbptt(tmp_path, capsys) -> None
         "--device", "cpu",
     ]) == 2
     assert "require --stateful-tbptt" in capsys.readouterr().err
+
+
+def test_policy_head_only_train_requires_stateful_tbptt(tmp_path, capsys) -> None:
+    demos_path = tmp_path / "corrections.npz"
+    demonstrations((0, 0, 1, 1)).save(demos_path)
+
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--policy-head-only",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 2
+    assert "require --stateful-tbptt" in capsys.readouterr().err
+
+
+def test_motion_boundary_rank_requires_stateful_tbptt(tmp_path, capsys) -> None:
+    demos_path = tmp_path / "successful.npz"
+    demonstrations((0, 0, 1, 1)).save(demos_path)
+
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--motion-boundary-rank-weight", "1.0",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 2
+    assert "require --stateful-tbptt" in capsys.readouterr().err
+
+
+def test_train_parses_safety_correction_controls() -> None:
+    parser = cli.build_parser()
+
+    defaults = parser.parse_args(["train"])
+    assert defaults.safety_correction_pairwise_rank_weight == 0.0
+    assert defaults.safety_correction_pairwise_rank_margin == 0.25
+    assert defaults.safety_correction_top1_rank_weight == 0.0
+    assert defaults.safety_correction_top1_rank_margin == 0.25
+    assert defaults.safety_correction_minimal_edit_weight == 0.0
+    assert defaults.safety_correction_minimal_edit_margin == 0.25
+    assert defaults.policy_head_only is False
+
+    configured = parser.parse_args([
+        "train",
+        "--safety-correction-pairwise-rank-weight", "1.5",
+        "--safety-correction-pairwise-rank-margin", "0.125",
+        "--safety-correction-top1-rank-weight", "1.75",
+        "--safety-correction-top1-rank-margin", "0.2",
+        "--safety-correction-minimal-edit-weight", "2.5",
+        "--safety-correction-minimal-edit-margin", "0.375",
+        "--policy-head-only",
+    ])
+    assert configured.safety_correction_pairwise_rank_weight == 1.5
+    assert configured.safety_correction_pairwise_rank_margin == 0.125
+    assert configured.safety_correction_top1_rank_weight == 1.75
+    assert configured.safety_correction_top1_rank_margin == 0.2
+    assert configured.safety_correction_minimal_edit_weight == 2.5
+    assert configured.safety_correction_minimal_edit_margin == 0.375
+    assert configured.policy_head_only is True
+
+
+@pytest.mark.parametrize(
+    "control",
+    (
+        ("--safety-correction-pairwise-rank-weight", "1.0"),
+        ("--safety-correction-pairwise-rank-margin", "0.5"),
+        ("--safety-correction-top1-rank-weight", "1.0"),
+        ("--safety-correction-top1-rank-margin", "0.5"),
+        ("--safety-correction-minimal-edit-weight", "1.0"),
+        ("--safety-correction-minimal-edit-margin", "0.5"),
+    ),
+)
+def test_safety_correction_controls_require_stateful_tbptt(
+    tmp_path, capsys, control,
+) -> None:
+    demos_path = tmp_path / "corrections.npz"
+    demonstrations((0, 0, 1, 1)).save(demos_path)
+
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        *control,
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 2
+    assert "require --stateful-tbptt" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "option",
+    (
+        "--safety-correction-pairwise-rank-weight",
+        "--safety-correction-pairwise-rank-margin",
+        "--safety-correction-top1-rank-weight",
+        "--safety-correction-top1-rank-margin",
+        "--safety-correction-minimal-edit-weight",
+        "--safety-correction-minimal-edit-margin",
+    ),
+)
+def test_safety_correction_controls_reject_negative_values(
+    capsys, option,
+) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        cli.main(["train", option, "-0.1"])
+    assert f"{option} cannot be negative" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "weight_option",
+    (
+        "--safety-correction-pairwise-rank-weight",
+        "--safety-correction-top1-rank-weight",
+        "--safety-correction-minimal-edit-weight",
+    ),
+)
+def test_safety_correction_controls_require_episode_balancing(
+    tmp_path, capsys, weight_option,
+) -> None:
+    demos_path = tmp_path / "corrections.npz"
+    values = demonstrations((0, 0, 1, 1))
+    values.correction_mask[1, -1] = True
+    values.save(demos_path)
+
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--stateful-tbptt",
+        weight_option, "1.0",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 1
+    assert "requires episode-balanced" in capsys.readouterr().err
+
+
+def test_initial_policy_kl_requires_stateful_tbptt(tmp_path, capsys) -> None:
+    demos_path = tmp_path / "native.npz"
+    demonstrations((0, 0, 1, 1)).save(demos_path)
+
+    assert cli.main([
+        "train",
+        "--demos", str(demos_path),
+        "--initial-policy-kl-weight", "1.0",
+        "--epochs", "1",
+        "--device", "cpu",
+    ]) == 2
+    assert "require --stateful-tbptt" in capsys.readouterr().err
+
+
+def test_initial_policy_kl_rejects_negative_weight(capsys) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        cli.main([
+            "train",
+            "--initial-policy-kl-weight", "-0.1",
+        ])
+    assert "--initial-policy-kl-weight cannot be negative" in (
+        capsys.readouterr().err
+    )
 
 
 def test_train_rejects_nonzero_memory_with_scenario_conditioning_disabled(
@@ -478,6 +794,24 @@ def test_merge_demos_renumbers_episode_groups(tmp_path, capsys) -> None:
         ((True, False), (False, True), (True, False)),
         dtype=np.bool_,
     )
+    first_values.correction_mask = np.asarray(
+        ((False, True), (True, False), (False, False)),
+        dtype=np.bool_,
+    )
+    first_values.teacher_action_evaluations = np.zeros(
+        (3, 2, 18, len(TEACHER_ACTION_EVALUATION_FIELDS)),
+        dtype=np.float32,
+    )
+    first_values.teacher_action_evaluations[
+        ..., TEACHER_ACTION_MINIMUM_MARGIN_INDEX
+    ] = 20.0
+    first_values.teacher_action_evaluations[
+        :, :, 0, TEACHER_ACTION_SELECTED_INDEX
+    ] = 1.0
+    first_values.teacher_action_regrets = np.zeros((3, 2, 18), dtype=np.float32)
+    first_values.teacher_action_evaluation_mask = np.asarray(
+        ((True, True), (True, False), (False, False)), dtype=bool,
+    )
     first_values.save(first)
     demonstrations((12, 12)).save(second)
 
@@ -500,11 +834,38 @@ def test_merge_demos_renumbers_episode_groups(tmp_path, capsys) -> None:
             (True, True),
         ),
     )
+    np.testing.assert_array_equal(
+        merged.correction_mask,
+        (
+            (False, True),
+            (True, False),
+            (False, False),
+            (False, False),
+            (False, False),
+        ),
+    )
     report = json.loads(capsys.readouterr().out)
     assert report["samples"] == 5
     assert report["episode_groups"] == 3
     assert report["action_supervision"] == "supervision_mask"
     assert report["supervised_labels"] == 7
+    assert report["correction_labels"] == 2
+    np.testing.assert_array_equal(
+        merged.teacher_action_evaluation_mask,
+        (
+            (True, True),
+            (True, False),
+            (False, False),
+            (False, False),
+            (False, False),
+        ),
+    )
+    assert merged.teacher_action_evaluations.shape == (5, 2, 18, 11)
+    assert report["teacher_action_evaluations"] == {
+        "available_decisions": 3,
+        "action_count": 18,
+        "fields": list(TEACHER_ACTION_EVALUATION_FIELDS),
+    }
 
 
 def test_contextualize_demos_uses_strict_manifest_episode_order(
@@ -522,14 +883,14 @@ def test_contextualize_demos_uses_strict_manifest_episode_order(
                 "scenario": "okuu:Lunatic",
                 "attack": 3,
                 "seed": 10,
-                "profile": "teacher",
+                "profile": "novice",
             },
             {
                 "episode_kind": "stage",
                 "scenario": "Stage 1@Normal",
                 "attack": None,
                 "seed": 11,
-                "profile": "teacher",
+                "profile": "intermediate",
             },
         ],
     }), encoding="utf-8")
@@ -541,10 +902,12 @@ def test_contextualize_demos_uses_strict_manifest_episode_order(
         "--output", str(output),
         "--manifest", str(output_manifest),
         "--previous-action-conditioning",
+        "--proficiency-conditioning",
     ]) == 0
 
     conditioned = Demonstrations.load(output)
     assert conditioned.memory.shape == (3, 1, 21)
+    assert conditioned.proficiency.shape == (3, 1, 5)
     np.testing.assert_array_equal(conditioned.memory[0, 0, :3], (0, 1, 0))
     np.testing.assert_array_equal(conditioned.memory[2, 0, :3], (0, 0, 1))
     report = json.loads(output_manifest.read_text(encoding="utf-8"))
@@ -555,6 +918,8 @@ def test_contextualize_demos_uses_strict_manifest_episode_order(
     ]
     assert report["previous_action_offset"] == 3
     assert report["previous_action_size"] == 18
+    assert report["proficiency_size"] == 5
+    assert report["proficiency_profiles"] == ["intermediate", "novice"]
     assert json.loads(capsys.readouterr().out)["episode_groups"] == 2
 
 
@@ -612,6 +977,169 @@ def test_relabel_dagger_command_writes_corrective_archive_and_manifest(
     assert manifest["action_supervision"]["mode"] == (
         "teacher_interventions_only"
     )
+    assert json.loads(capsys.readouterr().out) == manifest
+
+
+def test_relabel_dagger_command_can_select_only_safety_interventions(
+    tmp_path, capsys,
+) -> None:
+    source = tmp_path / "teacher.npz"
+    report_path = tmp_path / "dagger.json"
+    output = tmp_path / "safety-corrections.npz"
+    manifest_path = tmp_path / "safety-corrections.manifest.json"
+    values = demonstrations((0, 0, 0), steps=1)
+    values.actions[:, 0] = (0, 1, 2)
+    values.save(source)
+    report_path.write_text(json.dumps({
+        "run_kind": "live_luastg_native_dagger",
+        "implementation_sha256": "d" * 64,
+        "success": True,
+        "passed": True,
+        "episode_kind": "attack",
+        "scenario": "okuu:Lunatic",
+        "attack": 3,
+        "seed": 20260809,
+        "terminated": True,
+        "termination_reason": "attack_complete",
+        "engine_termination_reason": "attack_complete",
+        "decision_count": 3,
+        "teacher_interventions": 2,
+        "scheduled_teacher_interventions": 0,
+        "safety_teacher_interventions": 1,
+        "policy_disagreement_interventions": 1,
+        "student_teacher_agreements": 0,
+        "outcome_evidence": {"final_player": {"death": 0}},
+        "decisions": [
+            {
+                "decision": index,
+                "teacher_action": {"discrete": teacher},
+                "student_action": {"discrete": student},
+                "executed_action": {
+                    "discrete": teacher if intervened else student,
+                },
+                "teacher_intervened": intervened,
+                "intervention_reason": reason,
+                "student_teacher_agreement": False,
+                "student_predicted_minimum_margin": 0.0,
+                "teacher_predicted_minimum_margin": (
+                    3.0 if index == 1 else 0.0
+                ),
+            }
+            for index, (teacher, student, intervened, reason) in enumerate(zip(
+                (0, 1, 2),
+                (8, 9, 10),
+                (False, True, True),
+                (None, "minimum_margin", "policy_disagreement"),
+                strict=True,
+            ))
+        ],
+    }), encoding="utf-8")
+
+    assert cli.main([
+        "relabel-dagger",
+        "--demos", str(source),
+        "--dagger-report", str(report_path),
+        "--output", str(output),
+        "--manifest", str(manifest_path),
+        "--interventions-only",
+        "--safety-interventions-only",
+        "--minimum-safety-margin-gain", "2",
+    ]) == 0
+
+    relabeled = Demonstrations.load(output)
+    np.testing.assert_array_equal(relabeled.actions[:, 0], (8, 1, 2))
+    np.testing.assert_array_equal(
+        relabeled.supervision_mask[:, 0], (False, True, False),
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["total_teacher_interventions"] == 2
+    assert manifest["selected_safety_interventions"] == 1
+    assert manifest["excluded_policy_disagreement_interventions"] == 1
+    assert manifest["action_supervision"]["mode"] == (
+        "effective_safety_interventions_only"
+    )
+    assert manifest["minimum_safety_margin_gain"] == 2.0
+    assert json.loads(capsys.readouterr().out) == manifest
+
+
+def test_relabel_dagger_command_can_make_interventions_hard_labels(
+    tmp_path, capsys,
+) -> None:
+    source = tmp_path / "teacher-evaluated.npz"
+    report_path = tmp_path / "dagger.json"
+    output = tmp_path / "hard-interventions.npz"
+    manifest_path = tmp_path / "hard-interventions.manifest.json"
+    values = demonstrations((0, 0, 0), steps=1)
+    values.actions[:, 0] = (0, 1, 2)
+    values.teacher_action_evaluations = np.zeros(
+        (3, 1, 18, len(TEACHER_ACTION_EVALUATION_FIELDS)),
+        dtype=np.float32,
+    )
+    for index, action in enumerate(values.actions[:, 0]):
+        values.teacher_action_evaluations[
+            index, 0, action, TEACHER_ACTION_SELECTED_INDEX
+        ] = 1.0
+    values.teacher_action_regrets = np.zeros((3, 1, 18), dtype=np.float32)
+    values.teacher_action_evaluation_mask = np.ones((3, 1), dtype=bool)
+    values.save(source)
+    report_path.write_text(json.dumps({
+        "run_kind": "live_luastg_native_dagger",
+        "implementation_sha256": "c" * 64,
+        "success": True,
+        "passed": True,
+        "episode_kind": "attack",
+        "scenario": "okuu:Lunatic",
+        "attack": 3,
+        "seed": 20260808,
+        "terminated": True,
+        "termination_reason": "attack_complete",
+        "engine_termination_reason": "attack_complete",
+        "decision_count": 3,
+        "teacher_interventions": 1,
+        "student_teacher_agreements": 0,
+        "outcome_evidence": {"final_player": {"death": 0}},
+        "decisions": [
+            {
+                "decision": index,
+                "teacher_action": {"discrete": teacher},
+                "student_action": {"discrete": student},
+                "executed_action": {
+                    "discrete": teacher if intervened else student,
+                },
+                "teacher_intervened": intervened,
+                "student_teacher_agreement": False,
+            }
+            for index, (teacher, student, intervened) in enumerate(zip(
+                (0, 1, 2), (8, 9, 10), (False, True, False), strict=True,
+            ))
+        ],
+    }), encoding="utf-8")
+
+    assert cli.main([
+        "relabel-dagger",
+        "--demos", str(source),
+        "--dagger-report", str(report_path),
+        "--output", str(output),
+        "--manifest", str(manifest_path),
+        "--interventions-only",
+        "--hard-intervention-labels",
+    ]) == 0
+
+    relabeled = Demonstrations.load(output)
+    np.testing.assert_array_equal(relabeled.actions[:, 0], (8, 1, 10))
+    np.testing.assert_array_equal(
+        relabeled.supervision_mask[:, 0], (False, True, False),
+    )
+    np.testing.assert_array_equal(
+        relabeled.teacher_action_evaluation_mask[:, 0], (True, False, True),
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["hard_intervention_label_supervision"][
+        "hard_label_decisions"
+    ] == 1
+    assert manifest["hard_intervention_label_supervision"][
+        "remaining_soft_evaluation_decisions"
+    ] == 2
     assert json.loads(capsys.readouterr().out) == manifest
 
 
@@ -908,6 +1436,87 @@ def test_engine_replay_analyze_connects_and_writes_report(
     assert json.loads(capsys.readouterr().out)["frames_analyzed"] == 2592
 
 
+def test_engine_replay_collect_demos_routes_decision_phase_offset(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab import engine, engine_replay_dataset
+
+    connected = {}
+    calls = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            connected["closed"] = True
+
+    class FakeBuilder:
+        accepted_count = 1
+
+    def fake_connect(host, port, *, timeout):
+        connected.update(host=host, port=port, timeout=timeout)
+        return FakeClient()
+
+    def fake_collect(client, **kwargs):
+        calls.update(client=client, **kwargs)
+        return ({
+            "strict_success": True,
+            "action_supervision": {"supervised_decisions": 1},
+        }, FakeBuilder())
+
+    def fake_save(builder, report, output, manifest):
+        calls.update(
+            builder=builder,
+            save_report=report,
+            save_output=output,
+            save_manifest=manifest,
+        )
+        return {"saved": True, "decision_phase_offset": 2}
+
+    monkeypatch.setattr(engine.EngineClient, "connect", fake_connect)
+    monkeypatch.setattr(
+        engine_replay_dataset,
+        "collect_replay_demonstrations",
+        fake_collect,
+    )
+    monkeypatch.setattr(
+        engine_replay_dataset,
+        "save_replay_demonstrations",
+        fake_save,
+    )
+    replay = tmp_path / "slot3.rep"
+    output = tmp_path / "human-slot3-phase2.npz"
+    report = tmp_path / "human-slot3-phase2.json"
+    assert cli.main([
+        "engine-replay-collect-demos",
+        "--host", "127.0.0.2",
+        "--port", "25003",
+        "--timeout", "8.5",
+        "--replay", "../slot3.rep",
+        "--replay-file", str(replay),
+        "--save-demos", str(output),
+        "--decision-phase-offset", "2",
+        "--output", str(report),
+    ]) == 0
+
+    assert connected == {
+        "host": "127.0.0.2",
+        "port": 25003,
+        "timeout": 8.5,
+        "closed": True,
+    }
+    assert calls["replay_path"] == "../slot3.rep"
+    assert calls["replay_file"] == replay
+    assert calls["config"].decision_phase_offset == 2
+    assert calls["save_output"] == output
+    assert calls["save_manifest"] == output.with_suffix(".manifest.json")
+    assert json.loads(report.read_text())["demonstrations"][
+        "decision_phase_offset"
+    ] == 2
+    assert json.loads(capsys.readouterr().out)["strict_success"] is True
+
+
 def test_engine_mpc_matrix_resolves_catalog_and_profiles(
     monkeypatch, tmp_path, capsys,
 ) -> None:
@@ -1040,6 +1649,225 @@ def test_engine_mpc_campaign_has_only_memory_free_controller_inputs(
     assert json.loads(capsys.readouterr().out)["passed"] is True
 
 
+def test_live_policy_commands_parse_action_selection_ablation() -> None:
+    parser = cli.build_parser()
+    commands = (
+        ["engine-play", "--checkpoint", "policy.pt"],
+        [
+            "engine-dagger-play",
+            "--checkpoint", "policy.pt",
+            "--save-demos", "demos.npz",
+        ],
+        [
+            "engine-policy-matrix",
+            "--checkpoint", "policy.pt",
+            "--output", "matrix.json",
+        ],
+    )
+
+    for command in commands:
+        assert parser.parse_args(command).policy_action_selection == "joint"
+        assert parser.parse_args([
+            *command,
+            "--policy-action-selection", "factorized",
+        ]).policy_action_selection == "factorized"
+
+    residual = parser.parse_args([
+        "engine-play",
+        "--checkpoint", "policy.pt",
+        "--residual-adapter", "adapter.pt",
+    ])
+    assert residual.residual_adapter == Path("adapter.pt")
+
+    dagger = parser.parse_args([
+        "engine-dagger-play",
+        "--checkpoint", "policy.pt",
+        "--residual-adapter", "adapter.pt",
+        "--save-demos", "demos.npz",
+        "--record-teacher-evaluations",
+    ])
+    assert dagger.residual_adapter == Path("adapter.pt")
+    assert dagger.record_teacher_evaluations is True
+    assert dagger.minimum_safety_margin_gain is None
+    gated_dagger = parser.parse_args([
+        "engine-dagger-play",
+        "--checkpoint", "policy.pt",
+        "--save-demos", "demos.npz",
+        "--minimum-safety-margin-gain", "4.5",
+    ])
+    assert gated_dagger.minimum_safety_margin_gain == 4.5
+
+    training = parser.parse_args([
+        "train",
+        "--soft-action-loss-weight", "1.5",
+        "--soft-action-temperature", "3",
+        "--soft-action-safety-margin", "14",
+    ])
+    assert training.soft_action_loss_weight == 1.5
+    assert training.soft_action_temperature == 3.0
+    assert training.soft_action_safety_margin == 14.0
+
+
+def test_engine_dagger_routes_minimum_safety_margin_gain_without_real_engine(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from stg_lab import (
+        engine,
+        engine_dagger,
+        engine_matrix,
+        engine_mpc,
+        engine_play,
+        native_dataset,
+        residual_adapter,
+    )
+
+    checkpoint = tmp_path / "policy.pt"
+    checkpoint.write_bytes(b"test-checkpoint")
+    calls = {}
+    model = SimpleNamespace(config=SimpleNamespace(inference_mode="stream"))
+    wrapped_model = SimpleNamespace(
+        config=SimpleNamespace(inference_mode="stream"),
+        residual_runtime_stats=lambda: {"decisions": 9, "overrides": 2},
+    )
+    monkeypatch.setattr(cli, "_load_checkpoint", lambda *_args: (model, {}))
+    monkeypatch.setattr(
+        cli,
+        "_live_policy_scenario_key",
+        lambda *_args, **_kwargs: "attack:okuu:Lunatic#3",
+    )
+
+    class FakeStudent:
+        def __init__(self, *args, **kwargs):
+            calls.update(student_args=args, student_kwargs=kwargs)
+            self.model = args[0]
+
+    class FakeTeacher:
+        def __init__(self, config):
+            self.config = config
+            calls["teacher_config"] = config
+
+    class FakeBuilder:
+        accepted_count = 0
+
+        def begin(self, identity):
+            calls["identity"] = identity
+            return object()
+
+        def finish(self, episode, **kwargs):
+            calls.update(finished_episode=episode, finish_kwargs=kwargs)
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            calls["closed"] = True
+
+    def fake_connect(host, port, *, timeout):
+        calls.update(host=host, port=port, timeout=timeout)
+        return FakeConnection()
+
+    def fake_run(client, **kwargs):
+        calls.update(client=client, run_kwargs=kwargs)
+        return {
+            "success": True,
+            "passed": True,
+            "termination_reason": "attack_complete",
+            "controller": {"student": {}, "teacher": {}},
+            "config": asdict(kwargs["config"]),
+        }
+
+    monkeypatch.setattr(engine.EngineClient, "connect", fake_connect)
+
+    def fake_load_residual(
+        parent, adapter_path, *, parent_checkpoint, device,
+    ):
+        calls.update(
+            residual_parent=parent,
+            residual_adapter_path=adapter_path,
+            residual_parent_checkpoint=parent_checkpoint,
+            residual_device=device,
+        )
+        return wrapped_model, {
+            "kind": "frozen_parent_residual_correction_adapter",
+            "adapter": str(adapter_path),
+            "verified_parent_checkpoint": str(parent_checkpoint),
+        }
+
+    monkeypatch.setattr(
+        residual_adapter,
+        "load_residual_adapter",
+        fake_load_residual,
+    )
+    monkeypatch.setattr(engine_play, "VisualPolicyController", FakeStudent)
+    monkeypatch.setattr(engine_mpc, "EngineMPC", FakeTeacher)
+    monkeypatch.setattr(
+        engine_matrix,
+        "apply_controller_profile",
+        lambda _profile, config: config,
+    )
+    monkeypatch.setattr(
+        native_dataset,
+        "NativeDemonstrationBuilder",
+        FakeBuilder,
+    )
+    monkeypatch.setattr(engine_dagger, "run_engine_dagger_play", fake_run)
+
+    assert cli.main([
+        "engine-dagger-play",
+        "--checkpoint", str(checkpoint),
+        "--residual-adapter", str(tmp_path / "adapter.pt"),
+        "--save-demos", str(tmp_path / "demos.npz"),
+        "--teacher-probability", "0",
+        "--minimum-safety-margin-gain", "4.0",
+    ]) == 0
+
+    assert calls["closed"] is True
+    assert calls["residual_parent"] is model
+    assert calls["residual_parent_checkpoint"] == checkpoint
+    assert calls["residual_adapter_path"] == tmp_path / "adapter.pt"
+    assert calls["residual_device"] == "cpu"
+    assert calls["student_args"][0] is wrapped_model
+    assert calls["run_kwargs"]["config"].minimum_safety_margin_gain == 4.0
+    report = json.loads(capsys.readouterr().out)
+    assert report["config"]["minimum_safety_margin_gain"] == 4.0
+    assert report["controller"]["student"]["residual_adapter"] == {
+        "kind": "frozen_parent_residual_correction_adapter",
+        "adapter": str(tmp_path / "adapter.pt"),
+        "verified_parent_checkpoint": str(checkpoint),
+    }
+    assert report["controller"]["student"]["residual_adapter_runtime"] == {
+        "decisions": 9,
+        "overrides": 2,
+    }
+
+
+def test_engine_dagger_rejects_negative_minimum_safety_margin_gain(
+    capsys,
+) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        cli.main([
+            "engine-dagger-play",
+            "--checkpoint", "policy.pt",
+            "--save-demos", "demos.npz",
+            "--minimum-safety-margin-gain", "-0.1",
+        ])
+    assert "--minimum-safety-margin-gain cannot be negative" in (
+        capsys.readouterr().err
+    )
+
+
+def test_engine_dagger_residual_requires_joint_action_selection(capsys) -> None:
+    assert cli.main([
+        "engine-dagger-play",
+        "--checkpoint", "policy.pt",
+        "--residual-adapter", "adapter.pt",
+        "--policy-action-selection", "factorized",
+        "--save-demos", "demos.npz",
+    ]) == 2
+    assert "requires joint" in capsys.readouterr().err
+
+
 def test_engine_policy_matrix_resolves_targets_and_proficiencies(
     monkeypatch, tmp_path, capsys,
 ) -> None:
@@ -1100,6 +1928,7 @@ def test_engine_policy_matrix_resolves_targets_and_proficiencies(
         "--seed", "22",
         "--proficiency", "expert",
         "--proficiency", "intermediate",
+        "--policy-action-selection", "factorized",
         "--max-frames", "8400",
         "--vision-history", "1",
         "--no-visible-safety-shield",
@@ -1126,6 +1955,9 @@ def test_engine_policy_matrix_resolves_targets_and_proficiencies(
     assert calls["matrix"]["config"].visible_safety_shield is False
     assert calls["matrix"]["controller_metadata"]["kind"] == (
         "streaming_visual_policy"
+    )
+    assert calls["matrix"]["controller_metadata"]["action_selection"] == (
+        "factorized"
     )
     assert json.loads(output.read_text())["passed"] is True
     assert json.loads(capsys.readouterr().out)["passed"] is True
@@ -1369,6 +2201,23 @@ def test_engine_play_route_requires_sqlite_memory(capsys) -> None:
     assert "requires --memory-database and --memory-id" in capsys.readouterr().err
 
 
+def test_engine_play_residual_requires_checkpoint_and_joint_selection(capsys) -> None:
+    assert cli.main([
+        "engine-play",
+        "--route-artifact", "route.json",
+        "--residual-adapter", "adapter.pt",
+    ]) == 2
+    assert "requires --checkpoint" in capsys.readouterr().err
+
+    assert cli.main([
+        "engine-play",
+        "--checkpoint", "policy.pt",
+        "--residual-adapter", "adapter.pt",
+        "--policy-action-selection", "factorized",
+    ]) == 2
+    assert "requires joint" in capsys.readouterr().err
+
+
 def test_engine_play_stage_routes_checkpoint_to_full_stage_runner(
     monkeypatch, tmp_path, capsys,
 ) -> None:
@@ -1419,14 +2268,19 @@ def test_engine_play_stage_routes_checkpoint_to_full_stage_runner(
         "--checkpoint", str(checkpoint),
         "--seed", "92",
         "--proficiency", "intermediate",
+        "--policy-action-selection", "factorized",
         "--visible-safety-shield",
         "--visible-safety-horizon", "5",
+        "--replay-name", "stage1-policy.REP",
     ]) == 0
 
     assert calls["controller"] is selected_controller
     assert controller_args["kwargs"]["proficiency"] == "intermediate"
+    assert controller_args["kwargs"]["action_selection"] == "factorized"
+    assert calls["controller_metadata"]["action_selection"] == "factorized"
     assert calls["config"].visible_safety_shield is True
     assert calls["config"].visible_safety_horizon == 5
+    assert calls["config"].replay_name == "stage1-policy"
     assert calls["scenario"] == "Stage 1@Normal"
     assert calls["attack"] is None
     assert calls["stage"] == "Stage 1@Normal"

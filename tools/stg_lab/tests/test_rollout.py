@@ -148,6 +148,57 @@ def test_policy_behavior_can_defer_runtime_commit_for_native_overrides(
     assert runtime.commits == [(immediate, 3)]
 
 
+def test_policy_behavior_passes_factorized_model_scores_to_runtime(
+    monkeypatch,
+) -> None:
+    from stg_lab import rollout
+    from stg_lab.policy import ProficiencyRuntime, policy_action_scores
+
+    class RecordingRuntime(ProficiencyRuntime):
+        def preferred_action(self, logits, *, decision_interval: int) -> Action:
+            self.received_scores = np.asarray(logits).copy()
+            return super().preferred_action(
+                logits,
+                decision_interval=decision_interval,
+            )
+
+    logits = np.full((2, 9), -10.0, dtype=np.float32)
+    logits[0, 0] = 10.0
+    logits[:, 1] = 9.5
+    flattened = logits.reshape(18)
+    monkeypatch.setattr(
+        rollout,
+        "_policy_logits",
+        lambda *_args, **_options: (flattened, None),
+    )
+    visible = rollout.VisionObservation(
+        global_frames=np.zeros((1, 6, 8, 8), dtype=np.float32),
+        local_frames=np.zeros((1, 6, 8, 8), dtype=np.float32),
+        source_frame=0,
+    )
+    runtime = RecordingRuntime("expert", seed=7)
+
+    action, _hidden = rollout._policy_behavior_action(
+        object(),
+        None,
+        visible,
+        device="cpu",
+        memory=np.zeros(0, dtype=np.float32),
+        hidden=None,
+        inference_mode="stream",
+        config=RolloutConfig(decision_interval=3),
+        shield=False,
+        runtime=runtime,
+        action_selection="factorized",
+    )
+
+    np.testing.assert_allclose(
+        runtime.received_scores,
+        policy_action_scores(flattened, "factorized"),
+    )
+    assert action.discrete == 1
+
+
 def empty_factory(seed: int) -> STGEnvironment:
     return STGEnvironment(
         EmptyScenario(),
@@ -187,7 +238,7 @@ def test_collect_save_load_and_multi_seed_planner_metrics(tmp_path) -> None:
     loaded = load_demonstrations(output)
     np.testing.assert_array_equal(loaded.actions, demonstrations.actions)
     np.testing.assert_array_equal(loaded.episode_ids, demonstrations.episode_ids)
-    assert loaded.global_frames.dtype == np.float16
+    assert loaded.global_frames.dtype == np.float32
 
     repeated = evaluate_planner(
         empty_factory,

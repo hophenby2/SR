@@ -102,10 +102,21 @@ class FakeEngineClient:
         self.reset_call: dict[str, Any] | None = None
         self.render_calls: list[tuple[bool, int]] = []
         self.runtime_source_crc32 = local_runtime_source_fingerprints()[0]
+        self.commands = [
+            "ping", "catalog", "reset", "reset_stage", "step", "display",
+            "save_replay",
+        ]
+        self.replay_name: str | None = None
+        self.replay_episode_kind: str | None = None
+        self.replay_seed: int | None = None
+        self.replay_player: str | None = None
+        self.replay_stage_name: str | None = None
+        self.save_replay_calls: list[tuple[bool, str]] = []
 
     def ping(self):
         return {
             "protocol": 2,
+            "commands": self.commands,
             "session_id": "fake-live-session",
             "process_nonce": "fake-process",
             "runtime_identity": {
@@ -129,7 +140,39 @@ class FakeEngineClient:
         self.render_calls.append((enabled, every))
         return {"render": enabled, "every": every}
 
-    def reset(self, scenario, attack, *, seed, player, options):
+    def _reset_response(
+        self,
+        *,
+        replay_name: str | None,
+        episode_kind: str,
+        stage_name: str,
+        seed: int,
+        player: str,
+    ) -> dict[str, Any]:
+        response = {"observation": observation(
+            0, nearby_threat=self.nearby_threat,
+        )}
+        if replay_name is not None:
+            self.replay_name = replay_name
+            self.replay_episode_kind = episode_kind
+            self.replay_seed = seed
+            self.replay_player = player
+            self.replay_stage_name = stage_name
+            response["reset"] = {"replay": {
+                "schema_version": 1,
+                "name": replay_name,
+                "path": f"userdata/replay/test/analysis/{replay_name}.rep",
+                "stage_name": stage_name,
+                "random_seed": seed,
+                "player": player,
+                "episode_kind": episode_kind,
+                "saved": False,
+            }}
+        return response
+
+    def reset(
+        self, scenario, attack, *, seed, player, options, replay_name=None,
+    ):
         self.frame = 0
         self.reset_call = {
             "scenario": scenario,
@@ -138,9 +181,19 @@ class FakeEngineClient:
             "player": player,
             "options": options,
         }
-        return {"observation": observation(0, nearby_threat=self.nearby_threat)}
+        if replay_name is not None:
+            self.reset_call["replay_name"] = replay_name
+        return self._reset_response(
+            replay_name=replay_name,
+            episode_kind="attack",
+            stage_name="Spell Practice@Spell Practice",
+            seed=seed,
+            player=player,
+        )
 
-    def reset_stage(self, stage, *, seed, player, options):
+    def reset_stage(
+        self, stage, *, seed, player, options, replay_name=None,
+    ):
         self.frame = 0
         self.reset_call = {
             "stage": stage,
@@ -148,7 +201,15 @@ class FakeEngineClient:
             "player": player,
             "options": options,
         }
-        return {"observation": observation(0, nearby_threat=self.nearby_threat)}
+        if replay_name is not None:
+            self.reset_call["replay_name"] = replay_name
+        return self._reset_response(
+            replay_name=replay_name,
+            episode_kind="stage",
+            stage_name=stage,
+            seed=seed,
+            player=player,
+        )
 
     def step(self, action: Action, *, repeat: int = 1):
         self.actions.append((action, repeat))
@@ -161,6 +222,33 @@ class FakeEngineClient:
             nearby_threat=self.nearby_threat,
             death=self.final_death if terminated else None,
         )}
+
+    def save_replay(self, *, finish: bool, reason: str):
+        self.save_replay_calls.append((finish, reason))
+        assert self.replay_name is not None
+        assert self.replay_episode_kind is not None
+        assert self.replay_seed is not None
+        assert self.replay_player is not None
+        assert self.replay_stage_name is not None
+        frame_count = len(self.actions) + 1
+        return {"replay": {
+            "schema_version": 1,
+            "name": self.replay_name,
+            "path": f"userdata/replay/test/analysis/{self.replay_name}.rep",
+            "stage_name": self.replay_stage_name,
+            "random_seed": self.replay_seed,
+            "player": self.replay_player,
+            "episode_kind": self.replay_episode_kind,
+            "frame_count": frame_count,
+            "frame_bytes_verified": frame_count,
+            "file_size": 512 + frame_count,
+            "finish": finish,
+            "group_finish": 1 if finish else 0,
+            "reason": reason,
+            "saved": True,
+            "verified": True,
+            "crc32": "89abcdef",
+        }}
 
 
 class AlternatingController:
@@ -214,6 +302,14 @@ class ContextOnlyPolicy:
 
 
 def test_live_policy_rejects_identity_memory_without_vocabulary() -> None:
+    with pytest.raises(ValueError, match="unknown policy action selection"):
+        VisualPolicyController(
+            ContextOnlyPolicy(),
+            "stage5_boss3:lunatic",
+            device="cpu",
+            action_selection="independent",
+        )
+
     with pytest.raises(ValueError, match="checkpoint-declared scenario vocabulary"):
         VisualPolicyController(
             ContextOnlyPolicy(),
@@ -247,7 +343,12 @@ class ExecutedCommitController:
         self.commits.append((action, frames))
 
 
-def play_config(*, max_frames: int, observation_delay: int = 0) -> EnginePlayConfig:
+def play_config(
+    *,
+    max_frames: int,
+    observation_delay: int = 0,
+    replay_name: str | None = None,
+) -> EnginePlayConfig:
     vision = VisionConfig(
         global_width=16,
         global_height=16,
@@ -263,6 +364,7 @@ def play_config(*, max_frames: int, observation_delay: int = 0) -> EnginePlayCon
         vision=vision,
         shoot_gate_radius=12.0,
         shoot_risk_threshold=0.25,
+        replay_name=replay_name,
     )
 
 
@@ -314,6 +416,18 @@ def test_engine_play_requires_an_unshielded_model_for_pure_policy_success() -> N
             visible_safety_shield=True,
         ),
     )
+    factorized_controller = StubVisualPolicyController()
+    factorized_controller.action_selection = "factorized"
+    factorized = run_engine_play(
+        FakeEngineClient(terminate_at=3, reason="attack_complete"),  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        controller=factorized_controller,
+        controller_metadata={"kind": "streaming_visual_policy"},
+        config=play_config(max_frames=3),
+    )
 
     assert pure["success"] is True
     assert pure["pure_policy"] is True
@@ -328,6 +442,15 @@ def test_engine_play_requires_an_unshielded_model_for_pure_policy_success() -> N
     assert shielded["raw_model_action_execution"] is False
     assert shielded["pure_policy_success"] is False
     assert shielded["pure_policy_validation_eligible"] is False
+    assert factorized["pure_policy"] is True
+    assert factorized["raw_model_action_execution"] is False
+    assert factorized["pure_policy_success"] is True
+    assert factorized["controller"]["action_selection"] == "factorized"
+    assert factorized["controller"]["action_selection_uses_safety_state"] is False
+    assert (
+        "factorized_direction_speed_marginal_scores_from_model_logits"
+        in factorized["config"]["control_inputs"]
+    )
 
 
 def test_visible_safety_shield_uses_only_local_semantic_geometry() -> None:
@@ -489,6 +612,7 @@ def test_visual_policy_controller_defers_motor_commit_until_execution(
     controller.memory = np.zeros(0, dtype=np.float32)
     controller.hidden = None
     controller.inference_mode = "stream"
+    controller.action_selection = "factorized"
     controller.runtime = RecordingRuntime()
     controller.decisions = 0
     visible = VisionObservation(
@@ -501,6 +625,7 @@ def test_visual_policy_controller_defers_motor_commit_until_execution(
 
     assert preferred.move_y == 1
     assert calls[0]["commit_runtime"] is False
+    assert calls[0]["action_selection"] == "factorized"
     assert controller.runtime.commits == []
     controller.commit_executed_action(Action(move_x=-1, slow=True), frames=3)
     assert controller.runtime.commits == [(Action(move_x=-1, slow=True), 3)]
@@ -524,14 +649,61 @@ def test_visual_policy_controller_records_previous_executed_motor_action() -> No
     assert controller.memory[2 + action.discrete] == 1.0
 
 
+def test_visual_policy_controller_forwards_only_committed_execution_to_model() -> None:
+    class Model:
+        def __init__(self) -> None:
+            self.commits: list[tuple[Action, int]] = []
+
+        def commit_executed_action(self, action: Action, *, frames: int) -> None:
+            self.commits.append((action, frames))
+
+    controller = object.__new__(VisualPolicyController)
+    controller.model = Model()
+    controller.runtime = type("Runtime", (), {
+        "commit": lambda _self, _action, *, decision_interval: None,
+    })()
+    controller.previous_action_size = 0
+    controller.previous_action_offset = 0
+    controller.memory = np.zeros(0, dtype=np.float32)
+    action = Action(move_y=-1, slow=True)
+
+    assert controller.model.commits == []
+    controller.commit_executed_action(action, frames=3)
+
+    assert controller.model.commits == [(action, 3)]
+
+
 def test_stream_policy_control_inputs_report_learned_context() -> None:
     controller = object.__new__(VisualPolicyController)
+    controller.action_selection = "factorized"
     controller.scenario_vocabulary = ("<unknown>", "attack:okuu:Lunatic#3")
     controller.previous_action_size = 18
 
     assert _stream_policy_control_inputs(controller)[-2:] == [
         "registered_episode_identity_one_hot",
         "previous_executed_motor_action_one_hot",
+    ]
+    assert (
+        "factorized_direction_speed_marginal_scores_from_model_logits"
+        in _stream_policy_control_inputs(controller)
+    )
+
+
+def test_stream_policy_control_inputs_report_residual_execution_feedback() -> None:
+    controller = object.__new__(VisualPolicyController)
+    controller.action_selection = "joint"
+    controller.scenario_vocabulary = None
+    controller.previous_action_size = 0
+    controller.model = SimpleNamespace(
+        adapter=SimpleNamespace(
+            config=SimpleNamespace(executed_action_context=True),
+        ),
+    )
+
+    assert _stream_policy_control_inputs(controller)[-3:] == [
+        "residual_previous_executed_motor_action_one_hot",
+        "residual_previous_executed_action_validity",
+        "residual_log1p_consecutive_executed_action_decisions",
     ]
 
 
@@ -631,6 +803,119 @@ def test_engine_play_accepts_only_zero_death_stage_completion() -> None:
     assert report["attack"] is None
     assert report["termination_reason"] == "stage_complete"
     assert report["engine"]["catalog_entry"]["name"] == "Stage 1"
+
+
+def test_engine_play_saves_verified_native_attack_replay() -> None:
+    client = FakeEngineClient(terminate_at=3, reason="attack_complete")
+    config = play_config(max_frames=30, replay_name="learned-boss3.REP")
+
+    report = run_engine_play(
+        client,  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=42,
+        player="reimu_player",
+        controller=AlternatingController(),
+        config=config,
+    )
+
+    assert config.replay_name == "learned-boss3"
+    assert client.reset_call == {
+        "scenario": "okuu:Lunatic",
+        "attack": 3,
+        "seed": 42,
+        "player": "reimu_player",
+        "options": {},
+        "replay_name": "learned-boss3",
+    }
+    assert client.save_replay_calls == [(False, "attack_complete")]
+    assert report["success"] is True
+    assert report["native_replay"]["saved"] is True
+    assert report["native_replay"]["verified"] is True
+    assert report["native_replay"]["episode_kind"] == "attack"
+    assert report["native_replay"]["finish"] is False
+    assert report["native_replay"]["group_finish"] == 0
+    assert report["config"]["replay_name"] == "learned-boss3"
+
+
+@pytest.mark.parametrize(
+    ("terminate_at", "reason", "expected_reason"),
+    ((1, "player_hit", "player_hit"), (None, None, "max_frames")),
+)
+def test_engine_play_saves_failed_attack_replay_with_diagnostic_reason(
+    terminate_at: int | None,
+    reason: str | None,
+    expected_reason: str,
+) -> None:
+    client = FakeEngineClient(terminate_at=terminate_at, reason=reason)
+
+    report = run_engine_play(
+        client,  # type: ignore[arg-type]
+        scenario="okuu:Lunatic",
+        attack=3,
+        seed=43,
+        player="reimu_player",
+        controller=AlternatingController(),
+        config=play_config(max_frames=3, replay_name="failed-policy-run"),
+    )
+
+    assert report["success"] is False
+    assert report["termination_reason"] == expected_reason
+    assert client.save_replay_calls == [(False, expected_reason)]
+    assert report["native_replay"]["reason"] == expected_reason
+    assert report["native_replay"]["finish"] is False
+
+
+@pytest.mark.parametrize(
+    ("death", "expected_success", "expected_finish"),
+    ((0, True, True), (1, False, False)),
+)
+def test_engine_play_stage_replay_finish_requires_strict_success(
+    death: int,
+    expected_success: bool,
+    expected_finish: bool,
+) -> None:
+    client = FakeEngineClient(
+        terminate_at=3,
+        reason="stage_complete",
+        final_death=death,
+    )
+
+    report = run_engine_play(
+        client,  # type: ignore[arg-type]
+        scenario="Stage 1@Normal",
+        attack=None,
+        stage="Stage 1@Normal",
+        seed=44,
+        player="reimu_player",
+        controller=AlternatingController(),
+        config=play_config(max_frames=30, replay_name="learned-stage1"),
+    )
+
+    assert report["success"] is expected_success
+    assert client.save_replay_calls == [(expected_finish, "stage_complete")]
+    assert report["native_replay"]["episode_kind"] == "stage"
+    assert report["native_replay"]["finish"] is expected_finish
+    assert report["native_replay"]["group_finish"] == int(expected_finish)
+
+
+def test_engine_play_replay_capture_requires_bridge_support_before_reset() -> None:
+    client = FakeEngineClient(terminate_at=3, reason="attack_complete")
+    client.commands.remove("save_replay")
+
+    with pytest.raises(EngineProtocolError, match="does not advertise"):
+        run_engine_play(
+            client,  # type: ignore[arg-type]
+            scenario="okuu:Lunatic",
+            attack=3,
+            seed=42,
+            player="reimu_player",
+            controller=AlternatingController(),
+            config=play_config(max_frames=30, replay_name="unsupported"),
+        )
+
+    assert client.reset_call is None
+    assert client.actions == []
 
 
 def test_engine_play_rejects_boolean_false_as_zero_death() -> None:

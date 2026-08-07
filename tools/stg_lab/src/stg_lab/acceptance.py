@@ -746,6 +746,7 @@ def _compile_agreement(
                             if demonstrations.supervision_mask is None
                             else demonstrations.supervision_mask[mask]
                         ),
+                        correction_mask=demonstrations.correction_mask[mask],
                     )
                     subset.validate()
                     samples = int(

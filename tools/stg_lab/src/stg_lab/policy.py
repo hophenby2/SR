@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - exercised in the base, non-training en
 
 
 PROFICIENCY_VECTOR_SIZE = 5
+POLICY_ACTION_SELECTIONS = ("joint", "factorized")
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +110,38 @@ def proficiency_vector(
     return resolve_proficiency(value).vector()
 
 
+def available_policy_action_selections() -> tuple[str, ...]:
+    return POLICY_ACTION_SELECTIONS
+
+
+def resolve_policy_action_selection(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in POLICY_ACTION_SELECTIONS:
+        choices = ", ".join(POLICY_ACTION_SELECTIONS)
+        raise ValueError(
+            f"unknown policy action selection {value!r}; choose {choices}"
+        )
+    return normalized
+
+
+def policy_action_scores(
+    logits: np.ndarray,
+    action_selection: str = "joint",
+) -> np.ndarray:
+    """Decode 18-way model logits without adding non-model information."""
+
+    mode = resolve_policy_action_selection(action_selection)
+    values = np.asarray(logits)
+    if mode == "joint":
+        return values
+    if values.shape != (18,):
+        raise ValueError("factorized action selection requires exactly 18 logits")
+    joint = values.reshape(2, 9)
+    direction_scores = np.logaddexp.reduce(joint, axis=0)
+    speed_scores = np.logaddexp.reduce(joint, axis=1)
+    return (speed_scores[:, None] + direction_scores[None, :]).reshape(18)
+
+
 class ProficiencyRuntime:
     """Seeded motor/noise state for one policy episode."""
 
@@ -190,8 +223,18 @@ class PolicyConfig:
     proficiency_size: int = PROFICIENCY_VECTOR_SIZE
     action_count: int = 18
     inference_mode: str = "window"
+    local_feature_grid_size: int = 4
+    local_downsample_stages: int = 3
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.local_feature_grid_size, bool)
+            or not isinstance(self.local_feature_grid_size, int)
+            or self.local_feature_grid_size <= 0
+        ):
+            raise ValueError("local_feature_grid_size must be a positive integer")
+        if self.local_downsample_stages not in {2, 3}:
+            raise ValueError("local_downsample_stages must be 2 or 3")
         if self.proficiency_size not in {0, PROFICIENCY_VECTOR_SIZE}:
             raise ValueError(
                 f"proficiency_size must be 0 or {PROFICIENCY_VECTOR_SIZE}"
@@ -203,22 +246,41 @@ class PolicyConfig:
 if nn is not None:
 
     class _VisualEncoder(nn.Module):
-        def __init__(self, channels: int, output_size: int) -> None:
+        def __init__(
+            self,
+            channels: int,
+            output_size: int,
+            *,
+            feature_grid_size: int = 4,
+            downsample_stages: int = 3,
+        ) -> None:
             super().__init__()
+            if downsample_stages not in {2, 3}:
+                raise ValueError("downsample_stages must be 2 or 3")
             self.network = nn.Sequential(
                 nn.Conv2d(channels, 24, kernel_size=5, stride=2, padding=2),
                 nn.SiLU(),
                 nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1),
                 nn.SiLU(),
-                nn.Conv2d(48, 64, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(
+                    48,
+                    64,
+                    kernel_size=3,
+                    stride=2 if downsample_stages == 3 else 1,
+                    padding=1,
+                ),
                 nn.SiLU(),
                 # MPS does not implement every non-divisible adaptive-pool
                 # shape (global input reaches 7x6, local reaches 5x5). Fixed
                 # bilinear resampling retains coarse spatial layout on all
                 # supported devices.
-                nn.Upsample(size=(4, 4), mode="bilinear", align_corners=False),
+                nn.Upsample(
+                    size=(feature_grid_size, feature_grid_size),
+                    mode="bilinear",
+                    align_corners=False,
+                ),
                 nn.Flatten(),
-                nn.Linear(64 * 16, output_size),
+                nn.Linear(64 * feature_grid_size * feature_grid_size, output_size),
                 nn.LayerNorm(output_size),
                 nn.SiLU(),
             )
@@ -232,7 +294,12 @@ if nn is not None:
             super().__init__()
             self.config = config
             self.global_encoder = _VisualEncoder(config.channels, config.feature_size)
-            self.local_encoder = _VisualEncoder(config.channels, config.feature_size)
+            self.local_encoder = _VisualEncoder(
+                config.channels,
+                config.feature_size,
+                feature_grid_size=config.local_feature_grid_size,
+                downsample_stages=config.local_downsample_stages,
+            )
             recurrent_input = (
                 config.feature_size * 2
                 + config.memory_size
@@ -264,15 +331,15 @@ if nn is not None:
             ).reshape(batch, steps, -1)
             return torch.cat((global_features, local_features), dim=-1)
 
-        def forward_with_recurrent(
+        def forward_with_visual_features(
             self,
             global_frames: Tensor,
             local_frames: Tensor,
             memory: Tensor | None = None,
             proficiency: Tensor | None = None,
             hidden: Tensor | None = None,
-        ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-            """Run the policy and expose each decision's GRU hidden state."""
+        ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+            """Run one visual encoding and expose policy and feature outputs."""
 
             visual_features = self.encode_visual(global_frames, local_frames)
             batch, steps = global_frames.shape[:2]
@@ -313,7 +380,29 @@ if nn is not None:
                 self.risk_head(recurrent).squeeze(-1),
                 hidden,
                 recurrent,
+                visual_features,
             )
+
+        def forward_with_recurrent(
+            self,
+            global_frames: Tensor,
+            local_frames: Tensor,
+            memory: Tensor | None = None,
+            proficiency: Tensor | None = None,
+            hidden: Tensor | None = None,
+        ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+            """Run the policy and expose each decision's GRU hidden state."""
+
+            logits, risk, hidden, recurrent, _visual_features = (
+                self.forward_with_visual_features(
+                    global_frames,
+                    local_frames,
+                    memory,
+                    proficiency,
+                    hidden,
+                )
+            )
+            return logits, risk, hidden, recurrent
 
         def forward(
             self,

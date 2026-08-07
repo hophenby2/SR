@@ -755,6 +755,142 @@ v14 改善了路径、移动比例、底边驻留和跨 seed 稳健性，但 `>9
 持续性；仅有坐标轨迹的分析报告不能安全地反推出当时可见输入，也不能作为
 录制路线记忆注入当前 MPC。
 
+### 2026-08-06 第四个 adaptive development 候选
+
+第四个候选是一次性、仅供训练筛选的 selected-candidate confidence CV30 e6。
+它在完整复现 plain selector 后将 selector 和 ensemble-global candidate 冻结，
+再只用 fit split 中 anticipatory lead 4-10 的行训练独立 confidence head。正例
+表示冻结候选属于 `preferred_equivalent_actions`；不需要纠正的行显式作为负例。
+confidence loss 不向 selector 传播梯度，也没有 retry、epoch、seed、loss、mask、
+threshold 或聚合变体。membership head 的初始状态绑定第三个 dual-head 候选，
+去掉该 head 后的 base state 与 plain e6 逐位相同。
+
+正式 campaign 在训练或 audit 前即永久登记，固定输出路径、单 CPU 线程，并
+规定崩溃或失败同样消耗本次机会；每折 audit 只 forward 一次，fit、calibration
+和 audit 相互隔离。四个冻结 reference、代码、引用、parent、30 组来源 triplet
+及其 90 个文件均通过声明哈希校验，所有 selector/base 状态、梯度、有限值和
+恢复不变量也全部通过。正式报告为
+`tools/stg_lab/artifacts/policy-humanlike-highres-okuu3-selected-candidate-confidence-cv30-e6.json`，
+SHA-256 是
+`3b40ae00e2f01eb89f2ae67d4efef9f01737e4290efeb5c7a4fd042c2ce24804`。
+对应一次性 ledger 为
+`tools/stg_lab/artifacts/.policy-humanlike-highres-okuu3-selected-candidate-confidence-cv30-e6.started.json`，
+SHA-256 是
+`dda15e0a21a797be07ec121c34b626d5985cc05bb1eb3e42b5108d2204d91990`。
+
+三折合计 690 个 outer-audit 目标全部产生有限输出。selector 指标与 plain 和
+dual-head 完全相同，但三折都无法得到同时覆盖 fit 与 calibration early event
+的 fail-closed runtime：
+
+| 候选 | exact | equivalent | direction | speed | calibration 成功 | audit runtime eligible |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| plain | 89 | 138 | 138 | 437 | 0/3 | 0/3 |
+| balanced membership | 63 | 128 | 110 | 450 | 0/3 | 0/3 |
+| unweighted membership | 80 | 110 | 105 | 450 | 0/3 | 0/3 |
+| dual-head membership | 89 | 138 | 138 | 437 | 0/3 | 0/3 |
+| selected-candidate confidence | 89 | 138 | 138 | 437 | 0/3 | 0/3 |
+
+| fold | fit 标签 / 正例 | e6 最终 loss | audit 正例均值减负例均值 | 最低阈值下 fit / calibration 理论交集 |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 413 / 90 | 0.6678 | +0.00599 | 61 / 29 |
+| 1 | 421 / 113 | 0.6721 | +0.01916 | 65 / 4 |
+| 2 | 439 / 127 | 0.5990 | +0.01391 | 88 / 8 |
+
+理论候选交集不为空，但 confidence 对正确和错误冻结候选的排序差很小，整体
+置信度还明显高于实际正例率，因而不存在能在 fit/calibration 上保持零错误并
+覆盖 early event 的 fail-closed 阈值。失败来自候选正确性排序和可校准性不足，
+不是 selector 指标退化、物理安全预测故障或数值不稳定。预登记 gate 要求至少
+2/3 折 calibration 成功且至少 2/3 折 audit runtime eligible；实际为 `0/3`
+和 `0/3`，所以 `passed=false`、`eligible_for_fixed_followup=false`。
+
+该结果禁止继续训练同一候选的 e20，也禁止将 seed `10306..10310` 用作第四候选
+e20 的后续验证。它们未进入当前 CV30 来源不等于独立未使用：既有 artifacts
+已经记录 `10306`/`10307` 的原生与 DAgger 运行、`10308` 的 calibration 和
+`10310` 的 validation；因此整个编号组（包括 `10309`）都不能再声明为 pristine
+或独立 reserved seed。报告固定为 `training_only=true`、
+`acceptance_claim=false`、`deployment_eligible=false`，没有写出部署 checkpoint，
+也不是独立统计验证。它不能作为原生引擎运行、严格击破、通关成功率或真人水平
+证据。后续若继续开发，必须先登记为第五个 adaptive development 候选，并在
+查看其 audit 前冻结唯一目标和 gate；方向应是提高冻结候选正确性的排序与可校准
+性，而不是改写 plain selector 指标或加入手写路线记忆。
+
+### 2026-08-06 第五候选的 fit/cal-only 预检
+
+第五候选在登记正式 adaptive development screen 以前先执行只使用 fit 和
+calibration split 的可证伪预检。plain e6 selector、ensemble-global candidate
+和原有 gate/physical heads 均保持冻结且逐折复现 prior history；新增三成员 GRU
+对全部 18 个动作预测等价成员概率，最后才在冻结 candidate 位置 gather
+confidence。推理输入只有冻结 shared/action recurrent latent、selector 概率、
+mean/min onset gate、逐动作 physical danger mean/max 和 parent action one-hot；
+不读取 teacher、等价集、安全标签、路线、Lua timer、RNG 或手写相位记忆。
+verifier 固定为 hidden 96、bottleneck 48、24 epochs、AdamW `1e-3`、weight decay
+`1e-3`，loss 固定为 dense BCE、selected BCE、`2x` selected hard-negative
+pairwise 和 action-set rank；没有 epoch、seed、网络宽度或 loss 权重搜索。
+
+早期 v4 预检把 dense 和 selected loss 都限制在 anticipatory lead 4-10，设置内
+动态错误尾部校准后仅 `1/3` 折成功。报告为
+`tools/stg_lab/artifacts/policy-humanlike-highres-okuu3-temporal-action-set-verifier-fit-cal-probe-v4.json`，
+SHA-256 为
+`b87f4f5178af02510734338e29e246e7df411309ef9d8a2fe9b752dfee695adb`。
+v5 将 selected loss 扩到 `gate_valid && candidate != parent`，结果为 `0/3`，
+报告 SHA-256 为
+`6718e20ac3dca3cf8c7b45457fed58511887f6e24868889941018c47a0705b3c`。
+但代码审查随后发现 v4/v5 不能作为最终判定：运行时不要求 `gate_valid`，因此
+仍存在未监督的 gate-invalid changed-candidate；同时 float32 confidence 被转成
+Python double 后调用 `math.nextafter`，阈值与 float32 Tensor 比较时会回舍入为
+原分数，无法在 `>=` 语义下排除等值错误。对应测试原先使用 float64，没有覆盖
+真实执行 dtype。v5 因这两个实现缺陷仅保留为无效诊断，不能用于模型结论。
+
+corrected v6 保持模型与全部训练超参数不变，只修正两项语义：selected loss
+覆盖 fit 中所有 `candidate != parent` 的决策，gate-invalid 行明确作为负例；
+错误尾部直接保留来源 Tensor dtype，并用 `torch.nextafter` 取得 float32/float64
+的下一可表示值。score 恰为 1 时保留 inclusive 的饱和阈值 1.0，让该错误继续
+进入 gate inventory 和最终 fail-closed metrics，而不虚假声称已被 action
+threshold 排除。float32 回归证明旧阈值 `0.7500000000000001` 仍满足
+`float32(0.75) >= threshold`，新阈值 `0.7500000596046448` 才正确排除源分数。
+
+最终 v6 报告为
+`tools/stg_lab/artifacts/policy-humanlike-highres-okuu3-temporal-action-set-verifier-corrected-runtime-support-fit-cal-probe-v6.json`，
+SHA-256 为
+`1a66d60be75e00ab36e14f59fa7ea164abf80b2e572cd6f1c6247bb569d47c08`。
+三折 selector history 均与 plain reference 相同，verifier 输出全部有限，但
+calibration 仍为 `0/3`：
+
+| fold | fit 支持行 / gate-invalid / 正例 | fit 正负均值差 | calibration 支持行 / gate-invalid / 正例 | calibration 正负均值差 |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 12366 / 1699 / 688 | +0.03093 | 3077 / 432 / 211 | +0.02741 |
+| 1 | 12496 / 1717 / 659 | +0.02218 | 3175 / 418 / 139 | +0.01750 |
+| 2 | 11267 / 1313 / 721 | +0.03296 | 2825 / 345 / 151 | +0.02558 |
+
+| fold | fit 正例 max / 负例 max | calibration 正例 max / 负例 max |
+| ---: | ---: | ---: |
+| 0 | 0.53935 / 0.53522 | 0.51733 / 0.53303 |
+| 1 | 0.51451 / 0.51360 | 0.48228 / 0.47649 |
+| 2 | 0.54338 / 0.54057 | 0.49636 / 0.51662 |
+
+扩大监督域消除了声明与 runtime support 的错位，却把每折 selected 正例率降到
+约 5%-7%，跨 split 的正负尾部仍严重重叠；Fold 0/2 的 calibration 负例最大值
+直接超过正例最大值，Fold 1 的微小间隔也不能与 gate/physical 约束组合成同时
+覆盖 fit 和 calibration early event 的零错误 runtime。因此预定的 `>=2/3`
+门槛未满足，监督支持域假设被否定，不再通过增加 epoch、修改 loss 权重或继续
+试 threshold 追逐结果。
+
+三个预检都明确记录 `outer_audit_predictions=0`。第五候选没有创建 tracked
+preregistration、正式 campaign ledger 或正式 CV30 报告，没有读取当前 arm 的
+outer-audit prediction/metric，没有写出 checkpoint，也没有运行原生新 seed。
+所以它不能声明改善了 Stage 5 #3 行为、严格击破率或与真人 replay 的距离；当前
+可演示和可部署行为仍是前述 memory-free MPC v14，而不是这个 verifier。后续若
+继续模型路线，需要改变可见监督或取得与真人 replay 同步的可见观测，而不是把
+本次失败包装成已训练模型。
+
+本轮同时加入了尚未被正式候选调用的一次性 campaign 基础设施：固定 canonical
+路径、拒绝 symlink/hardlink/大小写 alias、O_EXCL ledger、同一 bytes 的 prereg
+哈希与解析、受保护输入快照和 audit 前复核，以及 Windows 映射盘不支持 hardlink
+时仍不覆盖既有文件的 exclusive JSON fallback。该基础设施的通过测试只证明
+防重试与跨平台文件语义，不表示第五候选获得了运行正式 audit 的资格。
+最终工作树运行 `uv run python -m pytest` 为 `996 passed`，source distribution
+和 wheel 均构建成功，错误级 Ruff、`compileall` 与 `git diff --check` 通过。
+
 ### 当前原生 Boss #3 严格结果
 
 保留的三次 CrossOver 验证都使用 CrossOver 26.3 + DXVK 启动新的原生 LuaSTG Sub 进程，从 Spell Practice reset 开始连续 `live_mpc` 闭环。v40/v41 是五帧观察延迟的持出验证，v42 是单列的零延迟回归；三局都使用区域动力学记忆 v2、`authority_state_shield=false` 和 `spell=false`。结果均在第 3816 帧由引擎确认 Boss HP `6000 -> 0`，自机 `death=0`，且 `unsafe_shot_frames=0`：

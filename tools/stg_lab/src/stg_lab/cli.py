@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -232,7 +232,11 @@ def _command_test(args: argparse.Namespace) -> int:
 def _merge_demonstrations(parts: Iterable[Any]):
     """Concatenate scenario datasets while preserving episode boundaries."""
 
-    from .training import Demonstrations, previous_actions_from_targets
+    from .training import (
+        TEACHER_ACTION_EVALUATION_FIELDS,
+        Demonstrations,
+        previous_actions_from_targets,
+    )
 
     values = tuple(parts)
     if not values:
@@ -285,6 +289,39 @@ def _merge_demonstrations(parts: Iterable[Any]):
             np.ones_like(item.actions, dtype=np.bool_)
             for item in values
         ], axis=0)
+    correction_mask = np.concatenate([
+        np.asarray(item.correction_mask, dtype=np.bool_)
+        for item in values
+    ], axis=0)
+    teacher_action_evaluations = None
+    teacher_action_regrets = None
+    teacher_action_evaluation_mask = None
+    if any(item.teacher_action_evaluations is not None for item in values):
+        teacher_action_evaluations = np.concatenate([
+            item.teacher_action_evaluations
+            if item.teacher_action_evaluations is not None else
+            np.zeros(
+                (
+                    *item.actions.shape,
+                    18,
+                    len(TEACHER_ACTION_EVALUATION_FIELDS),
+                ),
+                dtype=np.float32,
+            )
+            for item in values
+        ], axis=0)
+        teacher_action_regrets = np.concatenate([
+            item.teacher_action_regrets
+            if item.teacher_action_regrets is not None else
+            np.zeros((*item.actions.shape, 18), dtype=np.float32)
+            for item in values
+        ], axis=0)
+        teacher_action_evaluation_mask = np.concatenate([
+            item.teacher_action_evaluation_mask
+            if item.teacher_action_evaluation_mask is not None else
+            np.zeros(item.actions.shape, dtype=bool)
+            for item in values
+        ], axis=0)
     merged = Demonstrations(
         global_frames=np.concatenate([item.global_frames for item in values], axis=0),
         local_frames=np.concatenate([item.local_frames for item in values], axis=0),
@@ -295,6 +332,10 @@ def _merge_demonstrations(parts: Iterable[Any]):
         proficiency=proficiency,
         episode_ids=np.concatenate(episode_ids),
         supervision_mask=supervision_mask,
+        correction_mask=correction_mask,
+        teacher_action_evaluations=teacher_action_evaluations,
+        teacher_action_regrets=teacher_action_regrets,
+        teacher_action_evaluation_mask=teacher_action_evaluation_mask,
     )
     merged.validate()
     return merged
@@ -320,6 +361,22 @@ def _collect_demonstrations(args: argparse.Namespace) -> tuple[Any, dict[str, An
         datasets.append(demonstrations)
         scenario_reports[scenario] = summarize_episodes(episodes)
     return _merge_demonstrations(datasets), scenario_reports
+
+
+def _command_expand_previous_action_checkpoint(args: argparse.Namespace) -> int:
+    try:
+        from .training import expand_checkpoint_with_previous_action_context
+    except ImportError as error:
+        raise CLIError(
+            "checkpoint expansion requires the 'train' optional dependency set"
+        ) from error
+
+    report = expand_checkpoint_with_previous_action_context(
+        args.source,
+        args.output,
+    )
+    _emit_json(report, args.report)
+    return 0
 
 
 def _command_train(args: argparse.Namespace) -> int:
@@ -410,6 +467,8 @@ def _command_train(args: argparse.Namespace) -> int:
             int(demonstrations.proficiency.shape[-1])
         ),
         inference_mode=("stream" if args.stateful_tbptt else args.inference_mode),
+        local_feature_grid_size=args.local_feature_grid_size,
+        local_downsample_stages=args.local_downsample_stages,
     )
     training_data = {
         "path": str(args.demos or args.save_demos or "<collected-in-process>"),
@@ -426,6 +485,35 @@ def _command_train(args: argparse.Namespace) -> int:
         "previous_action_size": previous_action_size,
         "previous_action_offset": previous_action_offset,
         "proficiency_conditioning_input": demonstrations.proficiency is not None,
+        **(
+            {
+                "soft_action_targets": {
+                    "objective": (
+                        "negative_log_regret_weighted_acceptable_probability_mass"
+                    ),
+                    "loss_weight": args.soft_action_loss_weight,
+                    "collision_rank_weight": (
+                        args.soft_action_collision_rank_weight
+                    ),
+                    "collision_rank_margin": (
+                        args.soft_action_collision_rank_margin
+                    ),
+                    "temperature": args.soft_action_temperature,
+                    "safety_margin": args.soft_action_safety_margin,
+                    "hard_label_policy": (
+                        "teacher-evaluated rows use only the set-valued target; "
+                        "hard labels remain active only on rows without evaluations"
+                    ),
+                    "available_decisions": int(np.count_nonzero(
+                        demonstrations.teacher_action_evaluation_mask
+                    )),
+                    "model_input": False,
+                },
+            }
+            if args.soft_action_loss_weight > 0.0
+            and demonstrations.teacher_action_evaluation_mask is not None else
+            {}
+        ),
     }
     initial_model = None
     if args.init_checkpoint is not None and args.init_visual_encoder_checkpoint is not None:
@@ -488,11 +576,28 @@ def _command_train(args: argparse.Namespace) -> int:
         args.episode_balanced
         or args.correction_only
         or args.movement_onset_weight != 1.0
+        or args.movement_stop_weight != 1.0
+        or args.movement_speed_change_weight != 1.0
         or args.direction_change_weight != 1.0
         or args.exact_action_loss_weight != 1.0
         or args.direction_loss_weight != 0.0
         or args.speed_loss_weight != 0.0
         or args.direction_consistency_weight != 0.0
+        or args.action_consistency_weight != 0.0
+        or args.transition_action_rank_weight != 0.0
+        or args.movement_onset_rank_weight != 0.0
+        or args.movement_speed_change_rank_weight != 0.0
+        or args.motion_boundary_rank_weight != 0.0
+        or args.motion_boundary_rank_margin != 1.0
+        or args.motion_boundary_rank_lookback != 3
+        or args.safety_correction_pairwise_rank_weight != 0.0
+        or args.safety_correction_pairwise_rank_margin != 0.25
+        or args.safety_correction_top1_rank_weight != 0.0
+        or args.safety_correction_top1_rank_margin != 0.25
+        or args.safety_correction_minimal_edit_weight != 0.0
+        or args.safety_correction_minimal_edit_margin != 0.25
+        or args.initial_policy_kl_weight != 0.0
+        or args.policy_head_only
         or args.previous_action_dropout_probability != 0.0
         or args.future_visual_loss_weight != 0.0
         or tuple(args.future_visual_horizons) != (20, 40, 80)
@@ -506,6 +611,7 @@ def _command_train(args: argparse.Namespace) -> int:
             train_stateful_behavior_cloning,
         )
 
+        training_data["policy_head_only"] = args.policy_head_only
         training_config = StatefulTrainingConfig(
             seed=args.seed,
             epochs=args.epochs,
@@ -528,13 +634,54 @@ def _command_train(args: argparse.Namespace) -> int:
             ),
             restore_best_validation=args.restore_best_validation,
             movement_onset_weight=args.movement_onset_weight,
+            movement_stop_weight=args.movement_stop_weight,
+            movement_speed_change_weight=args.movement_speed_change_weight,
             direction_change_weight=args.direction_change_weight,
             episode_balanced=args.episode_balanced,
             exact_action_loss_weight=args.exact_action_loss_weight,
             direction_loss_weight=args.direction_loss_weight,
             speed_loss_weight=args.speed_loss_weight,
             direction_consistency_weight=args.direction_consistency_weight,
+            action_consistency_weight=args.action_consistency_weight,
+            transition_action_rank_weight=args.transition_action_rank_weight,
+            transition_action_rank_margin=args.transition_action_rank_margin,
+            movement_onset_rank_weight=args.movement_onset_rank_weight,
+            movement_speed_change_rank_weight=(
+                args.movement_speed_change_rank_weight
+            ),
+            motion_boundary_rank_weight=args.motion_boundary_rank_weight,
+            motion_boundary_rank_margin=args.motion_boundary_rank_margin,
+            motion_boundary_rank_lookback=args.motion_boundary_rank_lookback,
+            safety_correction_pairwise_rank_weight=(
+                args.safety_correction_pairwise_rank_weight
+            ),
+            safety_correction_pairwise_rank_margin=(
+                args.safety_correction_pairwise_rank_margin
+            ),
+            safety_correction_top1_rank_weight=(
+                args.safety_correction_top1_rank_weight
+            ),
+            safety_correction_top1_rank_margin=(
+                args.safety_correction_top1_rank_margin
+            ),
+            safety_correction_minimal_edit_weight=(
+                args.safety_correction_minimal_edit_weight
+            ),
+            safety_correction_minimal_edit_margin=(
+                args.safety_correction_minimal_edit_margin
+            ),
+            soft_action_loss_weight=args.soft_action_loss_weight,
+            soft_action_collision_rank_weight=(
+                args.soft_action_collision_rank_weight
+            ),
+            soft_action_collision_rank_margin=(
+                args.soft_action_collision_rank_margin
+            ),
+            soft_action_temperature=args.soft_action_temperature,
+            soft_action_safety_margin=args.soft_action_safety_margin,
+            initial_policy_kl_weight=args.initial_policy_kl_weight,
             correction_only=args.correction_only,
+            policy_head_only=args.policy_head_only,
             previous_action_dropout_probability=(
                 args.previous_action_dropout_probability
             ),
@@ -564,6 +711,15 @@ def _command_train(args: argparse.Namespace) -> int:
             risk_loss_weight=args.risk_loss_weight,
             class_balance=args.class_balance,
             class_balance_power=args.class_balance_power,
+            soft_action_loss_weight=args.soft_action_loss_weight,
+            soft_action_collision_rank_weight=(
+                args.soft_action_collision_rank_weight
+            ),
+            soft_action_collision_rank_margin=(
+                args.soft_action_collision_rank_margin
+            ),
+            soft_action_temperature=args.soft_action_temperature,
+            soft_action_safety_margin=args.soft_action_safety_margin,
             device=args.device,
         )
         _, history = train_behavior_cloning(
@@ -599,13 +755,125 @@ def _command_train(args: argparse.Namespace) -> int:
         "stateful_loss_controls": (
             {
                 "movement_onset_weight": args.movement_onset_weight,
+                "movement_stop_weight": args.movement_stop_weight,
+                "movement_speed_change_weight": (
+                    args.movement_speed_change_weight
+                ),
                 "direction_change_weight": args.direction_change_weight,
                 "episode_balanced": args.episode_balanced,
+                "policy_head_only": args.policy_head_only,
                 "exact_action_loss_weight": args.exact_action_loss_weight,
                 "direction_loss_weight": args.direction_loss_weight,
                 "speed_loss_weight": args.speed_loss_weight,
                 "direction_consistency_weight": (
                     args.direction_consistency_weight
+                ),
+                "action_consistency_weight": args.action_consistency_weight,
+                **(
+                    {
+                        "transition_action_rank_weight": (
+                            args.transition_action_rank_weight
+                        ),
+                        "transition_action_rank_margin": (
+                            args.transition_action_rank_margin
+                        ),
+                    }
+                    if args.transition_action_rank_weight > 0.0 else {}
+                ),
+                **(
+                    {
+                        "movement_onset_rank_weight": (
+                            args.movement_onset_rank_weight
+                        ),
+                        "movement_onset_rank_margin": (
+                            args.transition_action_rank_margin
+                        ),
+                        "movement_onset_rank_margin_source": (
+                            "shared_transition_action_rank_margin"
+                        ),
+                    }
+                    if args.movement_onset_rank_weight > 0.0 else {}
+                ),
+                **(
+                    {
+                        "movement_speed_change_rank_weight": (
+                            args.movement_speed_change_rank_weight
+                        ),
+                        "movement_speed_change_rank_margin": (
+                            args.transition_action_rank_margin
+                        ),
+                        "movement_speed_change_rank_margin_source": (
+                            "shared_transition_action_rank_margin"
+                        ),
+                    }
+                    if args.movement_speed_change_rank_weight > 0.0 else {}
+                ),
+                **(
+                    {
+                        "motion_boundary_rank_weight": (
+                            args.motion_boundary_rank_weight
+                        ),
+                        "motion_boundary_rank_margin": (
+                            args.motion_boundary_rank_margin
+                        ),
+                        "motion_boundary_rank_lookback": (
+                            args.motion_boundary_rank_lookback
+                        ),
+                    }
+                    if args.motion_boundary_rank_weight > 0.0 else {}
+                ),
+                **(
+                    {
+                        "safety_correction_pairwise_rank_weight": (
+                            args.safety_correction_pairwise_rank_weight
+                        ),
+                        "safety_correction_pairwise_rank_margin": (
+                            args.safety_correction_pairwise_rank_margin
+                        ),
+                    }
+                    if args.safety_correction_pairwise_rank_weight > 0.0 else {}
+                ),
+                **(
+                    {
+                        "safety_correction_top1_rank_weight": (
+                            args.safety_correction_top1_rank_weight
+                        ),
+                        "safety_correction_top1_rank_margin": (
+                            args.safety_correction_top1_rank_margin
+                        ),
+                    }
+                    if args.safety_correction_top1_rank_weight > 0.0 else {}
+                ),
+                **(
+                    {
+                        "safety_correction_minimal_edit_weight": (
+                            args.safety_correction_minimal_edit_weight
+                        ),
+                        "safety_correction_minimal_edit_margin": (
+                            args.safety_correction_minimal_edit_margin
+                        ),
+                    }
+                    if args.safety_correction_minimal_edit_weight > 0.0 else {}
+                ),
+                **(
+                    {
+                        "initial_policy_kl_weight": args.initial_policy_kl_weight,
+                    }
+                    if args.initial_policy_kl_weight > 0.0 else {}
+                ),
+                **(
+                    {
+                        "soft_action_loss_weight": args.soft_action_loss_weight,
+                        "soft_action_collision_rank_weight": (
+                            args.soft_action_collision_rank_weight
+                        ),
+                        "soft_action_collision_rank_margin": (
+                            args.soft_action_collision_rank_margin
+                        ),
+                        "soft_action_temperature": args.soft_action_temperature,
+                        "soft_action_safety_margin": args.soft_action_safety_margin,
+                    }
+                    if args.soft_action_loss_weight > 0.0 else {}
                 ),
                 "previous_action_dropout_probability": (
                     args.previous_action_dropout_probability
@@ -631,7 +899,7 @@ def _command_train(args: argparse.Namespace) -> int:
 
 def _command_merge_demos(args: argparse.Namespace) -> int:
     from .provenance import file_sha256
-    from .training import Demonstrations
+    from .training import TEACHER_ACTION_EVALUATION_FIELDS, Demonstrations
 
     demonstrations = _merge_demonstrations(
         Demonstrations.load(path) for path in args.inputs
@@ -661,6 +929,20 @@ def _command_merge_demos(args: argparse.Namespace) -> int:
             if demonstrations.supervision_mask is None else
             int(np.count_nonzero(demonstrations.supervision_mask))
         ),
+        "correction_labels": int(np.count_nonzero(
+            demonstrations.correction_mask
+        )),
+        "teacher_action_evaluations": (
+            None
+            if demonstrations.teacher_action_evaluation_mask is None else
+            {
+                "available_decisions": int(np.count_nonzero(
+                    demonstrations.teacher_action_evaluation_mask
+                )),
+                "action_count": 18,
+                "fields": list(TEACHER_ACTION_EVALUATION_FIELDS),
+            }
+        ),
     }
     _emit_json(report, args.manifest)
     return 0
@@ -674,6 +956,7 @@ def _command_contextualize_demos(args: argparse.Namespace) -> int:
         args.source_manifest,
         args.output,
         include_previous_action=args.previous_action_conditioning,
+        include_proficiency=args.proficiency_conditioning,
     )
     _emit_json(report, args.manifest)
     return 0
@@ -688,6 +971,10 @@ def _command_relabel_dagger(args: argparse.Namespace) -> int:
         args.output,
         args.manifest,
         interventions_only=args.interventions_only,
+        safety_interventions_only=args.safety_interventions_only,
+        hard_intervention_labels=args.hard_intervention_labels,
+        teacher_evaluation_context=args.teacher_evaluation_context,
+        minimum_safety_margin_gain=args.minimum_safety_margin_gain,
     )
     _emit_json(report)
     return 0
@@ -963,6 +1250,74 @@ def _command_engine_replay_analyze(args: argparse.Namespace) -> int:
     return 0 if report["analysis_complete"] else 1
 
 
+def _command_engine_replay_collect_demos(args: argparse.Namespace) -> int:
+    from .engine import EngineClient
+    from .engine_replay_dataset import (
+        ReplayDemonstrationConfig,
+        collect_replay_demonstrations,
+        save_replay_demonstrations,
+    )
+    from .vision import VisionConfig
+
+    replay_file = args.replay_file or Path(args.replay)
+    config = ReplayDemonstrationConfig(
+        max_frames=args.max_frames,
+        decision_interval=args.decision_interval,
+        decision_phase_offset=args.decision_phase_offset,
+        action_projection=args.action_projection,
+        vision=VisionConfig(
+            global_width=args.global_size[0],
+            global_height=args.global_size[1],
+            local_width=args.local_size[0],
+            local_height=args.local_size[1],
+            local_extent_x=args.local_extent[0],
+            local_extent_y=args.local_extent[1],
+            history=1,
+            observation_delay=args.observation_delay,
+        ),
+        render=args.render,
+        render_every=args.render_every,
+    )
+    with EngineClient.connect(args.host, args.port, timeout=args.timeout) as client:
+        report, builder = collect_replay_demonstrations(
+            client,
+            replay_path=args.replay,
+            replay_file=replay_file,
+            config=config,
+        )
+    supervision = report.get("action_supervision")
+    supervised_decisions = (
+        supervision.get("supervised_decisions", 0)
+        if isinstance(supervision, Mapping) else 0
+    )
+    if (
+        report["strict_success"] is True
+        and builder.accepted_count
+        and supervised_decisions > 0
+    ):
+        manifest_path = args.demos_manifest or args.save_demos.with_suffix(
+            ".manifest.json",
+        )
+        report["demonstrations"] = save_replay_demonstrations(
+            builder,
+            report,
+            args.save_demos,
+            manifest_path,
+        )
+    else:
+        report["demonstrations"] = {
+            "saved": False,
+            "reason": (
+                "replay has no execution-exact held-action labels"
+                if report["strict_success"] is True else
+                "replay did not complete the attack with death=0, continuous "
+                "shoot, and spell/special=false"
+            ),
+        }
+    _emit_json(report, args.output)
+    return 0 if report["strict_success"] and supervised_decisions > 0 else 1
+
+
 def _command_engine_play(args: argparse.Namespace) -> int:
     from .engine import EngineClient
     from .engine_play import (
@@ -981,6 +1336,13 @@ def _command_engine_play(args: argparse.Namespace) -> int:
         args.route_artifact is not None or args.library_artifact is not None
     ):
         raise CLIError("--stage currently requires a visual-policy checkpoint")
+    if args.residual_adapter is not None and args.checkpoint is None:
+        raise CLIError("--residual-adapter requires --checkpoint")
+    if (
+        args.residual_adapter is not None
+        and args.policy_action_selection != "joint"
+    ):
+        raise CLIError("--residual-adapter requires joint policy action selection")
     episode_scenario = args.stage or args.scenario
     episode_attack = None if args.stage is not None else args.attack
     if args.route_artifact is not None:
@@ -1007,6 +1369,16 @@ def _command_engine_play(args: argparse.Namespace) -> int:
         if not args.checkpoint.is_file():
             raise CLIError(f"checkpoint does not exist: {args.checkpoint}")
         model, checkpoint = _load_checkpoint(args.checkpoint, args.device)
+        residual_metadata = None
+        if args.residual_adapter is not None:
+            from .residual_adapter import load_residual_adapter
+
+            model, residual_metadata = load_residual_adapter(
+                model,
+                args.residual_adapter,
+                parent_checkpoint=args.checkpoint,
+                device=args.device,
+            )
         difficulty = (
             args.scenario.rsplit(":", 1)[-1].lower()
             if args.stage is None else
@@ -1030,12 +1402,21 @@ def _command_engine_play(args: argparse.Namespace) -> int:
             device=args.device,
             proficiency=args.proficiency,
             seed=args.seed,
+            action_selection=args.policy_action_selection,
         )
         metadata = {
-            "kind": "visual_policy",
+            "kind": (
+                "visual_policy_with_learned_residual_adapter"
+                if residual_metadata is not None else
+                "visual_policy"
+            ),
+            "action_selection": args.policy_action_selection,
+            "action_selection_uses_safety_state": False,
             "checkpoint": args.checkpoint,
             "checkpoint_metadata": _checkpoint_metadata(args.checkpoint, checkpoint),
         }
+        if residual_metadata is not None:
+            metadata["residual_adapter"] = residual_metadata
 
     config = EnginePlayConfig(
         max_frames=args.max_frames,
@@ -1048,6 +1429,7 @@ def _command_engine_play(args: argparse.Namespace) -> int:
         visible_safety_minimum_margin=args.visible_safety_minimum_margin,
         render=args.render,
         render_every=args.render_every,
+        replay_name=args.replay_name,
     )
     builder = None
     episode = None
@@ -1272,11 +1654,26 @@ def _command_engine_dagger_play(args: argparse.Namespace) -> int:
     from .native_dataset import NativeDemonstrationBuilder, NativeEpisodeIdentity
     from .provenance import file_sha256
 
+    if (
+        args.residual_adapter is not None
+        and args.policy_action_selection != "joint"
+    ):
+        raise CLIError("--residual-adapter requires joint policy action selection")
     if not args.checkpoint.is_file():
         raise CLIError(f"checkpoint does not exist: {args.checkpoint}")
     if args.stage is not None and args.region_dynamics_memory is not None:
         raise CLIError("--region-dynamics-memory cannot be used with --stage")
     model, checkpoint = _load_checkpoint(args.checkpoint, args.device)
+    residual_metadata = None
+    if args.residual_adapter is not None:
+        from .residual_adapter import load_residual_adapter
+
+        model, residual_metadata = load_residual_adapter(
+            model,
+            args.residual_adapter,
+            parent_checkpoint=args.checkpoint,
+            device=args.device,
+        )
     if getattr(getattr(model, "config", None), "inference_mode", None) != "stream":
         raise CLIError("engine-dagger-play requires a streaming policy checkpoint")
     episode_scenario = args.stage or args.scenario
@@ -1304,6 +1701,7 @@ def _command_engine_dagger_play(args: argparse.Namespace) -> int:
         device=args.device,
         proficiency=args.proficiency,
         seed=args.seed,
+        action_selection=args.policy_action_selection,
     )
     region_memory = (
         None
@@ -1331,9 +1729,12 @@ def _command_engine_dagger_play(args: argparse.Namespace) -> int:
         teacher_probability=args.teacher_probability,
         intervention_margin=args.intervention_margin,
         intervention_regret=args.intervention_regret,
+        minimum_safety_margin_gain=args.minimum_safety_margin_gain,
+        student_only_prefix_frames=args.student_only_prefix_frames,
         intervene_on_disagreement=args.intervene_on_disagreement,
         shoot_minimum_margin=args.shoot_minimum_margin,
         supervision_mode=args.supervision_mode,
+        record_teacher_evaluations=args.record_teacher_evaluations,
         render=args.render,
         render_every=args.render_every,
     )
@@ -1364,10 +1765,19 @@ def _command_engine_dagger_play(args: argparse.Namespace) -> int:
         )
     report["profile"] = args.profile
     report["controller"]["student"].update({
+        "action_selection": args.policy_action_selection,
+        "action_selection_uses_safety_state": False,
         "checkpoint": str(args.checkpoint),
         "checkpoint_sha256": file_sha256(args.checkpoint),
         "checkpoint_metadata": _checkpoint_metadata(args.checkpoint, checkpoint),
     })
+    if residual_metadata is not None:
+        report["controller"]["student"]["residual_adapter"] = residual_metadata
+        residual_stats = getattr(student.model, "residual_runtime_stats", None)
+        if callable(residual_stats):
+            report["controller"]["student"][
+                "residual_adapter_runtime"
+            ] = residual_stats()
     if args.region_dynamics_memory is not None:
         report["controller"]["teacher"].update({
             "region_dynamics_memory": str(args.region_dynamics_memory),
@@ -1490,6 +1900,7 @@ def _command_engine_policy_matrix(args: argparse.Namespace) -> int:
             device=args.device,
             proficiency=proficiency,
             seed=seed,
+            action_selection=args.policy_action_selection,
         )
 
     config = EnginePlayConfig(
@@ -1506,6 +1917,8 @@ def _command_engine_policy_matrix(args: argparse.Namespace) -> int:
     )
     metadata = {
         "kind": "streaming_visual_policy",
+        "action_selection": args.policy_action_selection,
+        "action_selection_uses_safety_state": False,
         "checkpoint": str(args.checkpoint),
         "checkpoint_sha256": file_sha256(args.checkpoint),
         "checkpoint_metadata": _jsonable(
@@ -1784,6 +2197,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     test_parser.set_defaults(handler=_command_test)
 
+    expand_checkpoint_parser = subparsers.add_parser(
+        "expand-previous-action-checkpoint",
+        help=(
+            "expand a two-value scenario-conditioned checkpoint with an "
+            "inert 18-way previous-action input"
+        ),
+    )
+    expand_checkpoint_parser.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="source checkpoint with memory_size=2 and no previous-action input",
+    )
+    expand_checkpoint_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="write the expanded memory_size=20 checkpoint here",
+    )
+    expand_checkpoint_parser.add_argument(
+        "--report",
+        type=Path,
+        help="optionally write the conversion audit JSON here",
+    )
+    expand_checkpoint_parser.set_defaults(
+        handler=_command_expand_previous_action_checkpoint,
+    )
+
     train_parser = subparsers.add_parser("train", help="train from planner demonstrations")
     _add_scenario_arguments(train_parser)
     _add_simulation_arguments(train_parser)
@@ -1827,7 +2268,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help=(
             "action-loss multiplier when the teacher starts moving after a "
-            "stationary decision; derived only from adjacent episode actions"
+            "stationary decision; one masked exact-hold transition window may "
+            "be bridged"
+        ),
+    )
+    train_parser.add_argument(
+        "--movement-stop-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "action-loss multiplier when the teacher stops after moving; one "
+            "masked exact-hold transition window may be bridged"
+        ),
+    )
+    train_parser.add_argument(
+        "--movement-speed-change-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "action-loss multiplier when a moving teacher changes focused speed "
+            "without changing move_xy; one masked exact-hold transition window "
+            "may be bridged"
         ),
     )
     train_parser.add_argument(
@@ -1867,6 +2328,175 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     train_parser.add_argument(
+        "--action-consistency-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "penalize adjacent 18-way action-distribution changes only while the "
+            "teacher direction and focused-speed state are both unchanged"
+        ),
+    )
+    train_parser.add_argument(
+        "--transition-action-rank-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "hinge-loss weight requiring the labelled action to be the top "
+            "choice at reliable supervised motion transitions"
+        ),
+    )
+    train_parser.add_argument(
+        "--transition-action-rank-margin",
+        type=float,
+        default=1.0,
+        help=(
+            "minimum labelled-action logit lead shared by generic transition, "
+            "movement-onset, and focused-speed-change ranking losses"
+        ),
+    )
+    train_parser.add_argument(
+        "--movement-onset-rank-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "independent per-episode hinge-loss weight for reliable hard-supervised "
+            "stationary-to-moving transitions; uses --transition-action-rank-margin"
+        ),
+    )
+    train_parser.add_argument(
+        "--movement-speed-change-rank-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "independent per-episode hinge-loss weight for reliable focused-speed "
+            "changes while move_xy is held"
+        ),
+    )
+    train_parser.add_argument(
+        "--motion-boundary-rank-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "two-sided per-episode rank weight for onset, stop, turn, and speed "
+            "boundaries in strict-success demonstration episodes; requires "
+            "--episode-balanced"
+        ),
+    )
+    train_parser.add_argument(
+        "--motion-boundary-rank-margin",
+        type=float,
+        default=1.0,
+        help="minimum old/new action-logit lead on each side of a motion boundary",
+    )
+    train_parser.add_argument(
+        "--motion-boundary-rank-lookback",
+        type=int,
+        choices=(1, 2, 3),
+        default=3,
+        help="reliable old-action hard states paired with each future boundary",
+    )
+    train_parser.add_argument(
+        "--safety-correction-pairwise-rank-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "per-episode hinge-loss weight requiring each correction_mask "
+            "teacher action to outrank the frozen initial policy argmax; "
+            "requires --episode-balanced"
+        ),
+    )
+    train_parser.add_argument(
+        "--safety-correction-pairwise-rank-margin",
+        type=float,
+        default=0.25,
+        help=(
+            "minimum corrected-action logit lead over the frozen initial "
+            "policy argmax"
+        ),
+    )
+    train_parser.add_argument(
+        "--safety-correction-top1-rank-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "per-episode hinge-loss weight requiring each correction_mask "
+            "teacher action to outrank every current alternative; requires "
+            "--episode-balanced"
+        ),
+    )
+    train_parser.add_argument(
+        "--safety-correction-top1-rank-margin",
+        type=float,
+        default=0.25,
+        help=(
+            "minimum corrected-action logit lead over the strongest current "
+            "nonpreferred action"
+        ),
+    )
+    train_parser.add_argument(
+        "--safety-correction-minimal-edit-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "per-episode KL weight for a frozen-parent target that changes only "
+            "the correction_mask preferred action; requires --episode-balanced"
+        ),
+    )
+    train_parser.add_argument(
+        "--safety-correction-minimal-edit-margin",
+        type=float,
+        default=0.25,
+        help=(
+            "preferred target-logit lead over the frozen parent's maximum while "
+            "retaining every other parent logit"
+        ),
+    )
+    train_parser.add_argument(
+        "--soft-action-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "maximize probability mass assigned to MPC-certified alternative "
+            "safe actions; requires recorded teacher evaluations"
+        ),
+    )
+    train_parser.add_argument(
+        "--soft-action-collision-rank-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "require the best acceptable action logit to outrank every "
+            "MPC-predicted collision without selecting one safe route"
+        ),
+    )
+    train_parser.add_argument(
+        "--soft-action-collision-rank-margin",
+        type=float,
+        default=1.0,
+        help="minimum logit gap between an acceptable action and collisions",
+    )
+    train_parser.add_argument(
+        "--soft-action-temperature",
+        type=float,
+        default=4.0,
+        help="clearance-regret temperature for acceptable-action weights",
+    )
+    train_parser.add_argument(
+        "--soft-action-safety-margin",
+        type=float,
+        default=12.0,
+        help="minimum MPC clearance for an alternative action to be acceptable",
+    )
+    train_parser.add_argument(
+        "--initial-policy-kl-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "distill the frozen initial checkpoint while learning corrective "
+            "states, preventing unrelated closed-loop behavior drift"
+        ),
+    )
+    train_parser.add_argument(
         "--episode-balanced",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1888,6 +2518,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "apply stateful action loss only at true supervision_mask entries "
             "while retaining complete episodes and risk targets from every decision"
+        ),
+    )
+    train_parser.add_argument(
+        "--policy-head-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "freeze the visual encoders, GRU, and risk head while training only "
+            "the final action policy_head; incompatible with future visual loss"
         ),
     )
     train_parser.add_argument(
@@ -1968,6 +2607,25 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--feature-size", type=int, default=96)
     train_parser.add_argument("--recurrent-size", type=int, default=128)
     train_parser.add_argument(
+        "--local-feature-grid-size",
+        type=int,
+        default=4,
+        help=(
+            "local visual encoder output grid; use 8 with two downsampling "
+            "stages to preserve narrow bullet gaps"
+        ),
+    )
+    train_parser.add_argument(
+        "--local-downsample-stages",
+        type=int,
+        choices=(2, 3),
+        default=3,
+        help=(
+            "number of stride-2 stages in the local visual encoder; legacy "
+            "checkpoints use 3"
+        ),
+    )
+    train_parser.add_argument(
         "--memory-size",
         type=int,
         default=None,
@@ -2024,6 +2682,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="append the previous executed 18-way motor action as one-hot context",
     )
+    context_parser.add_argument(
+        "--proficiency-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "attach each episode's novice/intermediate/expert manifest profile "
+            "as a trainable policy condition"
+        ),
+    )
     context_parser.set_defaults(handler=_command_contextualize_demos)
 
     relabel_dagger_parser = subparsers.add_parser(
@@ -2046,6 +2713,43 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "mark only teacher_intervened decisions in supervision_mask while "
             "retaining the complete successful episode"
+        ),
+    )
+    relabel_dagger_parser.add_argument(
+        "--teacher-evaluation-context",
+        type=int,
+        help=(
+            "retain set-valued teacher evaluations only within this many "
+            "decisions before or after a real intervention"
+        ),
+    )
+    relabel_dagger_parser.add_argument(
+        "--safety-interventions-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "with --interventions-only, supervise only predicted-collision, "
+            "minimum-margin, and clearance-regret interventions while keeping "
+            "policy disagreements as unsupervised context"
+        ),
+    )
+    relabel_dagger_parser.add_argument(
+        "--hard-intervention-labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "with --interventions-only, train real teacher interventions as "
+            "exclusive hard labels while retaining other teacher evaluations "
+            "as set-valued soft targets"
+        ),
+    )
+    relabel_dagger_parser.add_argument(
+        "--minimum-safety-margin-gain",
+        type=float,
+        help=(
+            "with --safety-interventions-only, supervise only action-changing "
+            "interventions whose teacher prediction improves minimum clearance "
+            "by at least this amount"
         ),
     )
     relabel_dagger_parser.set_defaults(handler=_command_relabel_dagger)
@@ -2182,6 +2886,84 @@ def build_parser() -> argparse.ArgumentParser:
     replay_analysis_parser.add_argument("--output", type=Path)
     replay_analysis_parser.set_defaults(handler=_command_engine_replay_analyze)
 
+    replay_demos_parser = subparsers.add_parser(
+        "engine-replay-collect-demos",
+        help=(
+            "collect causal delayed-visible movement demonstrations from a "
+            "strictly successful native human replay"
+        ),
+    )
+    replay_demos_parser.add_argument("--host", default="127.0.0.1")
+    replay_demos_parser.add_argument("--port", type=int, default=24816)
+    replay_demos_parser.add_argument("--timeout", type=float, default=30.0)
+    replay_demos_parser.add_argument(
+        "--replay",
+        required=True,
+        help="replay path interpreted by the LuaSTG process",
+    )
+    replay_demos_parser.add_argument(
+        "--replay-file",
+        type=Path,
+        help=(
+            "same replay on the Python filesystem; defaults to --replay when "
+            "both processes share a working directory"
+        ),
+    )
+    replay_demos_parser.add_argument("--save-demos", type=Path, required=True)
+    replay_demos_parser.add_argument("--demos-manifest", type=Path)
+    replay_demos_parser.add_argument("--max-frames", type=int, default=120_000)
+    replay_demos_parser.add_argument("--decision-interval", type=int, default=3)
+    replay_demos_parser.add_argument(
+        "--decision-phase-offset",
+        type=int,
+        choices=range(3),
+        default=0,
+        help=(
+            "shift the offline three-frame sampling boundary by 0, 1, or 2 "
+            "native replay frames; the offset is never a model input"
+        ),
+    )
+    replay_demos_parser.add_argument(
+        "--action-aggregation",
+        "--action-projection",
+        dest="action_projection",
+        choices=("exact-hold", "first", "midpoint", "modal"),
+        default="exact-hold",
+        help=(
+            "aggregate native frame inputs at the three-frame policy rate; "
+            "exact-hold (default) supervises only true holds and keeps mixed "
+            "windows as unsupervised context, while first/midpoint/modal retain "
+            "the legacy lossy projection for compatible ablations"
+        ),
+    )
+    replay_demos_parser.add_argument("--observation-delay", type=int, default=5)
+    replay_demos_parser.add_argument(
+        "--global-size", type=int, nargs=2, default=(48, 56), metavar=("W", "H"),
+    )
+    replay_demos_parser.add_argument(
+        "--local-size", type=int, nargs=2, default=(40, 40), metavar=("W", "H"),
+    )
+    replay_demos_parser.add_argument(
+        "--local-extent",
+        type=float,
+        nargs=2,
+        default=(72.0, 72.0),
+        metavar=("X", "Y"),
+    )
+    replay_demos_parser.add_argument(
+        "--render",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    replay_demos_parser.add_argument("--render-every", type=int, default=1)
+    replay_demos_parser.add_argument("--output", type=Path)
+    replay_demos_parser.set_defaults(handler=_command_engine_replay_collect_demos)
+
+    from .policy import (
+        available_policy_action_selections,
+        available_proficiencies,
+    )
+
     engine_play_parser = subparsers.add_parser(
         "engine-play",
         help="demonstrate a delayed-visible controller in a live attack or stage",
@@ -2202,6 +2984,14 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--route-artifact", type=Path)
     source.add_argument("--library-artifact", type=Path)
     source.add_argument("--checkpoint", type=Path)
+    engine_play_parser.add_argument(
+        "--residual-adapter",
+        type=Path,
+        help=(
+            "optional learned correction adapter bound to the exact frozen "
+            "--checkpoint; unsupported for route controllers"
+        ),
+    )
     engine_play_parser.add_argument("--memory-database", type=Path)
     engine_play_parser.add_argument("--memory-id", type=int)
     engine_play_parser.add_argument(
@@ -2211,8 +3001,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     engine_play_parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
     engine_play_parser.add_argument("--policy-scenario-key")
-    from .policy import available_proficiencies
-
+    engine_play_parser.add_argument(
+        "--policy-action-selection",
+        choices=available_policy_action_selections(),
+        default="joint",
+        help="decode model logits jointly or through direction/speed marginals",
+    )
     engine_play_parser.add_argument(
         "--proficiency",
         choices=available_proficiencies(),
@@ -2274,6 +3068,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="save executed streaming-policy actions only after strict native success",
     )
     engine_play_parser.add_argument("--demos-manifest", type=Path)
+    engine_play_parser.add_argument(
+        "--replay-name",
+        help=(
+            "save this attack or stage as a verified native THlib replay; "
+            "failed episodes are also saved with their actual termination reason"
+        ),
+    )
     engine_play_parser.add_argument(
         "--render",
         action=argparse.BooleanOptionalAction,
@@ -2438,9 +3239,23 @@ def build_parser() -> argparse.ArgumentParser:
     engine_dagger_parser.add_argument("--player", default="reimu_player")
     engine_dagger_parser.add_argument("--checkpoint", type=Path, required=True)
     engine_dagger_parser.add_argument(
+        "--residual-adapter",
+        type=Path,
+        help=(
+            "optional learned correction adapter bound to the exact frozen "
+            "--checkpoint; requires joint action selection"
+        ),
+    )
+    engine_dagger_parser.add_argument(
         "--device", choices=("cpu", "mps", "cuda"), default="cpu",
     )
     engine_dagger_parser.add_argument("--policy-scenario-key")
+    engine_dagger_parser.add_argument(
+        "--policy-action-selection",
+        choices=available_policy_action_selections(),
+        default="joint",
+        help="decode student logits jointly or through direction/speed marginals",
+    )
     engine_dagger_parser.add_argument(
         "--proficiency",
         choices=available_proficiencies(),
@@ -2489,6 +3304,25 @@ def build_parser() -> argparse.ArgumentParser:
     engine_dagger_parser.add_argument("--intervention-margin", type=float, default=12.0)
     engine_dagger_parser.add_argument("--intervention-regret", type=float, default=8.0)
     engine_dagger_parser.add_argument(
+        "--student-only-prefix-frames",
+        type=int,
+        default=0,
+        help=(
+            "training-only DAgger schedule: execute the frozen student for this "
+            "many initial native frames while still recording teacher evidence"
+        ),
+    )
+    engine_dagger_parser.add_argument(
+        "--minimum-safety-margin-gain",
+        type=float,
+        help=(
+            "execute predicted-collision, minimum-margin, and clearance-regret "
+            "teacher interventions only when the teacher improves predicted "
+            "minimum margin by at least this amount; scheduled and policy-"
+            "disagreement interventions are unchanged"
+        ),
+    )
+    engine_dagger_parser.add_argument(
         "--intervene-on-disagreement",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2510,6 +3344,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--region-dynamics-memory",
         type=Path,
         help="optional phase/topology teacher memory; never exposed to the student",
+    )
+    engine_dagger_parser.add_argument(
+        "--record-teacher-evaluations",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "store all 18 MPC candidate evaluations and regrets in the strict "
+            "demonstration archive"
+        ),
     )
     engine_dagger_parser.add_argument(
         "--render", action=argparse.BooleanOptionalAction, default=False,
@@ -2608,6 +3451,12 @@ def build_parser() -> argparse.ArgumentParser:
     engine_policy_matrix_parser.add_argument("--checkpoint", type=Path, required=True)
     engine_policy_matrix_parser.add_argument(
         "--device", choices=("cpu", "mps", "cuda"), default="cpu",
+    )
+    engine_policy_matrix_parser.add_argument(
+        "--policy-action-selection",
+        choices=available_policy_action_selections(),
+        default="joint",
+        help="decode model logits jointly or through direction/speed marginals",
     )
     engine_policy_matrix_parser.add_argument(
         "--scenario",
@@ -2841,8 +3690,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_size",
         "feature_size",
         "recurrent_size",
+        "local_feature_grid_size",
+        "local_downsample_stages",
         "tbptt_chunk_length",
         "movement_onset_weight",
+        "movement_stop_weight",
+        "movement_speed_change_weight",
         "direction_change_weight",
         "port",
         "attack",
@@ -2877,6 +3730,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--timeout must be positive")
     if hasattr(args, "memory_id") and args.memory_id is not None and args.memory_id <= 0:
         parser.error("--memory-id must be positive")
+    if (
+        hasattr(args, "minimum_safety_margin_gain")
+        and args.minimum_safety_margin_gain is not None
+        and args.minimum_safety_margin_gain < 0.0
+    ):
+        parser.error("--minimum-safety-margin-gain cannot be negative")
     for name in (
         "weight_decay",
         "risk_loss_weight",
@@ -2884,6 +3743,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "direction_loss_weight",
         "speed_loss_weight",
         "direction_consistency_weight",
+        "action_consistency_weight",
+        "transition_action_rank_weight",
+        "transition_action_rank_margin",
+        "movement_onset_rank_weight",
+        "movement_speed_change_rank_weight",
+        "safety_correction_pairwise_rank_weight",
+        "safety_correction_pairwise_rank_margin",
+        "safety_correction_top1_rank_weight",
+        "safety_correction_top1_rank_margin",
+        "safety_correction_minimal_edit_weight",
+        "safety_correction_minimal_edit_margin",
+        "soft_action_collision_rank_weight",
+        "soft_action_collision_rank_margin",
+        "initial_policy_kl_weight",
         "future_visual_loss_weight",
     ):
         if hasattr(args, name) and getattr(args, name) < 0.0:

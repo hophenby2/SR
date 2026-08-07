@@ -8,6 +8,8 @@ import math
 import random
 from typing import Any, Mapping
 
+import numpy as np
+
 from .engine import EngineClient, EngineProtocolError
 from .engine_runtime import verify_runtime_source_fingerprints
 from .engine_mpc import CandidateEvaluation, EngineMPC, MPCDecision
@@ -27,10 +29,15 @@ from .engine_play import (
     _stream_policy_control_inputs,
 )
 from .engine_vision import EngineStreamVision
-from .native_dataset import NativeEpisodeBuffer, risk_from_clearance
+from .native_dataset import (
+    SAFETY_INTERVENTION_REASONS,
+    NativeEpisodeBuffer,
+    risk_from_clearance,
+)
 from .protocol import Action
 from .provenance import source_tree_sha256
 from .render_performance import RenderPerformanceTrace
+from .training import TEACHER_ACTION_EVALUATION_FIELDS
 from .vision import VisionConfig
 
 
@@ -44,10 +51,13 @@ class EngineDAggerConfig:
     teacher_probability: float = 0.25
     intervention_margin: float = 12.0
     intervention_regret: float = 8.0
+    minimum_safety_margin_gain: float | None = None
+    student_only_prefix_frames: int = 0
     intervene_on_disagreement: bool = False
     # Retained for CLI/report compatibility; it no longer gates firing.
     shoot_minimum_margin: float = 12.0
     supervision_mode: str = "teacher"
+    record_teacher_evaluations: bool = False
     render: bool = False
     render_every: int = 1
 
@@ -58,6 +68,12 @@ class EngineDAggerConfig:
             raise ValueError("native DAgger actions must be held for exactly three frames")
         if self.observation_delay < 0:
             raise ValueError("observation_delay cannot be negative")
+        if (
+            isinstance(self.student_only_prefix_frames, bool)
+            or not isinstance(self.student_only_prefix_frames, int)
+            or self.student_only_prefix_frames < 0
+        ):
+            raise ValueError("student_only_prefix_frames must be a nonnegative integer")
         if not 0.0 <= self.teacher_probability <= 1.0:
             raise ValueError("teacher_probability must be in [0, 1]")
         finite_nonnegative = (
@@ -67,12 +83,23 @@ class EngineDAggerConfig:
         )
         if not all(math.isfinite(value) and value >= 0.0 for value in finite_nonnegative):
             raise ValueError("DAgger safety margins must be finite and nonnegative")
+        if self.minimum_safety_margin_gain is not None and (
+            isinstance(self.minimum_safety_margin_gain, bool)
+            or not isinstance(self.minimum_safety_margin_gain, (int, float))
+            or not math.isfinite(float(self.minimum_safety_margin_gain))
+            or float(self.minimum_safety_margin_gain) < 0.0
+        ):
+            raise ValueError(
+                "minimum_safety_margin_gain must be finite and nonnegative"
+            )
         if self.supervision_mode not in {"teacher", "corrective"}:
             raise ValueError(
                 "supervision_mode must be 'teacher' or 'corrective'"
             )
         if not isinstance(self.intervene_on_disagreement, bool):
             raise ValueError("intervene_on_disagreement must be a Boolean")
+        if not isinstance(self.record_teacher_evaluations, bool):
+            raise ValueError("record_teacher_evaluations must be a Boolean")
         if (
             isinstance(self.render_every, bool)
             or not isinstance(self.render_every, int)
@@ -140,6 +167,58 @@ def _movement_with_continuous_fire(movement: Action) -> Action:
         shoot=True,
         spell=False,
     )
+
+
+def _clearance_regret(reference: float, candidate: float) -> float:
+    """Return finite nonnegative regret relative to the selected MPC action."""
+
+    if math.isfinite(reference):
+        if not math.isfinite(candidate):
+            return 0.0 if candidate > 0.0 else 1_000_000.0
+        return min(1_000_000.0, max(0.0, reference - candidate))
+    if reference > 0.0:
+        return 0.0 if not math.isfinite(candidate) and candidate > 0.0 else 1_000_000.0
+    return 0.0
+
+
+def _teacher_action_evidence(
+    decision: MPCDecision,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Serialize all 18 policy-action evaluations plus clearance regret."""
+
+    teacher = _evaluation_for_action(decision, decision.action)
+    rows: list[tuple[float, ...]] = []
+    regrets: list[float] = []
+    for action_id in range(18):
+        evaluation = _evaluation_for_action(
+            decision,
+            Action.from_discrete(action_id),
+        )
+        rows.append((
+            float(evaluation.collided),
+            float(evaluation.collision_frames),
+            float(
+                -1
+                if evaluation.earliest_collision_frame is None else
+                evaluation.earliest_collision_frame
+            ),
+            float(evaluation.minimum_margin),
+            float(evaluation.boundary_penalty),
+            float(evaluation.boss_alignment),
+            float(evaluation.motion_penalty),
+            float(evaluation.minimum_nonregion_margin),
+            float(evaluation.minimum_region_margin),
+            float(evaluation.immediate_corner_clearance),
+            float(action_id == decision.action.discrete),
+        ))
+        regrets.append(_clearance_regret(
+            teacher.minimum_margin,
+            evaluation.minimum_margin,
+        ))
+    values = np.asarray(rows, dtype=np.float32)
+    if values.shape != (18, len(TEACHER_ACTION_EVALUATION_FIELDS)):
+        raise RuntimeError("serialized MPC evaluation schema is inconsistent")
+    return values, np.asarray(regrets, dtype=np.float32)
 
 
 def run_engine_dagger_play(
@@ -238,6 +317,10 @@ def run_engine_dagger_play(
     scheduled_interventions = 0
     safety_interventions = 0
     policy_disagreement_interventions = 0
+    student_only_prefix_decisions = 0
+    student_only_prefix_suppressed_interventions = 0
+    safety_margin_gain_gate_candidates = 0
+    safety_margin_gain_gate_rejections = 0
     agreements = 0
     terminal_before: Mapping[str, Any] | None = None
     terminal_action: Action | None = None
@@ -255,7 +338,7 @@ def run_engine_dagger_play(
         teacher_action = _movement_with_continuous_fire(teacher_decision.action)
         student_evaluation = _evaluation_for_action(teacher_decision, student_action)
         forced = rng.random() < config.teacher_probability
-        reason = _intervention_reason(
+        candidate_reason = _intervention_reason(
             student_evaluation,
             teacher_evaluation,
             forced=forced,
@@ -264,6 +347,33 @@ def run_engine_dagger_play(
             margin=config.intervention_margin,
             regret=config.intervention_regret,
         )
+        minimum_margin_gain = (
+            teacher_evaluation.minimum_margin
+            - student_evaluation.minimum_margin
+        )
+        safety_margin_gain_gate_applied = (
+            config.minimum_safety_margin_gain is not None
+            and candidate_reason in SAFETY_INTERVENTION_REASONS
+        )
+        safety_margin_gain_gate_passed: bool | None = None
+        reason = candidate_reason
+        if safety_margin_gain_gate_applied:
+            assert config.minimum_safety_margin_gain is not None
+            safety_margin_gain_gate_candidates += 1
+            safety_margin_gain_gate_passed = (
+                minimum_margin_gain >= config.minimum_safety_margin_gain
+            )
+            if not safety_margin_gain_gate_passed:
+                reason = None
+                safety_margin_gain_gate_rejections += 1
+        student_only_prefix_active = (
+            logical_frames < config.student_only_prefix_frames
+        )
+        student_only_prefix_decisions += int(student_only_prefix_active)
+        prefix_suppressed = student_only_prefix_active and reason is not None
+        student_only_prefix_suppressed_interventions += int(prefix_suppressed)
+        if prefix_suppressed:
+            reason = None
         intervened = reason is not None
         movement = teacher_action if intervened else student_action
         action = _movement_with_continuous_fire(movement)
@@ -271,20 +381,24 @@ def run_engine_dagger_play(
         supervised_action = (
             action if config.supervision_mode == "corrective" else teacher_action
         )
+        teacher_action_evaluations = None
+        teacher_action_regrets = None
+        if config.record_teacher_evaluations:
+            teacher_action_evaluations, teacher_action_regrets = (
+                _teacher_action_evidence(teacher_decision)
+            )
         episode.record(
             visible,
             supervised_action,
             risk_from_clearance(teacher_evaluation.minimum_margin),
             previous_action=previous_executed_action,
+            teacher_action_evaluations=teacher_action_evaluations,
+            teacher_action_regrets=teacher_action_regrets,
         )
         agreements += int(student_action.discrete == teacher_action.discrete)
         interventions += int(intervened)
         scheduled_interventions += int(reason == "scheduled_teacher")
-        safety_interventions += int(reason in {
-            "predicted_collision",
-            "minimum_margin",
-            "clearance_regret",
-        })
+        safety_interventions += int(reason in SAFETY_INTERVENTION_REASONS)
         policy_disagreement_interventions += int(reason == "policy_disagreement")
 
         start_frame = _episode_frame(raw)
@@ -333,9 +447,19 @@ def run_engine_dagger_play(
             ),
             "teacher_intervened": intervened,
             "intervention_reason": reason,
+            "candidate_intervention_reason": candidate_reason,
+            "minimum_safety_margin_gain_gate_applied": (
+                safety_margin_gain_gate_applied
+            ),
+            "minimum_safety_margin_gain_gate_passed": (
+                safety_margin_gain_gate_passed
+            ),
+            "student_only_prefix_active": student_only_prefix_active,
+            "student_only_prefix_suppressed_intervention": prefix_suppressed,
             "student_predicted_collision": student_evaluation.collided,
             "student_predicted_minimum_margin": student_evaluation.minimum_margin,
             "teacher_predicted_minimum_margin": teacher_evaluation.minimum_margin,
+            "teacher_predicted_minimum_margin_gain": minimum_margin_gain,
         })
 
     engine_terminated = raw.get("terminated") is True
@@ -409,6 +533,33 @@ def run_engine_dagger_play(
         "scheduled_teacher_interventions": scheduled_interventions,
         "safety_teacher_interventions": safety_interventions,
         "policy_disagreement_interventions": policy_disagreement_interventions,
+        "student_only_prefix": {
+            "configured_frames": config.student_only_prefix_frames,
+            "decisions": student_only_prefix_decisions,
+            "suppressed_interventions": (
+                student_only_prefix_suppressed_interventions
+            ),
+            "model_input": False,
+            "purpose": (
+                "collect parent-policy on-policy prefix states inside an episode "
+                "that must still satisfy strict native success"
+            ),
+        },
+        "safety_intervention_margin_gain_gate": {
+            "enabled": config.minimum_safety_margin_gain is not None,
+            "minimum_gain": config.minimum_safety_margin_gain,
+            "applies_to": sorted(SAFETY_INTERVENTION_REASONS),
+            "candidate_decisions": safety_margin_gain_gate_candidates,
+            "accepted_decisions": (
+                safety_margin_gain_gate_candidates
+                - safety_margin_gain_gate_rejections
+            ),
+            "rejected_decisions": safety_margin_gain_gate_rejections,
+            "unaffected_reasons": [
+                "policy_disagreement",
+                "scheduled_teacher",
+            ],
+        },
         "demonstration_supervision": {
             "mode": config.supervision_mode,
             "target": (
@@ -427,6 +578,13 @@ def run_engine_dagger_play(
             "teacher_only_targets": (
                 decision_count if config.supervision_mode == "teacher" else 0
             ),
+        },
+        "teacher_action_evaluations": {
+            "recorded": config.record_teacher_evaluations,
+            "action_count": 18,
+            "fields": list(TEACHER_ACTION_EVALUATION_FIELDS),
+            "regret": "max(0, selected_teacher_minimum_margin - candidate_minimum_margin)",
+            "model_input": False,
         },
         "engine": {
             "protocol": ping.get("protocol"),
@@ -459,6 +617,8 @@ def run_engine_dagger_play(
                 "scenario_key": student.scenario_key,
                 "device": student.device,
                 "inference_mode": student.inference_mode,
+                "action_selection": getattr(student, "action_selection", "joint"),
+                "action_selection_uses_safety_state": False,
                 "proficiency": asdict(student.proficiency),
             },
             "teacher": {

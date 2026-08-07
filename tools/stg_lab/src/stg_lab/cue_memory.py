@@ -201,6 +201,7 @@ def cue_condition_demonstrations(
         memory=memory,
         episode_ids=demonstrations.episode_ids.copy(),
         supervision_mask=demonstrations.supervision_mask,
+        correction_mask=demonstrations.correction_mask,
     )
     result.validate()
     return result

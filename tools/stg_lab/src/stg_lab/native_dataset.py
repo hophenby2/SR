@@ -10,13 +10,27 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .policy import proficiency_vector
 from .protocol import Action
 from .provenance import file_sha256
-from .training import Demonstrations, previous_actions_from_targets
+from .training import (
+    TEACHER_ACTION_EVALUATION_FIELDS,
+    Demonstrations,
+    previous_actions_from_targets,
+)
 from .vision import VisionObservation
 
 
 UNKNOWN_SCENARIO_CONTEXT = "<unknown>"
+SAFETY_INTERVENTION_REASONS = frozenset({
+    "clearance_regret",
+    "minimum_margin",
+    "predicted_collision",
+})
+_KNOWN_INTERVENTION_REASONS = SAFETY_INTERVENTION_REASONS | {
+    "policy_disagreement",
+    "scheduled_teacher",
+}
 
 
 def _report_action_id(value: Any, *, field: str, decision: int) -> int:
@@ -65,6 +79,16 @@ def _report_action_id(value: Any, *, field: str, decision: int) -> int:
     return raw_discrete
 
 
+def _report_margin(value: Any, *, field: str, decision: int) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or math.isnan(float(value))
+    ):
+        raise ValueError(f"decision {decision} {field} must be a non-NaN number")
+    return float(value)
+
+
 def _strict_dagger_completion(report: Mapping[str, Any]) -> tuple[str, str, float]:
     if report.get("run_kind") != "live_luastg_native_dagger":
         raise ValueError("source report is not a native DAgger report")
@@ -111,6 +135,10 @@ def relabel_dagger_demonstration_archive(
     manifest_path: str | Path,
     *,
     interventions_only: bool = False,
+    safety_interventions_only: bool = False,
+    hard_intervention_labels: bool = False,
+    teacher_evaluation_context: int | None = None,
+    minimum_safety_margin_gain: float | None = None,
 ) -> dict[str, Any]:
     """Keep safe student executions and teacher corrections as DAgger labels."""
 
@@ -120,6 +148,35 @@ def relabel_dagger_demonstration_archive(
     manifest_output = Path(manifest_path)
     if output.suffix.lower() != ".npz":
         raise ValueError("corrective DAgger output must use the .npz extension")
+    if teacher_evaluation_context is not None and (
+        isinstance(teacher_evaluation_context, bool)
+        or not isinstance(teacher_evaluation_context, int)
+        or teacher_evaluation_context < 0
+    ):
+        raise ValueError("teacher_evaluation_context must be a nonnegative integer")
+    if hard_intervention_labels and not interventions_only:
+        raise ValueError(
+            "hard_intervention_labels requires interventions_only"
+        )
+    if safety_interventions_only and not interventions_only:
+        raise ValueError(
+            "safety_interventions_only requires interventions_only"
+        )
+    if minimum_safety_margin_gain is not None:
+        if (
+            isinstance(minimum_safety_margin_gain, bool)
+            or not isinstance(minimum_safety_margin_gain, (int, float))
+            or not math.isfinite(float(minimum_safety_margin_gain))
+            or float(minimum_safety_margin_gain) < 0.0
+        ):
+            raise ValueError(
+                "minimum_safety_margin_gain must be finite and nonnegative"
+            )
+        if not safety_interventions_only:
+            raise ValueError(
+                "minimum_safety_margin_gain requires safety_interventions_only"
+            )
+        minimum_safety_margin_gain = float(minimum_safety_margin_gain)
     resolved = {
         "demonstrations": source.resolve(),
         "report": report_source.resolve(),
@@ -202,6 +259,9 @@ def relabel_dagger_demonstration_archive(
     student_ids = np.empty(sample_count, dtype=np.int64)
     supervised_ids = np.empty(sample_count, dtype=np.int64)
     intervention_flags = np.empty(sample_count, dtype=bool)
+    student_margins = np.empty(sample_count, dtype=np.float64)
+    teacher_margins = np.empty(sample_count, dtype=np.float64)
+    intervention_reasons: list[str | None] = []
     supervision = report.get("demonstration_supervision")
     source_supervision_mode = (
         supervision.get("mode") if isinstance(supervision, Mapping) else "teacher"
@@ -239,6 +299,32 @@ def relabel_dagger_demonstration_archive(
         if not isinstance(intervened, bool):
             raise ValueError(f"decision {index} teacher_intervened must be boolean")
         intervention_flags[index] = intervened
+        if minimum_safety_margin_gain is not None:
+            student_margins[index] = _report_margin(
+                decision.get("student_predicted_minimum_margin"),
+                field="student_predicted_minimum_margin",
+                decision=index,
+            )
+            teacher_margins[index] = _report_margin(
+                decision.get("teacher_predicted_minimum_margin"),
+                field="teacher_predicted_minimum_margin",
+                decision=index,
+            )
+        if safety_interventions_only:
+            reason = decision.get("intervention_reason")
+            if intervened:
+                if not isinstance(reason, str) or reason not in (
+                    _KNOWN_INTERVENTION_REASONS
+                ):
+                    raise ValueError(
+                        f"decision {index} has an invalid intervention_reason"
+                    )
+            elif reason is not None:
+                raise ValueError(
+                    f"decision {index} has intervention_reason without "
+                    "teacher_intervened=true"
+                )
+            intervention_reasons.append(reason)
         expected_executed = teacher_ids[index] if intervened else student_ids[index]
         if executed_ids[index] != expected_executed:
             source_name = "teacher" if intervened else "student"
@@ -281,6 +367,85 @@ def relabel_dagger_demonstration_archive(
         or declared_interventions != intervention_count
     ):
         raise ValueError("source DAgger teacher_interventions count is inconsistent")
+    selected_intervention_flags = intervention_flags
+    safety_intervention_count: int | None = None
+    policy_disagreement_count: int | None = None
+    scheduled_intervention_count: int | None = None
+    excluded_same_action_count: int | None = None
+    excluded_insufficient_gain_count: int | None = None
+    if safety_interventions_only:
+        safety_flags = np.fromiter(
+            (
+                reason in SAFETY_INTERVENTION_REASONS
+                for reason in intervention_reasons
+            ),
+            dtype=np.bool_,
+            count=sample_count,
+        )
+        policy_disagreement_flags = np.fromiter(
+            (reason == "policy_disagreement" for reason in intervention_reasons),
+            dtype=np.bool_,
+            count=sample_count,
+        )
+        scheduled_intervention_flags = np.fromiter(
+            (reason == "scheduled_teacher" for reason in intervention_reasons),
+            dtype=np.bool_,
+            count=sample_count,
+        )
+        safety_intervention_count = int(np.count_nonzero(safety_flags))
+        policy_disagreement_count = int(np.count_nonzero(
+            policy_disagreement_flags,
+        ))
+        scheduled_intervention_count = int(np.count_nonzero(
+            scheduled_intervention_flags,
+        ))
+        for field, actual in (
+            ("safety_teacher_interventions", safety_intervention_count),
+            (
+                "policy_disagreement_interventions",
+                policy_disagreement_count,
+            ),
+            ("scheduled_teacher_interventions", scheduled_intervention_count),
+        ):
+            declared = report.get(field)
+            if (
+                isinstance(declared, bool)
+                or not isinstance(declared, int)
+                or declared != actual
+            ):
+                raise ValueError(
+                    f"source DAgger {field} count is inconsistent"
+                )
+        if (
+            safety_intervention_count
+            + policy_disagreement_count
+            + scheduled_intervention_count
+            != intervention_count
+        ):
+            raise ValueError(
+                "source DAgger intervention reason counts do not sum to "
+                "teacher_interventions"
+            )
+        selected_intervention_flags = safety_flags
+        if minimum_safety_margin_gain is not None:
+            action_change_flags = student_ids != teacher_ids
+            with np.errstate(invalid="ignore"):
+                margin_gains = teacher_margins - student_margins
+                sufficient_gain_flags = (
+                    margin_gains >= minimum_safety_margin_gain
+                )
+            selected_intervention_flags = (
+                safety_flags & action_change_flags & sufficient_gain_flags
+            )
+            excluded_same_action_count = int(np.count_nonzero(
+                safety_flags & ~action_change_flags,
+            ))
+            excluded_insufficient_gain_count = int(np.count_nonzero(
+                safety_flags & action_change_flags & ~sufficient_gain_flags,
+            ))
+    selected_intervention_count = int(np.count_nonzero(
+        selected_intervention_flags,
+    ))
     agreement_count = int(np.count_nonzero(student_ids == teacher_ids))
     declared_agreements = report.get("student_teacher_agreements")
     if (
@@ -293,10 +458,56 @@ def relabel_dagger_demonstration_archive(
     relabeled_actions = actions.copy()
     relabeled_actions[:, 0] = executed_ids
     arrays["actions"] = relabeled_actions
+    correction_flags = np.zeros(sample_count, dtype=np.bool_)
+    if (
+        safety_interventions_only
+        and minimum_safety_margin_gain is not None
+    ):
+        correction_flags = selected_intervention_flags.copy()
+    arrays["correction_mask"] = correction_flags.reshape(-1, 1).astype(
+        np.uint8,
+    )
     if interventions_only:
-        arrays["supervision_mask"] = intervention_flags.reshape(-1, 1).astype(
-            np.uint8,
+        arrays["supervision_mask"] = selected_intervention_flags.reshape(
+            -1, 1,
+        ).astype(np.uint8)
+    if teacher_evaluation_context is not None:
+        if "teacher_action_evaluation_mask" not in arrays:
+            raise ValueError(
+                "teacher evaluation context requires recorded action evaluations"
+            )
+        context_mask = np.zeros(sample_count, dtype=np.bool_)
+        for index in np.flatnonzero(intervention_flags):
+            start = max(0, int(index) - teacher_evaluation_context)
+            stop = min(sample_count, int(index) + teacher_evaluation_context + 1)
+            context_mask[start:stop] = True
+        original_evaluation_mask = np.asarray(
+            arrays["teacher_action_evaluation_mask"][:, 0], dtype=np.bool_,
         )
+        context_mask &= original_evaluation_mask
+        arrays["teacher_action_evaluation_mask"] = context_mask.reshape(
+            -1, 1,
+        ).astype(np.uint8)
+    hard_intervention_evaluations_cleared = 0
+    if (
+        hard_intervention_labels
+        and "teacher_action_evaluation_mask" in arrays
+    ):
+        evaluation_mask = np.asarray(
+            arrays["teacher_action_evaluation_mask"][:, 0], dtype=np.bool_,
+        ).copy()
+        hard_intervention_evaluations_cleared = int(np.count_nonzero(
+            evaluation_mask & selected_intervention_flags
+        ))
+        evaluation_mask[selected_intervention_flags] = False
+        arrays["teacher_action_evaluation_mask"] = evaluation_mask.reshape(
+            -1, 1,
+        ).astype(np.uint8)
+    soft_evaluation_count = (
+        int(np.count_nonzero(arrays["teacher_action_evaluation_mask"]))
+        if "teacher_action_evaluation_mask" in arrays else
+        0
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as stream:
         np.savez_compressed(stream, **arrays)
@@ -323,6 +534,38 @@ def relabel_dagger_demonstration_archive(
         "history": 1,
         "decisions": sample_count,
         "teacher_interventions": intervention_count,
+        **(
+            {
+                "total_teacher_interventions": intervention_count,
+                "selected_safety_interventions": selected_intervention_count,
+                "excluded_policy_disagreement_interventions": (
+                    policy_disagreement_count
+                ),
+                "excluded_scheduled_teacher_interventions": (
+                    scheduled_intervention_count
+                ),
+                **(
+                    {
+                        "candidate_safety_interventions": (
+                            safety_intervention_count
+                        ),
+                        "minimum_safety_margin_gain": (
+                            minimum_safety_margin_gain
+                        ),
+                        "excluded_same_action_interventions": (
+                            excluded_same_action_count
+                        ),
+                        "excluded_insufficient_margin_gain_interventions": (
+                            excluded_insufficient_gain_count
+                        ),
+                    }
+                    if minimum_safety_margin_gain is not None else
+                    {}
+                ),
+            }
+            if safety_interventions_only else
+            {}
+        ),
         "student_executions": sample_count - intervention_count,
         "source_supervision_mode": source_supervision_mode,
         "replaced_labels": replaced_count,
@@ -331,24 +574,145 @@ def relabel_dagger_demonstration_archive(
             name
             for name in arrays
             if name != "actions"
+            and name != "correction_mask"
             and not (interventions_only and name == "supervision_mask")
+            and not (
+                (
+                    teacher_evaluation_context is not None
+                    or hard_intervention_labels
+                )
+                and name == "teacher_action_evaluation_mask"
+            )
         ),
+        "teacher_action_evaluations_preserved": (
+            demonstrations.teacher_action_evaluations is not None
+        ),
+        "teacher_action_evaluation_fields": (
+            list(TEACHER_ACTION_EVALUATION_FIELDS)
+            if demonstrations.teacher_action_evaluations is not None else
+            None
+        ),
+        "teacher_action_evaluation_supervision": {
+            "mode": (
+                (
+                    "teacher_intervention_context_except_hard_interventions"
+                    if hard_intervention_labels else
+                    "teacher_intervention_context"
+                )
+                if teacher_evaluation_context is not None else
+                (
+                    "all_recorded_evaluations_except_hard_interventions"
+                    if hard_intervention_labels else
+                    "all_recorded_evaluations"
+                )
+            ),
+            "context_radius_decisions": teacher_evaluation_context,
+            "available_decisions": soft_evaluation_count,
+            "model_input": False,
+        },
         "action_supervision": {
             "mode": (
-                "teacher_interventions_only"
-                if interventions_only else
-                "all_executed_actions"
+                (
+                    "effective_safety_interventions_only"
+                    if minimum_safety_margin_gain is not None else
+                    "safety_teacher_interventions_only"
+                ) if safety_interventions_only else
+                (
+                    "teacher_interventions_only"
+                    if interventions_only else
+                    "all_executed_actions"
+                )
             ),
             "mask": "supervision_mask",
             "supervised_decisions": (
-                intervention_count if interventions_only else sample_count
+                selected_intervention_count if interventions_only else sample_count
             ),
             "unsupervised_context_decisions": (
-                sample_count - intervention_count if interventions_only else 0
+                sample_count - selected_intervention_count
+                if interventions_only else
+                0
             ),
             "recurrent_context_decisions": sample_count,
             "risk_targets_available": sample_count,
         },
+        **(
+            {
+                "safety_intervention_selection": {
+                    "enabled": True,
+                    "accepted_reasons": sorted(SAFETY_INTERVENTION_REASONS),
+                    "candidate_safety_interventions": safety_intervention_count,
+                    "total_teacher_interventions": intervention_count,
+                    "selected_safety_interventions": selected_intervention_count,
+                    "excluded_policy_disagreement_interventions": (
+                        policy_disagreement_count
+                    ),
+                    "excluded_scheduled_teacher_interventions": (
+                        scheduled_intervention_count
+                    ),
+                    "requires_action_change": (
+                        minimum_safety_margin_gain is not None
+                    ),
+                    "minimum_teacher_margin_gain": minimum_safety_margin_gain,
+                    **(
+                        {
+                            "excluded_same_action_interventions": (
+                                excluded_same_action_count
+                            ),
+                            "excluded_insufficient_margin_gain_interventions": (
+                                excluded_insufficient_gain_count
+                            ),
+                        }
+                        if minimum_safety_margin_gain is not None else
+                        {}
+                    ),
+                    "semantics": (
+                        "hard action supervision selects safety interventions "
+                        "where the teacher changes the student action and improves "
+                        "predicted minimum margin by at least the configured gain; "
+                        "all rejected interventions remain recurrent context"
+                        if minimum_safety_margin_gain is not None else
+                        "hard action supervision selects only teacher_intervened "
+                        "rows caused by predicted collision, minimum margin, or "
+                        "clearance regret; policy disagreement and scheduled "
+                        "teacher rows remain recurrent context"
+                    ),
+                },
+            }
+            if safety_interventions_only else
+            {}
+        ),
+        **(
+            {
+                "hard_intervention_label_supervision": {
+                    "enabled": True,
+                    "requires_action_supervision": (
+                        (
+                            "effective_safety_interventions_only"
+                            if minimum_safety_margin_gain is not None else
+                            "safety_teacher_interventions_only"
+                        ) if safety_interventions_only else
+                        "teacher_interventions_only"
+                    ),
+                    "hard_label_decisions": selected_intervention_count,
+                    "soft_evaluation_rows_cleared": (
+                        hard_intervention_evaluations_cleared
+                    ),
+                    "remaining_soft_evaluation_decisions": soft_evaluation_count,
+                    "semantics": (
+                        "selected teacher intervention rows use the executed "
+                        "teacher action as an exclusive hard label; all other "
+                        "retained teacher evaluation rows, including policy "
+                        "disagreements, remain set-valued soft targets"
+                        if safety_interventions_only else
+                        "teacher_intervened rows use the executed teacher action "
+                        "as an exclusive hard label; all other retained teacher "
+                        "evaluation rows remain set-valued soft targets"
+                    ),
+                },
+            }
+            if hard_intervention_labels else
+            {}
+        ),
         "accepted_episodes": [{
             "episode_kind": episode_kind,
             "scenario": scenario,
@@ -375,9 +739,45 @@ def relabel_dagger_demonstration_archive(
                 "when unassisted and the teacher correction when intervened"
             ),
             "supervision_mask": (
-                "true only where teacher_intervened=true"
-                if interventions_only else
-                "true for every executed action"
+                "true only for safety interventions whose teacher action differs "
+                "and improves predicted minimum margin by the configured amount"
+                if minimum_safety_margin_gain is not None else
+                "true only where teacher_intervened=true and intervention_reason "
+                "is predicted_collision, minimum_margin, or clearance_regret"
+                if safety_interventions_only else
+                (
+                    "true only where teacher_intervened=true"
+                    if interventions_only else
+                    "true for every executed action"
+                )
+            ),
+            "correction_mask": (
+                "true only for selected safety interventions whose teacher "
+                "action differs from the student action and improves predicted "
+                "minimum margin by at least the configured threshold; false "
+                "for every other decision"
+                if (
+                    safety_interventions_only
+                    and minimum_safety_margin_gain is not None
+                ) else
+                "false for every decision because this relabel operation did "
+                "not select effective safety corrections by margin gain"
+            ),
+            **(
+                {
+                    "teacher_action_evaluation_mask": (
+                        "false at selected safety intervention rows so the "
+                        "executed teacher action is an exclusive hard label; "
+                        "unchanged at other retained rows, including "
+                        "policy_disagreement interventions"
+                        if safety_interventions_only else
+                        "false at teacher_intervened rows so the executed teacher "
+                        "action is an exclusive hard label; unchanged at every "
+                        "other retained teacher evaluation row"
+                    ),
+                }
+                if hard_intervention_labels else
+                {}
             ),
         },
     }
@@ -519,12 +919,14 @@ def contextualize_demonstrations(
     identities: Sequence[NativeEpisodeIdentity],
     *,
     include_previous_action: bool = False,
+    include_proficiency: bool = False,
 ) -> tuple[Demonstrations, tuple[str, ...], tuple[str, ...]]:
     """Attach a deterministic one-hot identity token to every episode.
 
     The identity token contains only the registered stage or attack. Optional
-    prior-motor context comes from recorded execution, never positions, timing,
-    future actions, or routes.
+    prior-motor context comes from recorded execution, and optional proficiency
+    is constant within an episode. Neither includes positions, timing, future
+    actions, or routes.
     """
 
     demonstrations.validate()
@@ -572,6 +974,26 @@ def contextualize_demonstrations(
             memory[:, :, len(vocabulary) + action_id] = (
                 previous_actions == action_id
             )
+    proficiency = demonstrations.proficiency
+    if include_proficiency:
+        annotated = np.zeros(
+            (*demonstrations.actions.shape, len(proficiency_vector("expert"))),
+            dtype=np.float32,
+        )
+        for episode_id, identity in zip(ordered_ids, identities, strict=True):
+            annotated[demonstrations.episode_ids == episode_id, :] = (
+                proficiency_vector(identity.profile)
+            )
+        if proficiency is not None and not np.allclose(
+            proficiency,
+            annotated,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError(
+                "demonstration proficiency does not match manifest episode profiles"
+            )
+        proficiency = annotated
     result = Demonstrations(
         global_frames=demonstrations.global_frames,
         local_frames=demonstrations.local_frames,
@@ -579,9 +1001,15 @@ def contextualize_demonstrations(
         risks=demonstrations.risks,
         previous_actions=demonstrations.previous_actions,
         memory=memory,
-        proficiency=demonstrations.proficiency,
+        proficiency=proficiency,
         episode_ids=demonstrations.episode_ids,
         supervision_mask=demonstrations.supervision_mask,
+        teacher_action_evaluations=demonstrations.teacher_action_evaluations,
+        teacher_action_regrets=demonstrations.teacher_action_regrets,
+        teacher_action_evaluation_mask=(
+            demonstrations.teacher_action_evaluation_mask
+        ),
+        correction_mask=demonstrations.correction_mask,
     )
     result.validate()
     return result, tuple(vocabulary), contexts
@@ -593,6 +1021,7 @@ def contextualize_demonstration_archive(
     output_path: str | Path,
     *,
     include_previous_action: bool = False,
+    include_proficiency: bool = False,
 ) -> dict[str, Any]:
     """Build a context-conditioned archive from strict native provenance."""
 
@@ -603,6 +1032,7 @@ def contextualize_demonstration_archive(
         Demonstrations.load(source),
         identities,
         include_previous_action=include_previous_action,
+        include_proficiency=include_proficiency,
     )
     output = Path(output_path)
     contextualized.save(output)
@@ -622,6 +1052,19 @@ def contextualize_demonstration_archive(
         "scenario_context_size": len(vocabulary),
         "previous_action_size": 18 if include_previous_action else 0,
         "previous_action_offset": len(vocabulary),
+        "proficiency_size": (
+            0
+            if contextualized.proficiency is None else
+            int(contextualized.proficiency.shape[-1])
+        ),
+        "proficiency_profiles": (
+            sorted({identity.profile for identity in identities})
+            if include_proficiency else
+            None
+        ),
+        "teacher_action_evaluations_preserved": (
+            contextualized.teacher_action_evaluations is not None
+        ),
         "episode_contexts": [
             {
                 **asdict(identity),
@@ -631,7 +1074,8 @@ def contextualize_demonstration_archive(
         ],
         "context_semantics": (
             "identity-only one-hot token plus optional prior executed motor "
-            "action; excludes coordinates, frames, phases, waypoints, and routes"
+            "action and episode-level proficiency; excludes coordinates, frames, "
+            "phases, waypoints, and routes"
         ),
     }
 
@@ -646,6 +1090,9 @@ class NativeEpisodeBuffer:
         self.actions: list[int] = []
         self.previous_actions: list[int] = []
         self.risks: list[float] = []
+        self.teacher_action_evaluations: list[np.ndarray] = []
+        self.teacher_action_regrets: list[np.ndarray] = []
+        self.teacher_action_evaluation_mask: list[bool] = []
 
     def record(
         self,
@@ -653,9 +1100,38 @@ class NativeEpisodeBuffer:
         action: Action,
         risk: float,
         previous_action: Action | None = None,
+        teacher_action_evaluations: np.ndarray | None = None,
+        teacher_action_regrets: np.ndarray | None = None,
     ) -> None:
         if visible.global_frames.shape[0] != 1 or visible.local_frames.shape[0] != 1:
             raise ValueError("native stream demonstrations must contain one latest frame")
+        if (teacher_action_evaluations is None) != (teacher_action_regrets is None):
+            raise ValueError(
+                "teacher action evaluations and regrets must be recorded together"
+            )
+        if teacher_action_evaluations is None:
+            evaluations = np.zeros(
+                (18, len(TEACHER_ACTION_EVALUATION_FIELDS)), dtype=np.float32,
+            )
+            regrets = np.zeros(18, dtype=np.float32)
+            evaluation_available = False
+        else:
+            evaluations = np.asarray(teacher_action_evaluations, dtype=np.float32)
+            regrets = np.asarray(teacher_action_regrets, dtype=np.float32)
+            if evaluations.shape != (
+                18,
+                len(TEACHER_ACTION_EVALUATION_FIELDS),
+            ):
+                raise ValueError("teacher action evaluation shape is invalid")
+            if regrets.shape != (18,):
+                raise ValueError("teacher action regret shape is invalid")
+            if np.isnan(evaluations).any():
+                raise ValueError("teacher action evaluations cannot contain NaN")
+            if not np.isfinite(regrets).all() or np.any(regrets < 0.0):
+                raise ValueError(
+                    "teacher action regrets must be finite and nonnegative"
+                )
+            evaluation_available = True
         self.global_frames.append(visible.global_frames.copy())
         self.local_frames.append(visible.local_frames.copy())
         self.previous_actions.append(
@@ -665,6 +1141,9 @@ class NativeEpisodeBuffer:
         )
         self.actions.append(action.discrete)
         self.risks.append(float(np.clip(risk, 0.0, 1.0)))
+        self.teacher_action_evaluations.append(evaluations.copy())
+        self.teacher_action_regrets.append(regrets.copy())
+        self.teacher_action_evaluation_mask.append(evaluation_available)
 
     @property
     def decisions(self) -> int:
@@ -713,6 +1192,9 @@ class NativeDemonstrationBuilder:
         actions: list[np.ndarray] = []
         previous_actions: list[np.ndarray] = []
         risks: list[np.ndarray] = []
+        teacher_action_evaluations: list[np.ndarray] = []
+        teacher_action_regrets: list[np.ndarray] = []
+        teacher_action_evaluation_mask: list[np.ndarray] = []
         episode_ids: list[int] = []
         for episode_id, episode in enumerate(self._accepted):
             global_frames.extend(episode.global_frames)
@@ -727,10 +1209,25 @@ class NativeDemonstrationBuilder:
             risks.extend(
                 np.asarray([value], dtype=np.float32) for value in episode.risks
             )
+            teacher_action_evaluations.extend(
+                np.asarray([value], dtype=np.float32)
+                for value in episode.teacher_action_evaluations
+            )
+            teacher_action_regrets.extend(
+                np.asarray([value], dtype=np.float32)
+                for value in episode.teacher_action_regrets
+            )
+            teacher_action_evaluation_mask.extend(
+                np.asarray([value], dtype=bool)
+                for value in episode.teacher_action_evaluation_mask
+            )
             episode_ids.extend([episode_id] * episode.decisions)
+        has_teacher_evaluations = any(
+            value.item() for value in teacher_action_evaluation_mask
+        )
         demonstrations = Demonstrations(
-            global_frames=np.stack(global_frames).astype(np.float16, copy=False),
-            local_frames=np.stack(local_frames).astype(np.float16, copy=False),
+            global_frames=np.stack(global_frames).astype(np.float32, copy=False),
+            local_frames=np.stack(local_frames).astype(np.float32, copy=False),
             actions=np.stack(actions),
             risks=np.stack(risks),
             previous_actions=np.stack(previous_actions),
@@ -738,6 +1235,21 @@ class NativeDemonstrationBuilder:
             proficiency=None,
             episode_ids=np.asarray(episode_ids, dtype=np.int64),
             supervision_mask=np.ones((len(actions), 1), dtype=bool),
+            teacher_action_evaluations=(
+                np.stack(teacher_action_evaluations)
+                if has_teacher_evaluations else
+                None
+            ),
+            teacher_action_regrets=(
+                np.stack(teacher_action_regrets)
+                if has_teacher_evaluations else
+                None
+            ),
+            teacher_action_evaluation_mask=(
+                np.stack(teacher_action_evaluation_mask)
+                if has_teacher_evaluations else
+                None
+            ),
         )
         demonstrations.validate()
         return demonstrations
@@ -766,7 +1278,29 @@ class NativeDemonstrationBuilder:
             ],
             "recorded_fields": [
                 "previous_executed_motor_action",
+                *(
+                    [
+                        "teacher_action_evaluations",
+                        "teacher_action_regrets",
+                        "teacher_action_evaluation_mask",
+                    ]
+                    if demonstrations.teacher_action_evaluations is not None else
+                    []
+                ),
             ],
+            "teacher_action_evaluation_schema": (
+                None
+                if demonstrations.teacher_action_evaluations is None else
+                {
+                    "action_count": 18,
+                    "fields": list(TEACHER_ACTION_EVALUATION_FIELDS),
+                    "regret": (
+                        "max(0, selected_teacher_minimum_margin - "
+                        "candidate_minimum_margin)"
+                    ),
+                    "model_input": False,
+                }
+            ),
             "excluded_model_inputs": [
                 "scenario_identity",
                 "attack_identity",

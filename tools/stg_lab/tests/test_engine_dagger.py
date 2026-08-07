@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pytest
 
 from stg_lab.engine import EngineProtocolError
@@ -194,6 +195,13 @@ def _run(
     student_action: Action = Action(move_x=-1, slow=True),
     supervision_mode: str = "teacher",
     intervene_on_disagreement: bool = False,
+    teacher_probability: float = 0.0,
+    intervention_margin: float = 0.0,
+    intervention_regret: float = 100.0,
+    minimum_safety_margin_gain: float | None = None,
+    student_only_prefix_frames: int = 0,
+    action_selection: str = "joint",
+    record_teacher_evaluations: bool = False,
 ):
     client = FakeClient(death=death)
     episode = NativeEpisodeBuffer(NativeEpisodeIdentity(
@@ -203,6 +211,7 @@ def _run(
         seed=42,
     ))
     student = FixedStudent(student_action)
+    student.action_selection = action_selection
     report = run_engine_dagger_play(
         client,  # type: ignore[arg-type]
         scenario="okuu:Lunatic",
@@ -218,11 +227,14 @@ def _run(
         config=EngineDAggerConfig(
             max_frames=12,
             observation_delay=0,
-            teacher_probability=0.0,
-            intervention_margin=0.0,
-            intervention_regret=100.0,
+            teacher_probability=teacher_probability,
+            intervention_margin=intervention_margin,
+            intervention_regret=intervention_regret,
+            minimum_safety_margin_gain=minimum_safety_margin_gain,
+            student_only_prefix_frames=student_only_prefix_frames,
             intervene_on_disagreement=intervene_on_disagreement,
             supervision_mode=supervision_mode,
+            record_teacher_evaluations=record_teacher_evaluations,
         ),
         vision_config=VisionConfig(
             global_width=12,
@@ -234,6 +246,23 @@ def _run(
         ),
     )
     return client, episode, report, student
+
+
+def test_dagger_reports_factorized_student_model_inputs() -> None:
+    _client, _episode, report, _student = _run(
+        student_collides=False,
+        action_selection="factorized",
+    )
+
+    assert report["controller"]["student"]["action_selection"] == "factorized"
+    assert (
+        report["controller"]["student"]["action_selection_uses_safety_state"]
+        is False
+    )
+    assert (
+        "factorized_direction_speed_marginal_scores_from_model_logits"
+        in report["config"]["student_control_inputs"]
+    )
 
 
 def test_dagger_records_teacher_labels_on_student_executed_states() -> None:
@@ -261,6 +290,28 @@ def test_dagger_records_teacher_labels_on_student_executed_states() -> None:
     assert report["shoot_frames"] == report["frames"]
     assert report["shoot_rate"] == 1.0
     assert all(action.shoot and not action.spell for action in client.actions)
+
+
+def test_dagger_optionally_records_all_policy_action_evaluations() -> None:
+    _client, episode, report, _student = _run(
+        student_collides=True,
+        record_teacher_evaluations=True,
+    )
+
+    teacher = Action(move_x=1, slow=True).discrete
+    assert report["teacher_action_evaluations"]["recorded"] is True
+    assert report["teacher_action_evaluations"]["action_count"] == 18
+    assert episode.teacher_action_evaluation_mask == [True, True]
+    assert episode.teacher_action_evaluations[0].shape == (18, 11)
+    assert episode.teacher_action_regrets[0].shape == (18,)
+    selected = episode.teacher_action_evaluations[0][:, -1]
+    assert np.flatnonzero(selected).tolist() == [teacher]
+    assert episode.teacher_action_regrets[0][teacher] == 0.0
+    # Focus does not change stationary geometry, but both policy ids remain.
+    np.testing.assert_array_equal(
+        episode.teacher_action_evaluations[0][4, :-1],
+        episode.teacher_action_evaluations[0][13, :-1],
+    )
 
 
 def test_dagger_continuous_fire_wrapper_preserves_only_movement_and_focus() -> None:
@@ -326,11 +377,155 @@ def test_dagger_intervenes_when_student_candidate_would_collide() -> None:
     ] == [(1, 3), (1, 3)]
 
 
+def test_dagger_student_only_prefix_collects_parent_states_before_rescue() -> None:
+    client, _episode, report, _student = _run(
+        student_collides=True,
+        supervision_mode="corrective",
+        student_only_prefix_frames=3,
+    )
+
+    assert [action.move_x for action in client.actions] == [-1, -1, -1, 1, 1, 1]
+    assert report["teacher_interventions"] == 1
+    assert report["student_only_prefix"] == {
+        "configured_frames": 3,
+        "decisions": 1,
+        "suppressed_interventions": 1,
+        "model_input": False,
+        "purpose": (
+            "collect parent-policy on-policy prefix states inside an episode "
+            "that must still satisfy strict native success"
+        ),
+    }
+    assert report["decisions"][0]["student_only_prefix_active"] is True
+    assert (
+        report["decisions"][0]["student_only_prefix_suppressed_intervention"]
+        is True
+    )
+    assert report["decisions"][1]["student_only_prefix_active"] is False
+
+
+@pytest.mark.parametrize("value", (-1, 1.5, True))
+def test_dagger_rejects_invalid_student_only_prefix(value) -> None:
+    with pytest.raises(ValueError, match="student_only_prefix_frames"):
+        EngineDAggerConfig(student_only_prefix_frames=value)
+
+
+@pytest.mark.parametrize(
+    ("run_options", "candidate_reason", "minimum_margin_gain"),
+    (
+        (
+            {"student_collides": True},
+            "predicted_collision",
+            31.0,
+        ),
+        (
+            {
+                "student_collides": False,
+                "student_minimum_margin": 8.0,
+                "intervention_margin": 12.0,
+            },
+            "minimum_margin",
+            22.0,
+        ),
+        (
+            {
+                "student_collides": False,
+                "student_minimum_margin": 20.0,
+                "intervention_regret": 8.0,
+            },
+            "clearance_regret",
+            10.0,
+        ),
+    ),
+)
+def test_dagger_minimum_margin_gain_gate_rejects_weak_safety_interventions(
+    run_options,
+    candidate_reason: str,
+    minimum_margin_gain: float,
+) -> None:
+    client, _episode, report, _student = _run(
+        **run_options,
+        supervision_mode="corrective",
+        minimum_safety_margin_gain=minimum_margin_gain + 0.5,
+    )
+
+    assert report["teacher_interventions"] == 0
+    assert report["safety_teacher_interventions"] == 0
+    assert all(action.move_x == -1 for action in client.actions)
+    assert all(
+        decision["candidate_intervention_reason"] == candidate_reason
+        and decision["intervention_reason"] is None
+        and decision["teacher_intervened"] is False
+        and decision["teacher_predicted_minimum_margin_gain"]
+        == minimum_margin_gain
+        and decision["minimum_safety_margin_gain_gate_applied"] is True
+        and decision["minimum_safety_margin_gain_gate_passed"] is False
+        for decision in report["decisions"]
+    )
+    assert report["safety_intervention_margin_gain_gate"] == {
+        "enabled": True,
+        "minimum_gain": minimum_margin_gain + 0.5,
+        "applies_to": [
+            "clearance_regret",
+            "minimum_margin",
+            "predicted_collision",
+        ],
+        "candidate_decisions": 2,
+        "accepted_decisions": 0,
+        "rejected_decisions": 2,
+        "unaffected_reasons": [
+            "policy_disagreement",
+            "scheduled_teacher",
+        ],
+    }
+    assert report["config"]["minimum_safety_margin_gain"] == (
+        minimum_margin_gain + 0.5
+    )
+
+
+def test_dagger_minimum_margin_gain_gate_accepts_threshold_equality() -> None:
+    client, _episode, report, _student = _run(
+        student_collides=True,
+        minimum_safety_margin_gain=31.0,
+    )
+
+    assert report["teacher_interventions"] == report["decision_count"]
+    assert report["safety_teacher_interventions"] == report["decision_count"]
+    assert all(action.move_x == 1 for action in client.actions)
+    assert all(
+        decision["intervention_reason"] == "predicted_collision"
+        and decision["minimum_safety_margin_gain_gate_passed"] is True
+        for decision in report["decisions"]
+    )
+    gate = report["safety_intervention_margin_gain_gate"]
+    assert gate["accepted_decisions"] == report["decision_count"]
+    assert gate["rejected_decisions"] == 0
+
+
+def test_dagger_margin_gain_gate_does_not_change_scheduled_interventions() -> None:
+    client, _episode, report, _student = _run(
+        student_collides=True,
+        teacher_probability=1.0,
+        minimum_safety_margin_gain=100.0,
+    )
+
+    assert report["scheduled_teacher_interventions"] == report["decision_count"]
+    assert report["safety_teacher_interventions"] == 0
+    assert all(action.move_x == 1 for action in client.actions)
+    assert all(
+        decision["intervention_reason"] == "scheduled_teacher"
+        and decision["minimum_safety_margin_gain_gate_applied"] is False
+        and decision["minimum_safety_margin_gain_gate_passed"] is None
+        for decision in report["decisions"]
+    )
+
+
 def test_dagger_can_collect_only_current_policy_disagreements() -> None:
     client, episode, report, student_controller = _run(
         student_collides=False,
         supervision_mode="corrective",
         intervene_on_disagreement=True,
+        minimum_safety_margin_gain=100.0,
     )
 
     teacher = Action(move_x=1, slow=True).discrete
@@ -340,6 +535,8 @@ def test_dagger_can_collect_only_current_policy_disagreements() -> None:
     assert report["policy_disagreement_interventions"] == report["decision_count"]
     assert all(
         decision["intervention_reason"] == "policy_disagreement"
+        and decision["minimum_safety_margin_gain_gate_applied"] is False
+        and decision["minimum_safety_margin_gain_gate_passed"] is None
         for decision in report["decisions"]
     )
     assert episode.actions == [teacher, teacher]
@@ -384,6 +581,12 @@ def test_corrective_dagger_supervises_the_actions_that_were_executed() -> None:
 def test_dagger_rejects_unknown_supervision_mode() -> None:
     with pytest.raises(ValueError, match="supervision_mode"):
         EngineDAggerConfig(supervision_mode="mixed")
+
+
+@pytest.mark.parametrize("value", (-1.0, float("inf"), float("nan"), True))
+def test_dagger_rejects_invalid_minimum_safety_margin_gain(value) -> None:
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        EngineDAggerConfig(minimum_safety_margin_gain=value)
 
 
 def test_dagger_rejects_stale_runtime_lua_before_reset() -> None:

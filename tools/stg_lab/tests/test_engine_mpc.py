@@ -1100,13 +1100,15 @@ def test_imminent_collision_interrupts_direction_hold_immediately() -> None:
         "collidable": False,
     }
     first = teacher.select(observation(0, enemies=[boss]))
-    assert (first.action.move_x, first.action.move_y) == (1, -1)
+    direction_length = math.hypot(first.action.move_x, first.action.move_y)
+    assert direction_length > 0.0
 
-    path_coordinate = 3.0 * math.sqrt(2.0)
+    player_speed = 2.0 if first.action.slow else 4.0
+    danger_distance = player_speed + 3.0
     danger = bullet(
         31,
-        path_coordinate,
-        -path_coordinate,
+        danger_distance * first.action.move_x / direction_length,
+        danger_distance * first.action.move_y / direction_length,
         dx=0.0,
         dy=0.0,
     )
@@ -1147,14 +1149,14 @@ def test_material_clearance_gain_can_interrupt_direction_hold() -> None:
     early = teacher.select(observation(
         3,
         enemies=[boss],
-        bullets=[bullet(31, 10.0, 0.0, dx=0.0, dy=0.0)],
+        bullets=[bullet(31, 10.0, 10.0, dx=0.0, dy=0.0)],
     ))
     assert early.action.discrete == first.action.discrete
 
     escaped = teacher.select(observation(
         9,
         enemies=[boss],
-        bullets=[bullet(31, 10.0, 0.0, dx=0.0, dy=0.0)],
+        bullets=[bullet(31, 10.0, 10.0, dx=0.0, dy=0.0)],
     ))
     incumbent = next(
         item for item in escaped.evaluations
@@ -1235,6 +1237,14 @@ def test_transition_penalty_distinguishes_switch_reverse_and_aba() -> None:
         action for action in teacher.actions
         if (action.move_x, action.move_y, action.slow) == (0, 1, True)
     )
+    fast_up = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (0, 1, False)
+    )
+    fast_right = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (1, 0, False)
+    )
 
     ordinary_switch = teacher._transition_penalty(up, right, None)
     reverse = teacher._transition_penalty(left, right, None)
@@ -1246,6 +1256,54 @@ def test_transition_penalty_distinguishes_switch_reverse_and_aba() -> None:
         + teacher.config.direction_reverse_penalty
     )
     assert aba_reverse == reverse + teacher.config.direction_aba_penalty
+    assert teacher._transition_penalty(fast_right, right, None) == (
+        teacher.config.speed_switch_penalty
+    )
+    assert teacher._transition_penalty(fast_up, right, None) == (
+        teacher.config.direction_switch_penalty
+        + teacher.config.speed_switch_penalty
+    )
+
+
+def test_beam_motion_penalty_matches_scalar_direction_and_speed_switch() -> None:
+    teacher = EngineMPC(MPCConfig(
+        horizon_frames=36,
+        beam_width=len(movement_actions()),
+    ))
+    slow_right = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (1, 0, True)
+    )
+    fast_up = next(
+        action for action in teacher.actions
+        if (action.move_x, action.move_y, action.slow) == (0, 1, False)
+    )
+    teacher._last_action = slow_right
+
+    evaluations, plans = teacher._beam_evaluations(
+        (0.0, 0.0, 0.5, 4.0, 2.0),
+        (-100.0, 100.0, -100.0, 100.0),
+        (),
+        None,
+    )
+    fast_up_index = next(
+        index for index, value in enumerate(evaluations)
+        if value.action == fast_up
+    )
+    plan = plans[fast_up_index]
+    assert len(plan) == (
+        teacher.config.horizon_frames // teacher.config.decision_interval
+    )
+
+    expected = 0.0
+    previous = slow_right
+    two_ago = None
+    for action in plan:
+        expected += teacher._transition_penalty(action, previous, two_ago)
+        expected += teacher._action_motion_penalty(action)
+        two_ago, previous = previous, action
+
+    assert evaluations[fast_up_index].motion_penalty == pytest.approx(expected)
 
 
 def test_humanlike_motion_penalties_prefer_focus_and_a_neutral_turn_beat() -> None:
@@ -3018,7 +3076,7 @@ def test_detected_parallel_gap_steers_toward_reachable_corridor() -> None:
     ))
     current = observation(
         0,
-        player_x=30.0,
+        player_x=0.0,
         player_y=0.0,
         bullets=wavefront,
     )
@@ -3038,7 +3096,7 @@ def test_detected_parallel_gap_steers_toward_reachable_corridor() -> None:
     assert enabled.gap_selected_center == pytest.approx((15.0, 0.0))
     assert enabled.gap_selected_width == pytest.approx(10.0)
     assert enabled.gap_navigation_mode == "enter"
-    assert enabled.action.move_x == -1
+    assert enabled.action.move_x == 1
     assert disabled.action.move_x == 0
     assert selected.collided is False
 

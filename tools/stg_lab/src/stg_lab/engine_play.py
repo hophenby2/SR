@@ -18,10 +18,17 @@ from .native_dataset import risk_from_clearance
 from .policy import (
     PlayerProficiencyProfile,
     ProficiencyRuntime,
+    resolve_policy_action_selection,
     resolve_proficiency,
 )
 from .protocol import Action
 from .provenance import file_sha256, source_tree_sha256
+from .replay_capture import (
+    normalize_replay_name,
+    replay_start_metadata,
+    require_native_replay_capture,
+    save_native_replay,
+)
 from .route_memory import (
     ExternalRouteController,
     ExternalRouteLibraryController,
@@ -60,6 +67,7 @@ class EnginePlayConfig:
     visible_safety_shield: bool = False
     visible_safety_horizon: int | None = None
     visible_safety_minimum_margin: float = 6.0
+    replay_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_frames <= 0:
@@ -95,6 +103,12 @@ class EnginePlayConfig:
             or not 1 <= self.render_every <= 600
         ):
             raise ValueError("render_every must be an integer in [1, 600]")
+        if self.replay_name is not None:
+            object.__setattr__(
+                self,
+                "replay_name",
+                normalize_replay_name(self.replay_name),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +245,7 @@ class VisualPolicyController:
         proficiency: str | PlayerProficiencyProfile = "expert",
         seed: int = 0,
         scenario_vocabulary: tuple[str, ...] | None = None,
+        action_selection: str = "joint",
     ) -> None:
         from .rollout import _model_device, _policy_inference_mode, scenario_memory_vector
 
@@ -239,6 +254,7 @@ class VisualPolicyController:
         self.device = _model_device(model, device)
         self.inference_mode = _policy_inference_mode(model)
         self.proficiency = resolve_proficiency(proficiency)
+        self.action_selection = resolve_policy_action_selection(action_selection)
         self.seed = int(seed)
         self.runtime = ProficiencyRuntime(self.proficiency, seed=self.seed)
         memory_size = int(getattr(getattr(model, "config", None), "memory_size", 4))
@@ -288,6 +304,11 @@ class VisualPolicyController:
         self.hidden: Any | None = None
         self.decisions = 0
         self.runtime.reset(self.seed)
+        reset_adapter = getattr(self.model, "reset_runtime_state", None)
+        if not callable(reset_adapter):
+            reset_adapter = getattr(self.model, "reset_runtime_stats", None)
+        if callable(reset_adapter):
+            reset_adapter()
         if self.previous_action_size:
             start = self.previous_action_offset
             self.memory[start:start + self.previous_action_size] = 0.0
@@ -311,6 +332,7 @@ class VisualPolicyController:
             shield=False,
             runtime=self.runtime,
             commit_runtime=False,
+            action_selection=self.action_selection,
         )
         self.decisions += 1
         return action
@@ -322,6 +344,13 @@ class VisualPolicyController:
             start = self.previous_action_offset
             self.memory[start:start + previous_action_size] = 0.0
             self.memory[start + action.discrete] = 1.0
+        model_commit = getattr(
+            getattr(self, "model", None),
+            "commit_executed_action",
+            None,
+        )
+        if callable(model_commit):
+            model_commit(action, frames=frames)
 
 
 def _commit_executed_action(
@@ -346,10 +375,24 @@ def _stream_policy_control_inputs(controller: VisibleController) -> list[str]:
         "current_visible_player_pose",
         "recurrent_hidden_state",
     ]
+    inputs.append(
+        "factorized_direction_speed_marginal_scores_from_model_logits"
+        if getattr(controller, "action_selection", "joint") == "factorized" else
+        "joint_18_way_model_action_logits"
+    )
     if getattr(controller, "scenario_vocabulary", None) is not None:
         inputs.append("registered_episode_identity_one_hot")
     if int(getattr(controller, "previous_action_size", 0)) > 0:
         inputs.append("previous_executed_motor_action_one_hot")
+    model = getattr(controller, "model", None)
+    adapter = getattr(model, "adapter", None)
+    adapter_config = getattr(adapter, "config", None)
+    if bool(getattr(adapter_config, "executed_action_context", False)):
+        inputs.extend((
+            "residual_previous_executed_motor_action_one_hot",
+            "residual_previous_executed_action_validity",
+            "residual_log1p_consecutive_executed_action_decisions",
+        ))
     return inputs
 
 
@@ -634,14 +677,24 @@ def _controller_state(controller: VisibleController) -> dict[str, Any]:
             "decisions": controller.decisions,
         }
     if isinstance(controller, VisualPolicyController):
-        return {
+        state = {
             "scenario_key": controller.scenario_key,
             "device": controller.device,
             "inference_mode": controller.inference_mode,
+            "action_selection": getattr(controller, "action_selection", "joint"),
+            "action_selection_uses_safety_state": False,
             "proficiency": asdict(controller.proficiency),
             "proficiency_seed": controller.seed,
             "decisions": controller.decisions,
         }
+        residual_stats = getattr(
+            getattr(controller, "model", None),
+            "residual_runtime_stats",
+            None,
+        )
+        if callable(residual_stats):
+            state["residual_adapter_runtime"] = residual_stats()
+        return state
     return {"type": type(controller).__name__}
 
 
@@ -697,7 +750,12 @@ def run_engine_play(
         completion_reason = "stage_complete"
     ping = client.ping()
     runtime_source_verification = verify_runtime_source_fingerprints(ping)
+    if config.replay_name is not None:
+        require_native_replay_capture(ping)
     catalog_response = client.catalog()
+    replay_request = (
+        {} if config.replay_name is None else {"replay_name": config.replay_name}
+    )
     if stage is None:
         assert attack is not None
         catalog_entry = _catalog_entry(catalog_response, scenario, attack)
@@ -707,6 +765,7 @@ def run_engine_play(
             seed=int(seed),
             player=player,
             options={},
+            **replay_request,
         )
     else:
         catalog_entry = _catalog_stage(catalog_response, stage)
@@ -715,7 +774,21 @@ def run_engine_play(
             seed=int(seed),
             player=player,
             options={},
+            **replay_request,
         )
+    replay_start = (
+        None
+        if config.replay_name is None else
+        replay_start_metadata(
+            reset_response,
+            expected_name=config.replay_name,
+            expected_episode_kind=episode_kind,
+            expected_stage_name=(
+                "Spell Practice@Spell Practice" if stage is None else stage
+            ),
+            expected_seed=int(seed),
+        )
+    )
     raw = _observation(reset_response)
     initial_episode_frame = _episode_frame(raw)
     stream_vision = (
@@ -865,6 +938,17 @@ def run_engine_play(
         and engine_reason == completion_reason
         and zero_death_evidence
     )
+    native_replay = None
+    if config.replay_name is not None:
+        assert replay_start is not None
+        native_replay = save_native_replay(
+            client,
+            replay_name=config.replay_name,
+            replay_start=replay_start,
+            episode_kind=episode_kind,
+            strict_success=success,
+            termination_reason=termination_reason,
+        )
     final_episode_frame = _episode_frame(raw)
     engine_advanced = None
     if initial_episode_frame is not None and final_episode_frame is not None:
@@ -884,6 +968,7 @@ def run_engine_play(
         and controller.proficiency.reaction_delay_frames == 0
         and controller.proficiency.direction_hold_frames <= config.decision_interval
         and controller.proficiency.suboptimal_action_probability == 0.0
+        and getattr(controller, "action_selection", "joint") == "joint"
     )
     return {
         "schema_version": 3,
@@ -929,6 +1014,7 @@ def run_engine_play(
         "unsafe_shot_frames_definition": (
             "retired: shooting does not affect movement or collision"
         ),
+        "native_replay": native_replay,
         "controller": metadata,
         "engine": {
             "protocol": ping.get("protocol"),
@@ -959,6 +1045,7 @@ def run_engine_play(
             "spell_forced_off": True,
             "render": config.render,
             "render_every": config.render_every,
+            "replay_name": config.replay_name,
             "control_inputs": (
                 _stream_policy_control_inputs(controller)
                 if stream_vision is not None else

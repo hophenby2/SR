@@ -2816,7 +2816,7 @@ class EngineMPC:
                 and direction != previous_direction
             ):
                 penalty += self.config.direction_aba_penalty
-        elif action.slow != previous.slow:
+        if action.slow != previous.slow:
             penalty += self.config.speed_switch_penalty
         return penalty
 
@@ -3327,8 +3327,9 @@ class EngineMPC:
                 self.config.decision_interval,
                 end_frame - block_start,
             )
+            currently_inside = outside_distance(current_x, current_y) <= 1e-6
             best: tuple[
-                tuple[float, float, float, float, float, int],
+                tuple[float, float, float, float, float, float, int],
                 tuple[tuple[float, float], ...],
                 Action,
             ] | None = None
@@ -3355,14 +3356,26 @@ class EngineMPC:
                     outside > speed * remaining_frames + 1e-6
                 )
                 hold_shortfall, style_penalty = self._gap_plan_style((*plan, action))
-                score = (
-                    deadline_unreachable,
-                    hold_shortfall,
-                    outside + style_penalty,
-                    movement,
-                    abs(endpoint_u - center_u),
-                    action_index,
-                )
+                if currently_inside:
+                    score = (
+                        deadline_unreachable,
+                        outside,
+                        movement,
+                        hold_shortfall,
+                        style_penalty,
+                        abs(endpoint_u - center_u),
+                        action_index,
+                    )
+                else:
+                    score = (
+                        deadline_unreachable,
+                        hold_shortfall,
+                        outside + style_penalty,
+                        movement,
+                        abs(endpoint_u - center_u),
+                        style_penalty,
+                        action_index,
+                    )
                 if best is None or score < best[0]:
                     best = score, tuple(candidate), action
             assert best is not None
@@ -5616,7 +5629,6 @@ class EngineMPC:
             )
             changed_speed = (
                 has_prior
-                & ~changed_direction
                 & (action_slow[action_indices] != action_slow[safe_prior])
             )
             motion_penalty += (
